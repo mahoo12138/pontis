@@ -504,10 +504,14 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
           {/* One row for the wallpaper and everything that only means something
               because a wallpaper does. The two layers hang under the picture —
               one step in, one step tighter than the groups beside them — so the
-              page says which decisions depend on which. */}
+              page says which decisions depend on which. The wrapper keeps
+              Mantine's label-first order: its hint belongs to the picture, and
+              the control slot holds the nested layers, so a hint below would
+              land past them. */}
           <Input.Wrapper
             label="背景图片"
             description="图片只保存在这台浏览器里，不会上传到 Server。"
+            inputWrapperOrder={['label', 'description', 'input', 'error']}
           >
             <Group gap="sm" wrap="nowrap" align="center">
               {appearance.background ? (
@@ -564,6 +568,7 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
                 <Input.Wrapper
                   label="背景底色"
                   description="从图片的主色调算出，浅深各一档；可直接改，清空回到主题底色，移除图片后一并清除。"
+                  inputWrapperOrder={['label', 'description', 'input', 'error']}
                 >
                   <Group gap="sm" align="flex-end">
                     <ColorInput
@@ -627,7 +632,7 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
       {config ? <SectionHeading title="显示" hint="点开书签和搜索结果时怎么打开，以及列表的松紧。" /> : null}
 
       {config ? (
-        <Group grow className="pontis-spForm">
+        <Group grow align="flex-start" className="pontis-spForm">
           <Select
             label="打开方式"
             description="也用于网页搜索结果。"

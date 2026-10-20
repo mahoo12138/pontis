@@ -40,7 +40,9 @@ export function PairingForm({
   };
 
   return (
-    <Stack gap="sm">
+    // lg, not sm: a hint now sits 4px under its own control, so the field above
+    // and the label below need more than that to keep the hint attached.
+    <Stack gap="lg">
       <TextInput
         label="服务器地址"
         description="扩展需要被允许访问该地址，浏览器会在点击后询问"

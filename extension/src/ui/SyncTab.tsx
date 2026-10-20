@@ -264,7 +264,7 @@ export function SyncTab({ sync, paired }: { sync: SyncState; paired: boolean }) 
                             )}
 
                           {b.state === 'mount_missing' && (
-                            <Group grow wrap="nowrap">
+                            <Group grow wrap="nowrap" align="center">
                               <FolderPickerField
                                 tree={folders}
                                 value={remountFolders[b.id] ?? ''}

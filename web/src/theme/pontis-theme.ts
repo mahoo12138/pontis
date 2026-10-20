@@ -132,6 +132,14 @@ export const pontisTheme = createTheme({
 
   // Component defaults — compact density, set once in theme
   components: {
+    // Mantine renders the description between the label and the control, so a
+    // control's row position depends on whether that field happens to have a
+    // hint. Below the control the optional text costs nothing: label and
+    // control hold one line each whether or not a hint exists. Kept in sync
+    // with the extension's copy of this theme.
+    InputWrapper: {
+      defaultProps: { inputWrapperOrder: ['label', 'input', 'description', 'error'] },
+    },
     Button: {
       defaultProps: { size: 'sm' },
       styles: { root: { fontWeight: 500 } },

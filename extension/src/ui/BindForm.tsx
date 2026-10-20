@@ -40,7 +40,7 @@ export function BindForm({
   };
 
   return (
-    <Stack gap="sm">
+    <Stack gap="md">
       <Group grow align="flex-start" wrap="wrap">
         <Select
           label="同步空间"

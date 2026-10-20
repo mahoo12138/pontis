@@ -110,6 +110,14 @@ export const pontisTheme = createTheme({
   },
 
   components: {
+    // Mantine renders the description between the label and the control, so a
+    // control's row position depends on whether that field happens to have a
+    // hint — and most do not. Side by side, the described field's box then
+    // lands a line below its neighbour's. Below the control the optional text
+    // costs nothing: label and control hold one line each whether or not a hint
+    // exists. A wrapper whose control slot holds nested fields (背景图片) passes
+    // the old order back at the call site.
+    InputWrapper: { defaultProps: { inputWrapperOrder: ['label', 'input', 'description', 'error'] } },
     Button: { defaultProps: { size: 'sm' }, styles: { root: { fontWeight: 500 } } },
     TextInput: { defaultProps: { size: 'sm' } },
     PasswordInput: { defaultProps: { size: 'sm' } },

@@ -25,6 +25,8 @@ const SURFACES = [
   'ui/SyncTab.tsx',
   'ui/Emptyish.tsx',
   'ui/Section.tsx',
+  'ui/BindForm.tsx',
+  'ui/PairingForm.tsx',
 ];
 
 /**
@@ -39,6 +41,16 @@ const OFF_SCALE_SPACING = /(?:^|\s)(?:gap|mt|mb|ml|mr|p|px|py|mx|my)=\{(?!0\b)[0
  * non-word character never matches — which is what made this check vacuous.
  */
 const DEFAULT_PALETTE = /\b(?:color|c)="(?:blue|red|amber|gray|grey|green|orange|violet|teal)"/g;
+
+/**
+ * `<Group grow>` with no `align`: Mantine's Group defaults to `center`, which
+ * floats a field without a description above its neighbour's control. Every
+ * field row has to say how it aligns, even when the answer is `center`.
+ */
+const IMPLICIT_GROUP_ALIGN = /<Group\s+grow(?![^>]*\balign=)/g;
+
+/** The theme key that decides where a description lands. Both apps must agree. */
+const WRAPPER_ORDER = /inputWrapperOrder:\s*\[([^\]]*)\]/;
 
 describe('settings layout invariants', () => {
   it('uses no Divider as a section heading', () => {
@@ -71,5 +83,29 @@ describe('settings layout invariants', () => {
     // shape has grown somewhere else.
     const strays = SURFACES.filter((f) => f !== 'ui/Section.tsx' && read(f).includes('pontis-sectionTitle'));
     expect(strays).toEqual([]);
+  });
+
+  it('states the alignment of every row of fields', () => {
+    const found: string[] = [];
+    for (const file of SURFACES) {
+      for (const match of read(file).matchAll(IMPLICIT_GROUP_ALIGN)) {
+        found.push(`${file}: ${match[0]}`);
+      }
+    }
+    expect(
+      found,
+      'Mantine centres a Group by default, which lifts a field without a description off its row: say align="" explicitly',
+    ).toEqual([]);
+  });
+
+  it('keeps the description on the same side of the control as the web app', () => {
+    // The two themes are hand-ported copies of each other; the order is what
+    // decides whether a row of fields lines up, so it cannot drift per app.
+    const extensionOrder = read('theme/pontisTheme.ts').match(WRAPPER_ORDER)?.[1];
+    const webOrder = readFileSync(join(here, '..', '..', '..', 'web', 'src', 'theme', 'pontis-theme.ts'), 'utf8').match(
+      WRAPPER_ORDER,
+    )?.[1];
+    expect(extensionOrder).toBeTruthy();
+    expect(webOrder).toBe(extensionOrder);
   });
 });
