@@ -7,10 +7,11 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Alert, Badge, Box, Button, Group, Stack, Text } from '@mantine/core';
+import { Badge, Box, Button, Group, Stack, Text } from '@mantine/core';
 import { originPatternFor } from '../../core/pairing/pairing';
 import { PontisLogo } from '../../ui/PontisLogo';
 import { createRuntime, errText, wakeWorker } from '../../ui/runtime';
+import { notifyError } from '../../ui/notify';
 import { BindForm, type SpaceOption } from '../../ui/BindForm';
 import { PairingForm } from '../../ui/PairingForm';
 import { mountFolderTree } from '../../ui/mountFolders';
@@ -27,7 +28,6 @@ export function App() {
   const [folders, setFolders] = useState<FolderTreeNode[]>([]);
   const [boundSpaceIds, setBoundSpaceIds] = useState<string[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [redoStep, setRedoStep] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
@@ -60,11 +60,10 @@ export function App() {
 
   async function run(key: string, fn: () => Promise<void>) {
     setBusy(key);
-    setError(null);
     try {
       await fn();
     } catch (err) {
-      setError(errText(err));
+      notifyError(errText(err));
     } finally {
       setBusy(null);
       setRedoStep(null);
@@ -113,12 +112,6 @@ export function App() {
 
       <div className="pontis-pagePad">
         <Stack gap="lg">
-          {error && (
-            <Alert color="errorRed" withCloseButton onClose={() => setError(null)}>
-              {error}
-            </Alert>
-          )}
-
           <GuideStep
             index={1}
             title="连接服务器"

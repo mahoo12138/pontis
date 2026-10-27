@@ -8,7 +8,7 @@
 // this page still has to offer cold is the unpaired account tab, because
 // re-pairing after a server move is an edit here, not a trip back to the guide.
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   Alert,
@@ -23,6 +23,7 @@ import {
   Text,
 } from '@mantine/core';
 import { Section } from '../../ui/Section';
+import { notifyError } from '../../ui/notify';
 import { runtime } from '../../ui/optionsRuntime';
 import { DiagnosticsPanel } from '../../ui/DiagnosticsPanel';
 import { AccountTab } from '../../ui/AccountTab';
@@ -100,6 +101,14 @@ export function App() {
     doBind, doUnbind, toggleSync, answerIssues, resolveIntents, doIntegrityCheck, doRemount,
   } = sync;
 
+  // The hook keeps the last failure; this page no longer pins it above the tabs,
+  // it surfaces it once as a corner notification and lets go.
+  useEffect(() => {
+    if (!error) return;
+    notifyError(error, '操作失败');
+    setError(null);
+  }, [error, setError]);
+
   const doPair = (params: {
     serverUrl: string;
     username: string;
@@ -162,11 +171,6 @@ export function App() {
       </header>
 
       <div className="pontis-pagePad">
-        {error && (
-          <Alert color="errorRed" title="操作失败" withCloseButton onClose={() => setError(null)} mb="md">
-            {error}
-          </Alert>
-        )}
         {!paired && (
           <Alert color="accentBlue" title="这台浏览器还没有配对" mb="md">
             <Stack gap="xs">

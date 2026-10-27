@@ -518,7 +518,7 @@ function Refusal({
 
   return (
     <Stack gap="sm" mt="xl" maw={520}>
-      <Alert color={copy.strong ? 'red' : 'amber'} variant="light" title={copy.title}>
+      <Alert color={copy.strong ? 'errorRed' : 'warningAmber'} variant="light" title={copy.title}>
         {copy.body}
         {errorCode ? (
           <Text component="div" size="xs" c="dimmed" mt={4}>

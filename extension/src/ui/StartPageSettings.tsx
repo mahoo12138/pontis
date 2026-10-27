@@ -23,6 +23,7 @@ import {
   TextInput,
 } from '@mantine/core';
 import { createRuntime, errText } from './runtime';
+import { notifyError } from './notify';
 import { SectionHeading } from './Section';
 import { chromeApi } from '../runtime/chromeApi';
 import { FolderPickerField } from './FolderPickerField';
@@ -52,7 +53,6 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
   const [config, setConfig] = useState<StartPageConfigRecord | null>(null);
   const [paired, setPaired] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   /** Spaces this device actually syncs, with the binding that grants the read. */
   const [synced, setSynced] = useState<{ value: string; label: string; bindingId: string }[]>([]);
@@ -141,7 +141,6 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
     }
     let cancelled = false;
     setLoadingTree(true);
-    setError(null);
     void runtime.client
       .fetchSnapshot(bindingId)
       .then((snap) => {
@@ -149,7 +148,9 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
         setTree(buildFolderTree(snap.nodes));
         setPicked('');
       })
-      .catch((err) => !cancelled && setError(errText(err)))
+      .catch((err) => {
+        if (!cancelled) notifyError(errText(err));
+      })
       .finally(() => !cancelled && setLoadingTree(false));
     return () => {
       cancelled = true;
@@ -159,14 +160,13 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
   const save = async () => {
     if (!picked || !spaceId) return;
     setBusy('save');
-    setError(null);
     try {
       // Read the chosen folder once, through the same call the page will use.
       // A source that cannot be read should not become the thing the page is
       // configured to show (§8.2).
       const read = await runtime.client.deviceStartPageSnapshot(spaceId, picked);
       if (typeof read.value === 'symbol') {
-        setError('这个目录读不到内容，来源没有切换。');
+        notifyError('这个目录读不到内容，来源没有切换。');
         return;
       }
       await saveSource(deps, { spaceId, folderId: picked }, read.value);
@@ -174,7 +174,7 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
       onChanged?.();
       setSourceOpen(false);
     } catch (err) {
-      setError(errText(err));
+      notifyError(errText(err));
     } finally {
       setBusy(null);
     }
@@ -183,7 +183,6 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
   const release = async () => {
     if (!config) return;
     setBusy('release');
-    setError(null);
     try {
       // Releasing the display is the reader's decision made now, locally. The
       // cached tree goes with it; the binding is untouched, because a start
@@ -192,7 +191,7 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
       await reload();
       onChanged?.();
     } catch (err) {
-      setError(errText(err));
+      notifyError(errText(err));
     } finally {
       setBusy(null);
     }
@@ -231,11 +230,10 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
   const chooseBackground = async (file: File | undefined) => {
     if (!config || !file) return;
     setBusy('background');
-    setError(null);
     try {
       const prepared = await prepareBackground(file);
       if ('error' in prepared) {
-        setError(BACKGROUND_ERROR_TEXT[prepared.error]);
+        notifyError(BACKGROUND_ERROR_TEXT[prepared.error]);
         return;
       }
       // A new picture is a new colour: what was read out of the old one is
@@ -247,7 +245,7 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
       });
       if (next) showTints(next);
     } catch (err) {
-      setError(errText(err));
+      notifyError(errText(err));
     } finally {
       setBusy(null);
     }
@@ -266,7 +264,6 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
   const reextractTints = async () => {
     if (!config || !appearance.background) return;
     setBusy('tint');
-    setError(null);
     try {
       const tints = await tintsFromStoredBackground(appearance.background);
       const next = await applyAppearance({
@@ -274,9 +271,9 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
         tintDark: tints?.dark ?? null,
       });
       if (next) showTints(next);
-      if (!tints) setError('这张图片看不出主色调，已改用主题底色。');
+      if (!tints) notifyError('这张图片看不出主色调，已改用主题底色。', '没有读出主色调');
     } catch (err) {
-      setError(errText(err));
+      notifyError(errText(err));
     } finally {
       setBusy(null);
     }
@@ -376,15 +373,7 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
                   停止显示
                 </Button>
               ) : null}
-              <Button
-                variant={config ? 'default' : 'filled'}
-                onClick={() => {
-                  // Open clean: an error left over from the tree behind is not
-                  // something this dialog did.
-                  setError(null);
-                  setSourceOpen(true);
-                }}
-              >
+              <Button variant={config ? 'default' : 'filled'} onClick={() => setSourceOpen(true)}>
                 {config ? '更改来源' : '选择来源'}
               </Button>
               <Button variant="light" component="a" href={chromeApi().runtime.getURL('start-page.html')} target="_blank">
@@ -395,23 +384,12 @@ export function StartPageSettings({ onChanged }: { onChanged?: () => void }) {
         </Box>
       </Box>
 
-      {error ? (
-        <Alert color="errorRed" variant="light" title="操作未完成">
-          {error}
-        </Alert>
-      ) : null}
-
       {/* The two choices that decide what the page shows, opened from the card
           that reports the result. Flat on the page they kept a reader who had
           already chosen sitting in the middle of the same decision again, and
           pushed everything below it out of sight. */}
       <Modal opened={sourceOpen} onClose={() => setSourceOpen(false)} title="选择来源" size="lg" radius="lg">
         <Stack gap="md">
-          {error ? (
-            <Alert color="errorRed" variant="light" title="操作未完成">
-              {error}
-            </Alert>
-          ) : null}
           <Text size="sm" c="dimmed">
             起始页显示哪个空间的哪个文件夹。这只是这台浏览器的显示决定，不影响同步。
           </Text>

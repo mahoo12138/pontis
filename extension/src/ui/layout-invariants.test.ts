@@ -52,6 +52,14 @@ const IMPLICIT_GROUP_ALIGN = /<Group\s+grow(?![^>]*\balign=)/g;
 /** The theme key that decides where a description lands. Both apps must agree. */
 const WRAPPER_ORDER = /inputWrapperOrder:\s*\[([^\]]*)\]/;
 
+/**
+ * A failure pinned in the page. Action results are corner notifications now
+ * (`ui/notify.ts`); a red banner here means a fourth failure surface grew back.
+ * Blue and amber stay allowed — those state what a surface cannot do yet, which
+ * is content the page has to keep showing after the moment passes.
+ */
+const PINNED_FAILURE = /<Alert[^>]*color="errorRed"/g;
+
 describe('settings layout invariants', () => {
   it('uses no Divider as a section heading', () => {
     const offenders = SURFACES.filter((f) => /<Divider\s+label=/.test(read(f)));
@@ -96,6 +104,16 @@ describe('settings layout invariants', () => {
       found,
       'Mantine centres a Group by default, which lifts a field without a description off its row: say align="" explicitly',
     ).toEqual([]);
+  });
+
+  it('surfaces an action failure as a notification, not a banner', () => {
+    const found: string[] = [];
+    for (const file of SURFACES) {
+      for (const match of read(file).matchAll(PINNED_FAILURE)) {
+        found.push(`${file}: ${match[0]}`);
+      }
+    }
+    expect(found, 'use notifyError from ui/notify.ts: a banner pushes the section it is about out of the way').toEqual([]);
   });
 
   it('keeps the description on the same side of the control as the web app', () => {

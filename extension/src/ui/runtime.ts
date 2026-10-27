@@ -35,11 +35,12 @@ export function createRuntime(onBindingCreated?: () => Promise<void>): Runtime {
 }
 
 /** An ApiError carries a stable code; showing only its message loses the part
- *  a person would quote back to whoever runs the server. */
+ *  a person would quote back to whoever runs the server. Its message already
+ *  opens with that code, so prefixing again prints it twice. */
 export function errText(err: unknown): string {
-  const code = (err as { code?: string }).code;
-  const message = (err as { message?: string }).message;
-  return code ? `${code}: ${message ?? ''}` : String(err);
+  const { code, message } = (err ?? {}) as { code?: string; message?: string };
+  const text = message ?? String(err);
+  return code && !text.startsWith(`${code}:`) ? `${code}: ${text}` : text;
 }
 
 /** Ask the worker for a round now instead of leaving the surface showing a
