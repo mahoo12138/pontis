@@ -4,8 +4,8 @@ import {
   Badge,
   Button,
   Group,
-  NativeSelect,
   SegmentedControl,
+  Select,
   Skeleton,
   Text,
   TextInput,
@@ -111,31 +111,32 @@ export default function PlazaPage() {
         </Group>
 
         <Group gap="sm" mb={16} wrap="nowrap">
-          <NativeSelect
+          {/* "All" is the absence of a filter, so it is the empty state of the
+              field rather than an option inside it: clearing writes nothing to
+              the URL, which is what the list already treats as "no filter". */}
+          <Select
             size="xs"
             w={150}
-            value={tag}
-            onChange={(e) => setParam('tag', e.currentTarget.value)}
-            data={[
-              { value: '', label: '全部标签' },
-              ...(facets?.tags ?? []).map((t) => ({ value: t, label: t })),
-            ]}
+            placeholder="全部标签"
+            clearable
+            value={tag || null}
+            onChange={(v) => setParam('tag', v ?? '')}
+            data={(facets?.tags ?? []).map((t) => ({ value: t, label: t }))}
           />
-          <NativeSelect
+          <Select
             size="xs"
             w={150}
-            value={publisher}
-            onChange={(e) => setParam('publisher', e.currentTarget.value)}
-            data={[
-              { value: '', label: '全部作者' },
-              ...(facets?.publishers ?? []).map((p) => ({ value: p, label: p })),
-            ]}
+            placeholder="全部作者"
+            clearable
+            value={publisher || null}
+            onChange={(v) => setParam('publisher', v ?? '')}
+            data={(facets?.publishers ?? []).map((p) => ({ value: p, label: p }))}
           />
-          <NativeSelect
+          <Select
             size="xs"
             w={130}
             value={sort}
-            onChange={(e) => setParam('sort', e.currentTarget.value)}
+            onChange={(v) => setParam('sort', v ?? 'updated')}
             data={[
               { value: 'updated', label: '最近更新' },
               { value: 'published', label: '最新发布' },

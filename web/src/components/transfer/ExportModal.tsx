@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Group, Modal, NativeSelect, Radio, Stack, Text } from '@mantine/core';
+import { Button, Group, Modal, Radio, Select, Stack, Text } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import type { ImportFormat } from '@pontis/api';
 import { useExport } from '../../hooks/use-transfer';
@@ -97,14 +97,14 @@ export default function ExportModal({
         </Radio.Group>
 
         {slotOptions.length > 0 && (
-          <NativeSelect
+          <Select
             label="导出范围"
             data={[
               { value: 'space:', label: '整个空间' },
               ...slotOptions,
             ]}
             value={scope}
-            onChange={(e) => setScope(e.currentTarget.value)}
+            onChange={(v) => v && setScope(v)}
           />
         )}
 

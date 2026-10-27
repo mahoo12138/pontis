@@ -3,8 +3,8 @@ import {
   Button,
   Group,
   Modal,
-  NativeSelect,
   Radio,
+  Select,
   Stack,
   Text,
 } from '@mantine/core';
@@ -15,6 +15,7 @@ import { previewApplyPublication } from '@pontis/api/endpoints/plaza';
 import { useApplyPublication } from '../../hooks/use-plaza';
 import { useNodes, useRootSlots } from '../../hooks/use-nodes';
 import { useSpaces } from '../../hooks/use-spaces';
+import { folderPaths } from '../../features/explorer';
 import { tokens } from '../../styles/semantic-tokens.css';
 
 /**
@@ -60,9 +61,10 @@ export default function ImportModal({
     for (const slot of rootSlots?.root_slots ?? []) {
       opts.push({ value: `root:${slot.key}`, label: `根目录 / ${slot.display_name}` });
     }
+    const paths = folderPaths(nodesData?.nodes ?? []);
     for (const node of nodesData?.nodes ?? []) {
       if (node.type === 'folder') {
-        opts.push({ value: `node:${node.id}`, label: node.title });
+        opts.push({ value: `node:${node.id}`, label: paths.get(node.id) ?? node.title });
       }
     }
     return opts;
@@ -145,17 +147,19 @@ export default function ImportModal({
       styles={{ header: { fontSize: 15, fontWeight: 600 } }}
     >
       <Stack gap="sm">
-        <NativeSelect
+        <Select
           label="目标空间"
           data={spaces.map((s) => ({ value: s.id, label: s.name }))}
           value={spaceId}
-          onChange={(e) => setSpaceId(e.currentTarget.value)}
+          searchable
+          onChange={(v) => v && setSpaceId(v)}
         />
-        <NativeSelect
+        <Select
           label="目标位置"
           data={locationOptions.map((o) => ({ value: o.value, label: o.label }))}
           value={location}
-          onChange={(e) => setLocation(e.currentTarget.value)}
+          searchable
+          onChange={(v) => v && setLocation(v)}
         />
         <Radio.Group
           label="导入方式"

@@ -5,9 +5,9 @@ import {
   FileButton,
   Group,
   Modal,
-  NativeSelect,
   Radio,
   SegmentedControl,
+  Select,
   Stack,
   Text,
 } from '@mantine/core';
@@ -21,6 +21,7 @@ import type {
 import { useImportApply, useImportPreview } from '../../hooks/use-transfer';
 import { useNodes, useRootSlots } from '../../hooks/use-nodes';
 import { useSpaces } from '../../hooks/use-spaces';
+import { folderPaths } from '../../features/explorer';
 import { tokens } from '../../styles/semantic-tokens.css';
 import { mono } from '../../styles/management.css';
 
@@ -84,8 +85,9 @@ export default function ImportModal({
       opts.push({ value: `root:${slot.key}`, label: `根目录 / ${slot.display_name}` });
     }
     if (opts.length === 0) opts.push({ value: 'root:', label: '空间根目录' });
+    const paths = folderPaths(nodesData?.nodes ?? []);
     for (const node of nodesData?.nodes ?? []) {
-      if (node.type === 'folder') opts.push({ value: `node:${node.id}`, label: node.title });
+      if (node.type === 'folder') opts.push({ value: `node:${node.id}`, label: paths.get(node.id) ?? node.title });
     }
     return opts;
   }, [rootSlots, nodesData]);
@@ -249,11 +251,12 @@ export default function ImportModal({
             显示前 {plan.entries.length} 项(共 {plan.total} 项)。预览绑定于当前修订,确认前如有变化将要求重新预览。
           </Text>
 
-          <NativeSelect
+          <Select
             label="目标位置"
             data={locationOptions.map((o) => ({ value: o.value, label: o.label }))}
             value={location}
-            onChange={(e) => setLocation(e.currentTarget.value)}
+            searchable
+            onChange={(v) => v && setLocation(v)}
           />
           <Radio.Group label="导入方式" value={strategy} onChange={(v) => setStrategy(v as 'merge' | 'replace')}>
             <Group gap="lg" mt={6}>

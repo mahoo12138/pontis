@@ -3,7 +3,7 @@
 // rows, and no node may vanish because its parent is not in the list.
 
 import { describe, expect, it } from 'vitest';
-import { buildTreeIndex, flattenVisible, listFolders } from './tree';
+import { buildTreeIndex, flattenVisible, folderPaths, listFolders, pathTitles } from './tree';
 import type { Node } from '@pontis/api';
 
 function node(over: Partial<Node> & { id: string }): Node {
@@ -127,5 +127,37 @@ describe('listFolders', () => {
 
   it('drops a forbidden folder together with everything under it', () => {
     expect(listFolders(tree, new Set(['main'])).map((f) => f.node.id)).toEqual(['work']);
+  });
+});
+
+// A pick-list of folders used to show bare titles, so two folders called 临时 were
+// indistinguishable. The label now carries where the folder is.
+describe('pathTitles / folderPaths', () => {
+  const nodes = [
+    node({ id: 'f1', type: 'folder', title: '工作', parent_id: null }),
+    node({ id: 'f2', type: 'folder', title: '学习', parent_id: null }),
+    node({ id: 'a', type: 'folder', title: '临时', parent_id: 'f1' }),
+    node({ id: 'b', type: 'folder', title: '临时', parent_id: 'f2' }),
+    node({ id: 'bm', title: 'example', parent_id: 'a' }),
+  ];
+
+  it('labels two folders of the same name by where they are', () => {
+    const paths = folderPaths(nodes);
+    expect(paths.get('a')).toBe('工作 / 临时');
+    expect(paths.get('b')).toBe('学习 / 临时');
+    // Only folders get a path: a bookmark is not a place to move something into.
+    expect(paths.has('bm')).toBe(false);
+  });
+
+  it('names a root folder by itself', () => {
+    expect(pathTitles(buildTreeIndex(nodes), 'f1')).toEqual(['工作']);
+  });
+
+  it('stops at a parent cycle instead of hanging the picker', () => {
+    const cyclic = [
+      node({ id: 'x', type: 'folder', title: 'X', parent_id: 'y' }),
+      node({ id: 'y', type: 'folder', title: 'Y', parent_id: 'x' }),
+    ];
+    expect(pathTitles(buildTreeIndex(cyclic), 'x')).toEqual(['Y', 'X']);
   });
 });

@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Group, SegmentedControl } from '@mantine/core';
+import { Button, Group, SegmentedControl } from '@mantine/core';
 import {
   IconArrowsSort,
   IconLink,
@@ -24,9 +24,11 @@ interface ToolbarProps {
 /**
  * A quiet text action in the toolbar's right cluster.
  *
- * Extracted because 导入 and 导出 were the same twenty lines of inline style
- * written twice, and a third action would have made that a pattern rather than
- * a slip.
+ * Extracted because 导入 and 导出 were the same twenty lines written twice, and
+ * a third action would have made that a pattern rather than a slip. It is a
+ * `Button` now rather than a styled `<button>`: hover, the focus ring and the
+ * press came with the component, and hand-writing them back is how they go
+ * missing one action at a time.
  */
 function TextButton({
   onClick,
@@ -40,27 +42,16 @@ function TextButton({
   children: ReactNode;
 }) {
   return (
-    <button
+    <Button
+      variant="subtle"
+      color="coolGray"
+      size="compact-sm"
       onClick={onClick}
       aria-label={ariaLabel}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 4,
-        padding: '4px 6px',
-        fontSize: '12px',
-        color: tokens.textSecondary,
-        backgroundColor: 'transparent',
-        border: 'none',
-        borderRadius: 4,
-        cursor: 'pointer',
-      }}
-      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = tokens.hoverBg)}
-      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+      leftSection={icon}
     >
-      {icon}
       {children}
-    </button>
+    </Button>
   );
 }
 

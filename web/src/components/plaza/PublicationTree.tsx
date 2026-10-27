@@ -9,6 +9,7 @@ import {
 } from '@tabler/icons-react';
 import type { PublicationNodeDTO } from '@pontis/api';
 import { tokens } from '../../styles/semantic-tokens.css';
+import { pubTreeRow } from '../../styles/plaza.css';
 import { extractHost } from '../../lib/format';
 
 /**
@@ -101,23 +102,8 @@ export default function PublicationTree({ root }: { root: PublicationNodeDTO }) 
         <button
           onClick={() => toggle(node.id)}
           aria-expanded={!isCollapsed}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            width: '100%',
-            height: 32,
-            paddingLeft: 8 + depth * 20,
-            paddingRight: 12,
-            backgroundColor: 'transparent',
-            border: 'none',
-            borderRadius: 6,
-            cursor: 'pointer',
-            textAlign: 'left',
-            color: tokens.textPrimary,
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = tokens.hoverBg)}
-          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+          className={pubTreeRow}
+          style={{ paddingLeft: 8 + depth * 20 }}
         >
           {isCollapsed ? (
             <IconChevronRight size={13} stroke={1.7} style={{ color: tokens.textSecondary, flexShrink: 0 }} />

@@ -42,6 +42,7 @@
 | Backend | Go + chi + SQLite + handwritten SQL |
 | ORM | None |
 | Frontend | TS + React18 + React Router / TanStack Query + Mantine + Vanilla Extract |
+| Mantine 版本 | 停在 7.17.8：不为 `TreeSelect` 跨两个大版本升级（见下方「Mantine 9 升级」决策） |
 | Web Router | react-router-dom（见下方「路由栈」决策）；TanStack Router 不再并列 |
 | Extension | TS + WXT + Dexie |
 | Repository | monorepo server/web/extension/packages |
@@ -63,6 +64,26 @@
 迁移到 TanStack Router（类型化 search params 是它真正的价值）如果要做，条件是：
 作为独立分支，自带深链与 search params 的测试，且不夹带任何同步正确性修复。在
 内部 Alpha 里它排不到前面。
+
+### Mantine 9 升级（2026-10-20）
+
+**决策：不为 `TreeSelect` 升级 Mantine。两端停在 7.17.8；升级若发生，独立立项，且不一次跨两个大版本。**
+
+排查四处「从文件夹树里选一个文件夹」的界面时确认了两件事。第一，`TreeSelect` 从
+`@mantine/core` 9.2.0 才有，而 9.x 的 peer 是 `react ^19.2.0`（8.x 仍接受
+`^18.x || ^19.x`）——我们在 React 18.3，所以「换 TreeSelect」实际等于「先做 React
+18→19」。第二，即便升上去它也顶不了那四处：single/multiple 模式**只有叶子节点可以
+选中**（官方文档原文 "Only leaf nodes can be selected"），而选中一个含有子文件夹的
+文件夹正是这里的常态；closed 字段显示祖先路径没有对应 prop；也不做虚拟化。9.x 里
+真正可借的是 `useVirtualizedCombobox` 这个模式，不是 TreeSelect。
+
+因此本轮改为：四处文件夹选择统一用可搜索 `Select`，**label 里带完整路径**——同名
+文件夹由此可分辨，路径也带走了缩进本来表达的信息；标签输入换成 `TagsInput`
+（`splitChars` 保住全角逗号）；两处用 JS 改 DOM style 做的 hover 换成 CSS 规则或主题
+`Button`。评估全文（含 7→8、8→9 逐条对账与本仓库命中计数）见
+`mantine-9-upgrade-assessment.md`。
+
+将来若因别的原因升级，顺序是 7→8（低风险、React 18 下可做）→ React 19 → 8→9。
 
 ## B. Sync Invariants
 

@@ -1,10 +1,8 @@
 import { useMemo, useState } from 'react';
-import { Modal, Button, Group, Stack, Text, ScrollArea } from '@mantine/core';
-import { IconFolder, IconFolderRoot } from '@tabler/icons-react';
+import { Button, Group, Modal, Select } from '@mantine/core';
 import type { Node, ParentRef, RootSlot } from '@pontis/api';
-import { listFolders } from '../../features/explorer';
+import { listFolders, pathTitles } from '../../features/explorer';
 import type { TreeIndex } from '../../features/explorer';
-import { tokens } from '../../styles/semantic-tokens.css';
 
 interface MoveNodesModalProps {
   opened: boolean;
@@ -20,7 +18,6 @@ interface MoveNodesModalProps {
 interface Target {
   parent: ParentRef;
   label: string;
-  depth: number;
 }
 
 /**
@@ -48,17 +45,16 @@ export default function MoveNodesModal({
     return ids;
   }, [nodes, index]);
 
+  // The indent this list used to draw said which folder was which; a path says
+  // the same thing in one line and stays readable while the list is filtered.
   const targets = useMemo<Target[]>(() => {
-    const folders = listFolders(index, forbidden).map(({ node, depth }) => ({
+    const folders = listFolders(index, forbidden).map(({ node }) => ({
       parent: { type: 'node' as const, id: node.id },
-      label: node.title,
-      // Root folders sit under the root slot that holds them.
-      depth: depth + 1,
+      label: pathTitles(index, node.id).join(' / '),
     }));
     const roots = rootSlots.map((slot) => ({
       parent: { type: 'root' as const, key: slot.key },
-      label: slot.display_name || '根目录',
-      depth: 0,
+      label: `根目录 / ${slot.display_name || '根目录'}`,
     }));
     return [...roots, ...folders];
   }, [index, forbidden, rootSlots]);
@@ -79,49 +75,14 @@ export default function MoveNodesModal({
       title={`移动 ${nodes.length} 项`}
       size={380}
     >
-      <Text fz="xs" c="dimmed" mb={8}>
-        选择目标文件夹：
-      </Text>
-      <ScrollArea.Autosize mah={300} type="auto">
-        <Stack gap={0} align="stretch">
-          {targets.map((target) => {
-            const key = targetKey(target);
-            const active = key === choiceKey;
-            return (
-              <button
-                key={key}
-                onClick={() => setChoiceKey(key)}
-                aria-pressed={active}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  width: '100%',
-                  height: 30,
-                  // Indent expresses tree depth, so the padding is the content.
-                  padding: `0 8px 0 ${8 + target.depth * 14}px`,
-                  fontSize: 13,
-                  textAlign: 'left',
-                  color: tokens.textPrimary,
-                  backgroundColor: active ? tokens.selectedBg : 'transparent',
-                  border: 'none',
-                  borderRadius: 6,
-                  cursor: 'pointer',
-                }}
-              >
-                {target.depth === 0 ? (
-                  <IconFolderRoot size={14} stroke={1.5} style={{ color: tokens.textSecondary }} />
-                ) : (
-                  <IconFolder size={14} stroke={1.5} style={{ color: tokens.textSecondary }} />
-                )}
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {target.label}
-                </span>
-              </button>
-            );
-          })}
-        </Stack>
-      </ScrollArea.Autosize>
+      <Select
+        label="目标文件夹"
+        placeholder="选择要移动到哪个文件夹"
+        searchable
+        value={choiceKey}
+        onChange={setChoiceKey}
+        data={targets.map((t) => ({ value: targetKey(t), label: t.label }))}
+      />
 
       <Group justify="flex-end" mt="md">
         <Button variant="subtle" onClick={() => { reset(); onClose(); }}>

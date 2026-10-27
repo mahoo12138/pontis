@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Button, Group, Modal, Stack, Text, TextInput } from '@mantine/core';
+import { Button, Group, Modal, Stack, TagsInput, Text, TextInput } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import type { PublicationDetail } from '@pontis/api';
 import { useUpdatePublication } from '../../hooks/use-plaza';
@@ -20,14 +20,14 @@ export default function EditMetaModal({
   const update = useUpdatePublication();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [tags, setTags] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (opened && publication) {
       setTitle(publication.title);
       setDescription(publication.description);
-      setTags(publication.tags.join(', '));
+      setTags(publication.tags);
       setError(null);
     }
   }, [opened, publication]);
@@ -47,10 +47,7 @@ export default function EditMetaModal({
         params: {
           title: trimmed,
           description: description.trim(),
-          tags: tags
-            .split(/[,，]/)
-            .map((t) => t.trim())
-            .filter(Boolean),
+          tags,
         },
       },
       {
@@ -88,11 +85,15 @@ export default function EditMetaModal({
           value={description}
           onChange={(e) => setDescription(e.currentTarget.value)}
         />
-        <TextInput
+        {/* Mantine splits on the half-width comma only; the full-width one is what
+            a Chinese input method actually produces, and both were accepted while
+            this was a plain text field. */}
+        <TagsInput
           label="标签"
-          placeholder="用逗号分隔,例如:Go, 后端"
+          placeholder="输入后按逗号或回车"
           value={tags}
-          onChange={(e) => setTags(e.currentTarget.value)}
+          onChange={setTags}
+          splitChars={[',', '，']}
         />
         <Text fz={12} c="dimmed">
           修改只影响列表里的展示,不会改动已经发布的快照内容。

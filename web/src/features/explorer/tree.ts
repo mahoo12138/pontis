@@ -118,3 +118,34 @@ export function flattenVisible(
 
   return rows;
 }
+
+/** Titles from the root down to and including `id`. */
+export function pathTitles(index: TreeIndex, id: string): string[] {
+  const titles: string[] = [];
+  const seen = new Set<string>();
+  let current = index.byId.get(id);
+  // A parent chain is server data; a cycle must hang the picker rather than
+  // prove itself impossible, so the walk stops the first time it revisits.
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    titles.unshift(current.title);
+    current = current.parent_id ? index.byId.get(current.parent_id) : undefined;
+  }
+  return titles;
+}
+
+/**
+ * Every folder keyed by id, labelled with its whole path.
+ *
+ * A bookmark tree has the same folder names over and over — "工作", "临时",
+ * "未分类" — and a flat picker cannot tell them apart, so the label carries
+ * what the indent used to.
+ */
+export function folderPaths(nodes: Node[]): Map<string, string> {
+  const index = buildTreeIndex(nodes);
+  const out = new Map<string, string>();
+  for (const node of index.byId.values()) {
+    if (node.type === 'folder') out.set(node.id, pathTitles(index, node.id).join(' / '));
+  }
+  return out;
+}

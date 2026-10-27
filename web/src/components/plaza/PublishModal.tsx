@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Button, Group, Modal, NativeSelect, Stack, Text, TextInput } from '@mantine/core';
+import { Button, Group, Modal, Select, Stack, TagsInput, Text, TextInput } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import type { PublicationVisibility, Space } from '@pontis/api';
 import { usePublish } from '../../hooks/use-plaza';
 import { useNodes } from '../../hooks/use-nodes';
+import { folderPaths } from '../../features/explorer';
 
 /** The three things a user can publish (doc 10 §3), all stored as one tree. */
 type SourceKind = 'space' | 'folder' | 'bookmark';
@@ -30,7 +31,7 @@ export default function PublishModal({
   const [sourceKind, setSourceKind] = useState<SourceKind>('space');
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [tags, setTags] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
   const [visibility, setVisibility] = useState<PublicationVisibility>('plaza');
   const [error, setError] = useState<string | null>(null);
 
@@ -41,7 +42,7 @@ export default function PublishModal({
       setSourceKind('space');
       setTitle('');
       setDescription('');
-      setTags('');
+      setTags([]);
       setVisibility('plaza');
       setError(null);
     }
@@ -49,13 +50,23 @@ export default function PublishModal({
   }, [opened]);
 
   const { data: nodesData } = useNodes(sourceKind === 'space' ? undefined : spaceId || undefined);
-  const sourceOptions = useMemo(
-    () =>
-      (nodesData?.nodes ?? [])
-        .filter((n) => (sourceKind === 'space' ? false : n.type === sourceKind))
-        .map((n) => ({ value: n.id, label: n.title })),
-    [nodesData, sourceKind],
-  );
+  // Two folders called 「工作」are the normal case, not the exception, so a
+  // folder is labelled with its whole path and a bookmark with the folder it
+  // sits in — its own title stays the part worth reading first.
+  const sourceOptions = useMemo(() => {
+    const nodes = nodesData?.nodes ?? [];
+    if (sourceKind === 'space') return [];
+    const paths = folderPaths(nodes);
+    return nodes
+      .filter((n) => n.type === sourceKind)
+      .map((n) => ({
+        value: n.id,
+        label:
+          sourceKind === 'folder'
+            ? paths.get(n.id) ?? n.title
+            : `${n.title}  ·  ${n.parent_id ? paths.get(n.parent_id) ?? '根目录' : '根目录'}`,
+      }));
+  }, [nodesData, sourceKind]);
 
   const handlePublish = () => {
     const trimmed = title.trim();
@@ -75,10 +86,7 @@ export default function PublishModal({
         title: trimmed,
         description: description.trim() || undefined,
         visibility,
-        tags: tags
-          .split(/[,，]/)
-          .map((t) => t.trim())
-          .filter(Boolean),
+        tags,
       },
       {
         onSuccess: () => {
@@ -107,16 +115,18 @@ export default function PublishModal({
       styles={{ header: { fontSize: 15, fontWeight: 600 } }}
     >
       <Stack gap="sm">
-        <NativeSelect
+        <Select
           label="来源空间"
           data={spaces.map((s) => ({ value: s.id, label: s.name }))}
           value={spaceId}
-          onChange={(e) => {
-            setSpaceId(e.currentTarget.value);
+          searchable
+          onChange={(v) => {
+            if (!v) return;
+            setSpaceId(v);
             setSource('');
           }}
         />
-        <NativeSelect
+        <Select
           label="发布范围"
           data={[
             { value: 'space', label: '整个空间' },
@@ -124,20 +134,19 @@ export default function PublishModal({
             { value: 'bookmark', label: '单个书签' },
           ]}
           value={sourceKind}
-          onChange={(e) => {
-            setSourceKind(e.currentTarget.value as SourceKind);
+          onChange={(v) => {
+            setSourceKind((v ?? 'space') as SourceKind);
             setSource('');
           }}
         />
         {sourceKind !== 'space' && (
-          <NativeSelect
+          <Select
             label={sourceKind === 'folder' ? '发布内容' : '发布书签'}
-            data={[
-              { value: '', label: sourceKind === 'folder' ? '选择文件夹…' : '选择书签…', disabled: true },
-              ...sourceOptions,
-            ]}
-            value={source}
-            onChange={(e) => setSource(e.currentTarget.value)}
+            placeholder={sourceKind === 'folder' ? '选择文件夹…' : '选择书签…'}
+            data={sourceOptions}
+            value={source || null}
+            searchable
+            onChange={(v) => setSource(v ?? '')}
           />
         )}
         <TextInput
@@ -157,20 +166,24 @@ export default function PublishModal({
           value={description}
           onChange={(e) => setDescription(e.currentTarget.value)}
         />
-        <TextInput
+        {/* Mantine splits on the half-width comma only; the full-width one is what
+            a Chinese input method actually produces, and both were accepted while
+            this was a plain text field. */}
+        <TagsInput
           label="标签"
-          placeholder="用逗号分隔,例如:Go, 后端"
+          placeholder="输入后按逗号或回车"
           value={tags}
-          onChange={(e) => setTags(e.currentTarget.value)}
+          onChange={setTags}
+          splitChars={[',', '，']}
         />
-        <NativeSelect
+        <Select
           label="可见性"
           data={[
             { value: 'plaza', label: '公开到广场' },
             { value: 'private', label: '私有（仅自己在「我的发布」可见）' },
           ]}
           value={visibility}
-          onChange={(e) => setVisibility(e.currentTarget.value as PublicationVisibility)}
+          onChange={(v) => v && setVisibility(v as PublicationVisibility)}
         />
         <Text fz={12} c="dimmed">
           发布会创建一个独立的版本化快照,不包含私有 UUID、修订号或设备信息。

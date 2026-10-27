@@ -6,9 +6,9 @@ import {
   Group,
   Menu,
   Modal,
-  NativeSelect,
   PasswordInput,
   SegmentedControl,
+  Select,
   Skeleton,
   Switch,
   Table,
@@ -218,14 +218,14 @@ export function PreferencesPanel() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 480 }}>
       <section>
         <Text className={sectionTitle} mb={4}>界面语言</Text>
-        <NativeSelect
+        <Select
           w={220}
           value={i18n.language}
           data={[
             { value: 'zh-CN', label: '简体中文' },
             { value: 'en', label: 'English' },
           ]}
-          onChange={(e) => void i18n.changeLanguage(e.currentTarget.value)}
+          onChange={(v) => v && void i18n.changeLanguage(v)}
         />
       </section>
       <section>
@@ -480,11 +480,11 @@ function CreateTokenModal({ opened, onClose }: { opened: boolean; onClose: () =>
             onChange={(e) => setSpaceScope(e.currentTarget.checked ? 'all' : 'selected')}
             mb="sm"
           />
-          <NativeSelect
+          <Select
             label="有效期"
             data={TOKEN_LIFETIMES}
             value={String(lifetimeDays)}
-            onChange={(e) => setLifetimeDays(Number(e.currentTarget.value))}
+            onChange={(v) => v && setLifetimeDays(Number(v))}
             mb="sm"
           />
           <Group justify="flex-end" mt="lg">

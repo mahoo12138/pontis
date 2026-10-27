@@ -716,6 +716,7 @@ Server Revision     18,340
 
 - Label 清晰
 - Helper Text 克制，且放在**控件下方**：Mantine 默认把描述排在 label 与控件之间，而描述是可选的，于是同一个字段行里，有描述的控件会比没有的低一行。主题在 `InputWrapper.defaultProps.inputWrapperOrder` 里统一改成 `label → input → description → error`；只有控件槽里装着嵌套字段的复合 wrapper（如起始页的「背景图片」）才在调用处传回原顺序，让说明贴着它所属的标题。
+- 选项列表一律用主题化的 `Select`，不用系统原生 `<select>` / `NativeSelect`：原生控件由平台绘制，圆角、字号、箭头和禁用态都不受本主题控制，混用会读成两个产品。筛选器的「全部」是空值而不是一个选项，用 `placeholder` + `clearable` 表达，清空即不写进 URL。
 - 一行放多个字段时显式写 `align`：`Group` 默认居中，会把两个控件错开；`<Group grow>` 一律 `align="flex-start"`。
 - 字段之间的间距不小于 `md`：描述与自己的控件只隔 4px，间距必须明显大于它才不会串行。
 - 表单宽度通常 400–640px

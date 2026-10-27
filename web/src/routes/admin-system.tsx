@@ -1,4 +1,4 @@
-import { NativeSelect, SegmentedControl, Skeleton, Text } from '@mantine/core';
+import { SegmentedControl, Select, Skeleton, Text } from '@mantine/core';
 import ErrorState from '../components/common/ErrorState';
 import { sectionTitle, sectionHint } from '../styles/management.css';
 import { tokens } from '../styles/semantic-tokens.css';
@@ -42,7 +42,7 @@ export default function AdminSystemPage() {
       </section>
       <section>
         <Text className={sectionTitle} mb={4}>会话有效期</Text>
-        <NativeSelect
+        <Select
           disabled
           w={220}
           value={s?.session_ttl_hours ?? '24'}
@@ -52,18 +52,18 @@ export default function AdminSystemPage() {
             { value: '168', label: '7 天' },
             { value: '720', label: '30 天' },
           ]}
-          onChange={(e) => update.mutate({ session_ttl_hours: Number(e.currentTarget.value) })}
+          onChange={(v) => v && update.mutate({ session_ttl_hours: Number(v) })}
         />
         <NotLive reason="有效期是服务端常量，改动不会让已签发的会话提前或延后过期。" />
       </section>
       <section>
         <Text className={sectionTitle} mb={4}>每用户空间上限</Text>
-        <NativeSelect
+        <Select
           disabled
           w={220}
           value={s?.max_spaces_per_user ?? '16'}
           data={['4', '8', '16', '32', '64'].map((v) => ({ value: v, label: `${v} 个` }))}
-          onChange={(e) => update.mutate({ max_spaces_per_user: Number(e.currentTarget.value) })}
+          onChange={(v) => v && update.mutate({ max_spaces_per_user: Number(v) })}
         />
         <NotLive reason="创建 Space 时不校验数量，这个上限不会拒绝任何请求。" />
       </section>
