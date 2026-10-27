@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Alert, Button, Group, Paper, PasswordInput, Stack, Text, Title } from '@mantine/core';
 import { IconAlertCircle, IconCheck } from '@tabler/icons-react';
 import { useResetPassword } from '../hooks/use-auth';
+import { authFieldError } from '../lib/errors';
 import { PontisLogo } from '../components/common/PontisLogo';
 
 /**
@@ -22,6 +23,7 @@ export default function ResetPasswordPage() {
 
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
+  const [passwordError, setPasswordError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   if (!token) {
@@ -51,24 +53,26 @@ export default function ResetPasswordPage() {
 
   const submit = async () => {
     setError(null);
+    setPasswordError(null);
     if (password.length < 8) {
-      setError('密码至少 8 个字符');
+      setPasswordError('密码至少 8 个字符');
       return;
     }
-    if (password !== confirm) {
-      setError('两次输入的密码不一致');
-      return;
-    }
+    // A mismatch is already written under 确认新密码; submitting anyway would
+    // spend the one-time link on a password this page knows is wrong.
+    if (password !== confirm) return;
     try {
       await reset.mutateAsync({ token, new_password: password });
       setDone(true);
     } catch (e) {
-      const code = (e as { code?: string })?.code;
-      setError(
-        code === 'RESET_TOKEN_INVALID'
-          ? '这条重置链接已经用过或已过期，需要管理员重新生成一条。'
-          : ((e as Error)?.message ?? '重置失败'),
-      );
+      const field = authFieldError(e);
+      if (field?.field === 'password') setPasswordError(field.text);
+      else
+        setError(
+          (e as { code?: string })?.code === 'RESET_TOKEN_INVALID'
+            ? '这条重置链接已经用过或已过期，需要管理员重新生成一条。'
+            : ((e as Error)?.message ?? '重置失败'),
+        );
     }
   };
 
@@ -87,6 +91,7 @@ export default function ResetPasswordPage() {
           label="新密码"
           withAsterisk
           autoComplete="new-password"
+          error={passwordError ?? undefined}
           value={password}
           onChange={(e) => setPassword(e.currentTarget.value)}
         />

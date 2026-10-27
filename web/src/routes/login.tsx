@@ -34,7 +34,18 @@ export default function LoginPage() {
       await loginMutation.mutateAsync(values);
       navigate('/');
     } catch (e: any) {
-      setError(e?.message ?? '登录失败');
+      // Neither of these belongs to one box: the server will not say which half
+      // was wrong (that would tell someone which usernames exist), and a disabled
+      // account is a fact about the account. So they stay with the form — but in
+      // the page's own language rather than the server's.
+      const code = (e as { code?: string } | undefined)?.code;
+      setError(
+        code === 'INVALID_CREDENTIALS'
+          ? '用户名或密码错误'
+          : code === 'ACCOUNT_DISABLED'
+            ? '这个账号已被停用，请联系管理员'
+            : (e?.message ?? '登录失败'),
+      );
     }
   });
 

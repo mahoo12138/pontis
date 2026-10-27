@@ -14,6 +14,7 @@ import {
 import { useForm } from '@mantine/form';
 import { IconAlertCircle } from '@tabler/icons-react';
 import { useRegister, useSystemStatus } from '../hooks/use-auth';
+import { authFieldError } from '../lib/errors';
 import { PontisLogo } from '../components/common/PontisLogo';
 
 export default function RegisterPage() {
@@ -50,7 +51,9 @@ export default function RegisterPage() {
       // and takes the visitor through.
       navigate('/login', { state: { registered: true } });
     } catch (e: any) {
-      setError(e?.message ?? '注册失败');
+      const field = authFieldError(e);
+      if (field) form.setFieldError(field.field, field.text);
+      else setError(e?.message ?? '注册失败');
     }
   });
 

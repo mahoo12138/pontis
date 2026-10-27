@@ -13,6 +13,7 @@ import {
 import { useForm } from '@mantine/form';
 import { IconAlertCircle } from '@tabler/icons-react';
 import { useSetup } from '../hooks/use-auth';
+import { authFieldError } from '../lib/errors';
 import { PontisLogo } from '../components/common/PontisLogo';
 
 export default function SetupPage() {
@@ -35,7 +36,9 @@ export default function SetupPage() {
       // Backend setup does not issue a session cookie; log in next.
       navigate('/login');
     } catch (e: any) {
-      setError(e?.message ?? '创建失败');
+      const field = authFieldError(e);
+      if (field) form.setFieldError(field.field, field.text);
+      else setError(e?.message ?? '创建失败');
     }
   });
 

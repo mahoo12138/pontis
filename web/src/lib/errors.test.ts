@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { ApiError, ContractViolation } from '@pontis/api';
-import { describeError } from './errors';
+import { authFieldError, describeError } from './errors';
 
 describe('describeError', () => {
   it('keeps the server code on a client-side rejection', () => {
@@ -32,5 +32,32 @@ describe('describeError', () => {
     expect(describeError(null)).toBeUndefined();
     expect(describeError('a string')).toBeUndefined();
     expect(describeError(new Error(''))).toBeUndefined();
+  });
+});
+
+// What a rejected sign-up is told, and where. The four codes the server uses to
+// name one half of the form must land under that field; the rest stay with the
+// form, because they are not about any one box.
+describe('authFieldError', () => {
+  it('routes a rejected field to the box it rejected', () => {
+    const taken = new ApiError(409, 'USERNAME_TAKEN', 'username already in use', 'req_1');
+    expect(authFieldError(taken)).toEqual({ field: 'username', text: '这个用户名已经被占用' });
+    expect(authFieldError(new ApiError(400, 'INVALID_PASSWORD', 'password must be at least 8 characters', 'r'))).toEqual({
+      field: 'password',
+      text: '密码至少 8 个字符',
+    });
+    expect(authFieldError(new ApiError(409, 'EMAIL_TAKEN', 'email already in use', 'r'))?.field).toBe('email');
+  });
+
+  it('leaves a wrong credential with the form, because saying which half was wrong leaks who exists', () => {
+    expect(authFieldError(new ApiError(401, 'INVALID_CREDENTIALS', 'unknown user or wrong password', 'r'))).toBeNull();
+    expect(authFieldError(new ApiError(403, 'RESET_TOKEN_INVALID', 'reset link is invalid, used or expired', 'r'))).toBeNull();
+    expect(authFieldError(new ApiError(500, 'INTERNAL', 'internal error', 'r'))).toBeNull();
+  });
+
+  it('says nothing for a failure that never reached the server', () => {
+    expect(authFieldError(new TypeError('Failed to fetch'))).toBeNull();
+    expect(authFieldError(undefined)).toBeNull();
+    expect(authFieldError(null)).toBeNull();
   });
 });

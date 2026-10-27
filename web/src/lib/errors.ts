@@ -9,6 +9,32 @@
 
 import { ApiError, ContractViolation } from '@pontis/api';
 
+/** Which box a rejected sign-up or password change belongs to.
+ *
+ *  The server names what it rejected by code, so the sentence can go under the
+ *  field it is about instead of in a banner above the form, where it reads as a
+ *  complaint about the page. The copy is written here rather than passed through:
+ *  the server answers in English, and these four restate the form's own rules.
+ *
+ *  Codes that name no field stay with the form. `INVALID_CREDENTIALS` is
+ *  deliberately not attributable — saying which half was wrong would tell someone
+ *  which usernames exist — and a spent reset link is a fact about the link, not
+ *  about a box.
+ */
+export type AuthField = 'username' | 'password' | 'email';
+
+const AUTH_FIELD_ERRORS: Record<string, { field: AuthField; text: string }> = {
+  INVALID_USERNAME: { field: 'username', text: '用户名需为 3–32 位字母、数字或 . _ -' },
+  USERNAME_TAKEN: { field: 'username', text: '这个用户名已经被占用' },
+  EMAIL_TAKEN: { field: 'email', text: '这个邮箱已经注册过了' },
+  INVALID_PASSWORD: { field: 'password', text: '密码至少 8 个字符' },
+};
+
+export function authFieldError(error: unknown): { field: AuthField; text: string } | null {
+  const code = (error as { code?: string } | null | undefined)?.code;
+  return (code && AUTH_FIELD_ERRORS[code]) || null;
+}
+
 export function describeError(error: unknown): string | undefined {
   if (error instanceof ContractViolation) {
     // The message already names the path and what was expected, e.g.
