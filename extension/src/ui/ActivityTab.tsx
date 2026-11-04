@@ -13,11 +13,13 @@ import {
   Button,
   Group,
   Modal,
+  NumberInput,
   Progress,
   SegmentedControl,
   Stack,
   TagsInput,
   Text,
+  TextInput,
 } from '@mantine/core';
 import { Section } from './Section';
 import { fmtDuration } from './duration';
@@ -36,6 +38,7 @@ import {
   createSuggestedBookmark,
   type ActivitySuggestions,
 } from '../core/activity/suggest';
+import { normalizeLimit } from '../core/activity/limits';
 
 /** The trailing N local days, oldest first: `YYYY-MM-DD` strings the
  *  aggregate tables are keyed by. */
@@ -101,6 +104,9 @@ export function ActivityTab({ paired }: { paired: boolean }) {
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [limitHost, setLimitHost] = useState('');
+  const [limitMinutes, setLimitMinutes] = useState(30);
+  const [limitNotice, setLimitNotice] = useState<{ kind: 'ok' | 'warn'; text: string } | null>(null);
 
   const refresh = useCallback(() => {
     readActivityView(activityDb, adapter)
@@ -152,6 +158,47 @@ export function ActivityTab({ paired }: { paired: boolean }) {
       setError(errText(e));
     } finally {
       setClearing(false);
+    }
+  };
+
+  /**
+   * The one runtime ask of the OPTIONAL notifications permission, and it
+   * happens inside the click that adds a limit — the copy above the form has
+   * already said what the permission is for, so the browser's own grant
+   * bubble arrives with the context in place. A person who never adds a
+   * limit never sees this call.
+   */
+  const ensureNotificationPermission = async (): Promise<boolean> => {
+    const { chrome } = runtime;
+    const granted = await chrome.permissions.contains({ permissions: ['notifications'] });
+    if (granted) return true;
+    return new Promise<boolean>((resolve) =>
+      chrome.permissions.request({ permissions: ['notifications'] }, resolve),
+    );
+  };
+
+  const doAddLimit = async () => {
+    const limit = normalizeLimit({ host: limitHost, minutes: limitMinutes });
+    if (!limit) {
+      setLimitNotice({ kind: 'warn', text: '域名或分钟数不对：填主机名（如 bilibili.com）和 1–1440 的整数分钟。' });
+      return;
+    }
+    try {
+      const granted = await ensureNotificationPermission();
+      const others = (view?.prefs.limits ?? []).filter((l) => l.host !== limit.host);
+      await savePrefs({ limits: [...others, limit] });
+      setLimitNotice(
+        granted
+          ? { kind: 'ok', text: `已设定：${limit.host} 每天 ${limit.minutes} 分钟，到点会弹一条通知。` }
+          : {
+              kind: 'warn',
+              text: '通知权限没有授予：限额仍会记录，到点在活动页可见，但不弹提醒；下次添加限额时会再次询问。',
+            },
+      );
+      setLimitHost('');
+      setLimitMinutes(30);
+    } catch (e) {
+      setError(errText(e));
     }
   };
 
@@ -208,6 +255,71 @@ export function ActivityTab({ paired }: { paired: boolean }) {
           <Text size="xs" c="dimmed">
             原始记录保留 {prefs.segmentRetentionDays} 天，按天汇总保留 {prefs.aggregateRetentionDays} 天，到期自动删除。
           </Text>
+        </Stack>
+      </Section>
+
+      <Section
+        title="每日限额"
+        hint="给特定站点设一天的预算，到点弹一条系统通知——只提醒、不拦截、不上报。通知权限只在添加第一个限额时申请，也只用于这个提醒。"
+      >
+        <Stack gap="sm">
+          {(prefs.limits ?? []).length === 0 ? (
+            <Text size="xs" c="dimmed">
+              还没有限额。比较常见的用法是给容易刷起来的站点设一个上限，比如 30 分钟。
+            </Text>
+          ) : (
+            (prefs.limits ?? []).map((l) => (
+              <Group key={l.host} gap="xs" wrap="nowrap" justify="space-between">
+                <Text size="sm" truncate style={{ flex: 1 }}>
+                  {l.host}
+                  <Text size="xs" c="dimmed" component="span" ml={6}>
+                    {l.minutes} 分钟 / 天
+                  </Text>
+                </Text>
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  color="coolGray"
+                  onClick={() => {
+                    setLimitNotice(null);
+                    void savePrefs({ limits: (prefs.limits ?? []).filter((x) => x.host !== l.host) });
+                  }}
+                >
+                  删除
+                </Button>
+              </Group>
+            ))
+          )}
+          <Group gap="xs" wrap="nowrap" align="flex-end">
+            <TextInput
+              size="xs"
+              placeholder="站点，如 bilibili.com"
+              value={limitHost}
+              onChange={(e) => setLimitHost(e.currentTarget.value)}
+              style={{ flex: 1 }}
+            />
+            <NumberInput
+              size="xs"
+              w={120}
+              min={1}
+              max={1440}
+              value={limitMinutes}
+              onChange={(v) => setLimitMinutes(Number(v) || 0)}
+              suffix=" 分钟"
+            />
+            <Button size="xs" variant="light" onClick={() => void doAddLimit()}>
+              添加
+            </Button>
+          </Group>
+          {limitNotice && (
+            <Alert
+              color={limitNotice.kind === 'ok' ? 'healthyGreen' : 'warningAmber'}
+              variant="light"
+              maw={480}
+            >
+              {limitNotice.text}
+            </Alert>
+          )}
         </Stack>
       </Section>
 

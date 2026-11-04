@@ -17,9 +17,10 @@ import { RemoteChangeApplier } from '../core/sync/remoteChangeApplier';
 import { ResyncService, type IntentDecision } from '../core/sync/resync';
 import { SyncCoordinator } from '../core/sync/syncCoordinator';
 import { WorkerLoop } from '../core/sync/workerLoop';
-import { ActivityDB, loadActivityPrefs } from '../core/activity/store';
+import { ActivityDB, dayKeyOf, loadActivityPrefs } from '../core/activity/store';
 import { ActivityTracker, type ActivityChromeApi } from '../core/activity/tracker';
 import { flushActivity } from '../core/activity/uploader';
+import { checkDailyLimits } from '../core/activity/limits';
 import { chromeApi, kvArea } from '../runtime/chromeApi';
 
 export default defineBackground(() => {
@@ -59,6 +60,33 @@ export default defineBackground(() => {
       // only risk an unhandled rejection on a worker that is about to die.
     });
 
+  // Daily-budget nudges ride the same heartbeat. One notification per host
+  // per day — the dedupe lives in the prefs row, durable across worker
+  // replacements — and only when the OPTIONAL notifications permission has
+  // actually been granted at add-a-limit time. A click on the notification
+  // opens the activity tab; that is the whole interaction.
+  const notifyLimitHits = () =>
+    void (async () => {
+      const hits = await checkDailyLimits(activityDb);
+      for (const hit of hits) {
+        if (!chrome.notifications) return;
+        const granted = await chrome.permissions.contains({ permissions: ['notifications'] });
+        if (!granted) return;
+        const today = dayKeyOf(Date.now());
+        try {
+          await chrome.notifications.create(`pontis-limit-${today}-${hit.host}`, {
+            type: 'basic',
+            iconUrl: chrome.runtime.getURL('/icon/128.png'),
+            title: 'Pontis 每日限额',
+            message: `今日 ${hit.host} 已达 ${hit.minutes} 分钟预算（累计 ${Math.round(hit.seconds / 60)} 分钟）。`,
+          });
+        } catch {
+          // A notification that cannot be shown is not an error to surface:
+          // the numbers remain in the activity tab either way.
+        }
+      }
+    })().catch(() => undefined);
+
   // A fresh install has nothing paired and no way to know where to start.
   // Opening the guide is the only moment the extension puts a window in front of
   // a person; after that everything is theirs to reopen. An update never does
@@ -85,12 +113,22 @@ export default defineBackground(() => {
       flushActivityNow();
     }
     if (alarm.name === 'pontis-integrity') void loop.runIntegrity('daily');
-    if (alarm.name === 'pontis-activity-hb') void tracker.onHeartbeat();
+    if (alarm.name === 'pontis-activity-hb') {
+      void tracker.onHeartbeat();
+      notifyLimitHits();
+    }
   });
   chrome.runtime.onStartup.addListener(() => {
     void loop.runSync('startup');
     void loop.runIntegrity('startup');
     flushActivityNow();
+  });
+
+  // A budget nudge clicked mid-evening wants the page where the numbers and
+  // the edit button live, not a generic greeting.
+  chrome.notifications?.onClicked.addListener((id) => {
+    if (!id.startsWith('pontis-limit-')) return;
+    void chrome.tabs.create({ url: chrome.runtime.getURL('options.html#activity') });
   });
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

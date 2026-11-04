@@ -77,7 +77,17 @@ export interface ChromeGlobal {
    */
   permissions: {
     request(details: { permissions?: string[]; origins?: string[] }, callback: (granted: boolean) => void): void;
-    contains(details: { origins?: string[] }): Promise<boolean>;
+    contains(details: { origins?: string[]; permissions?: string[] }): Promise<boolean>;
+  };
+  /**
+   * The OPTIONAL notifications permission, requested at runtime only when a
+   * person adds their first daily limit. Optional because a person who never
+   * sets a limit should never be asked and never see the permission; absent
+   * here because only the background ever uses it.
+   */
+  notifications?: {
+    create(id: string, options: { type: 'basic'; iconUrl: string; title: string; message: string }): Promise<void>;
+    onClicked: { addListener(cb: (notificationId: string) => void): void };
   };
 }
 

@@ -94,6 +94,12 @@ export interface ActivityCurrentState {
 
 export type ActivityMode = 'off' | 'local' | 'upload';
 
+/** One daily budget: a host and how many minutes of it a day is enough. */
+export interface ActivityHostLimit {
+  host: string;
+  minutes: number;
+}
+
 export interface ActivityPrefsRecord {
   id: 'prefs';
   /**
@@ -110,6 +116,11 @@ export interface ActivityPrefsRecord {
    *  days that fall off locally stop being re-sent, and the server GCs
    *  older rows on its own schedule). */
   aggregateRetentionDays: number;
+  /** Per-host daily budgets. Entirely local: a limit never uploads. */
+  limits: ActivityHostLimit[];
+  /** host → local day the budget notification last fired. The dedupe that
+   *  keeps a stuck-open tab from nudging once a minute all evening. */
+  limitsNotified?: Record<string, string>;
   updatedAt: number;
 }
 
@@ -123,6 +134,7 @@ export function defaultActivityPrefs(): ActivityPrefsRecord {
     blocklist: [],
     segmentRetentionDays: DEFAULT_SEGMENT_RETENTION_DAYS,
     aggregateRetentionDays: DEFAULT_AGGREGATE_RETENTION_DAYS,
+    limits: [],
     updatedAt: 0,
   };
 }

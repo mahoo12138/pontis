@@ -97,6 +97,14 @@ export default defineConfig({
     // aggregates, never a URL.
     permissions: ['bookmarks', 'storage', 'alarms', 'search', 'tabs', 'idle'],
     optional_host_permissions: ['http://*/*', 'https://*/*'],
+    // `notifications` is OPTIONAL on purpose, and this is the whole answer to
+    // "why does a bookmark tool want to show notifications": it is never part
+    // of the install-time grant, a person who never sets a daily limit is
+    // never asked for it, and the one runtime request happens inside the click
+    // that adds the first limit — after the settings page has spelled out the
+    // single purpose: a system notification when a host's day budget is
+    // reached. It blocks no website, collects nothing, and reports nothing.
+    optional_permissions: ['notifications'],
     ...(e2eOrigin ? { host_permissions: [e2eOrigin] } : {}),
   },
 });
