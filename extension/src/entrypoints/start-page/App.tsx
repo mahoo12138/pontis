@@ -27,6 +27,7 @@ import { buildSourceTree, resolveCurrentFolder } from '../../core/start-page/tre
 import { navigableUrl, openNavigable, urlKind } from '../../core/start-page/url';
 import { createSearchAdapter } from '../../core/start-page/search';
 import { SearchArea } from './SearchArea';
+import { ActivityStrip } from '../../ui/ActivityStrip';
 import type { StartPageAppearanceRecord } from '../../core/store/db';
 import type { StartPageSnapshotNodeWire } from '../../core/start-page/wire';
 
@@ -320,6 +321,8 @@ export function App() {
           ))}
         </ul>
       )}
+
+      <ActivityStrip activityDb={runtime.activityDb} />
     </Shell>
   );
 }

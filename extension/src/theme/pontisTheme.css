@@ -529,6 +529,30 @@ html[data-mantine-color-scheme='dark'] .pontis-spHead {
   }
 }
 
+/* The activity strip: one dimmed line at the foot of the launch surface.
+   It competes with nothing — 12px, half-strength ink, hairline link — and
+   only renders when tracking is on and the day has numbers. */
+.pontis-spActivity {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 28px;
+  font-size: 12px;
+  color: var(--mantine-color-dimmed);
+}
+
+.pontis-spActivity a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  opacity: 0.75;
+}
+
+.pontis-spActivity a:hover {
+  opacity: 1;
+}
+
 .pontis-spCrumbs {
   display: flex;
   flex-wrap: wrap;
