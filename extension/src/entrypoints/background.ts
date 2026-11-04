@@ -136,6 +136,14 @@ export default defineBackground(() => {
         .catch((err) => sendResponse({ ok: false, error: String(err) }));
       return true;
     }
+    if (isMessage(msg, 'pontis/activity-flush')) {
+      // The settings page's 立即上传: nobody should wait out a five-minute
+      // alarm to see the badge clear after deliberately switching upload on.
+      // Failures land in the queue rows, so the answer only says it ran.
+      flushActivityNow();
+      sendResponse({ ok: true });
+      return true;
+    }
     return undefined;
   });
 

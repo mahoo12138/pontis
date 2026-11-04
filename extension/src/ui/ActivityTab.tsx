@@ -100,6 +100,7 @@ export function ActivityTab({ paired }: { paired: boolean }) {
   const [bookmarking, setBookmarking] = useState<string | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
   const refresh = useCallback(() => {
     readActivityView(activityDb, adapter)
@@ -215,9 +216,32 @@ export function ActivityTab({ paired }: { paired: boolean }) {
         hint={`共 ${fmtDuration(today.total)} · ${today.visits} 段专注 · 切换 ${today.switches} 次`}
         right={
           prefs.mode === 'upload' ? (
-            <Text size="xs" c="dimmed">
-              {queued > 0 ? `${queued} 天待上传` : '已全部上传'}
-            </Text>
+            <Group gap="xs" wrap="nowrap">
+              <Text size="xs" c="dimmed">
+                {queued > 0 ? `${queued} 天待上传` : '已全部上传'}
+              </Text>
+              {queued > 0 && (
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  color="coolGray"
+                  loading={uploading}
+                  onClick={() =>
+                    void (async () => {
+                      setUploading(true);
+                      try {
+                        await runtime.chrome.runtime.sendMessage({ type: 'pontis/activity-flush' });
+                        refresh();
+                      } finally {
+                        setUploading(false);
+                      }
+                    })()
+                  }
+                >
+                  立即上传
+                </Button>
+              )}
+            </Group>
           ) : undefined
         }
       >

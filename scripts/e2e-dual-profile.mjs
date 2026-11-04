@@ -536,6 +536,11 @@ const HELPERS = `
     return 'typed';
   };
   const bodyText = () => document.body.innerText;
+  // Mantine's SegmentedControl hides the real radio input and paints the
+  // options as labels inside one role=radiogroup; the label is the click
+  // target, the same way the mount field's radio rows work above.
+  const segmentRect = (text) => rectOf([...document.querySelectorAll('[role="radiogroup"] label')]
+    .find((el) => (el.textContent || '').includes(text)));
 `;
 
 /**
@@ -937,6 +942,96 @@ async function main() {
       check(text.includes('E2E Converge'), `${name}: popup lists the bound space`, text.slice(0, 160));
       check(!/需要恢复|等待确认|目录缺失/.test(text), `${name}: binding needs no human`, text.slice(0, 160));
     }
+
+    // ─── 浏览统计：真实标签页、真实事件、真实上报 ─────────────────────
+    //
+    // The tracker lives in profile A's service worker; opening and rotating
+    // real tabs is the exact signal a person produces (onActivated, url
+    // changes, onRemoved — no synthetic events). Two host names for one
+    // server give two attributable rows, because a host label deliberately
+    // carries no port. Then the real settings page turns upload on, the
+    // worker flushes, and the server API is asked what it now holds.
+
+    const activityProbe = `
+      const db = await new Promise((res, rej) => {
+        const r = indexedDB.open('pontis-activity');
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      });
+      const all = (store) => new Promise((res) => {
+        const q = db.transaction(store).objectStore(store).getAll();
+        q.onsuccess = () => res(q.result || []); q.onerror = () => res([]);
+      });
+      const [segments, daily, metrics, queue, state] = await Promise.all(
+        ['segments', 'daily', 'metrics', 'queue', 'state'].map(all));
+      return JSON.stringify({
+        segments: segments.length,
+        daily: daily.map((d) => d.host + '=' + d.seconds + 's/' + d.visits + 'v'),
+        switches: metrics[0]?.switches ?? 0,
+        queue: queue.map((q) => q.day + ':' + q.status),
+        open: state[0]?.host ?? null,
+      });
+    `;
+    const totalSeconds = (probe) => JSON.parse(probe).daily
+      .reduce((n, row) => n + Number(row.split('=')[1].split('s')[0]), 0);
+
+    // One dwell of ~3.6s per stop: comfortably above MIN_SEGMENT_MS (2s), so
+    // a stop counts as a recorded episode even if idle detection clips it.
+    const browseTo = async (url) => {
+      const page = await a.browser.page(url, { fresh: true });
+      try { await page.send('Page.bringToFront'); } catch { /* cosmetic */ }
+      await new Promise((r) => setTimeout(r, 3600));
+      return page;
+    };
+    const browseUrls = [`${ORIGIN}/login`, `http://localhost:${PORT}/login`, `${ORIGIN}/login?e2e=1`];
+
+    let probe = '';
+    for (let round = 0; round < 3; round++) {
+      for (const url of browseUrls) await browseTo(url);
+      for (const url of browseUrls) await a.browser.closePages(url);
+      // Returning focus to the settings tab also rotates the open segment
+      // onto an untracked page, which is how the last dwell gets settled.
+      // The probe is a function body of its own (it carries its return),
+      // evaluated raw like REPLICA_DUMP above.
+      probe = await a.page.evaluate(activityProbe);
+      log(`  step A: activity probe ${probe}`);
+      if (totalSeconds(probe) >= 6 && JSON.parse(probe).switches >= 3) break;
+    }
+    const localProbe = JSON.parse(probe);
+    check(totalSeconds(probe) >= 6,
+      'A: real tab rotations left recorded dwell time', probe);
+    check(localProbe.switches >= 3,
+      'A: tab activations counted as context switches', `switches=${localProbe.switches}`);
+    check(localProbe.daily.some((row) => row.startsWith('127.0.0.1='))
+      && localProbe.daily.some((row) => row.startsWith('localhost=')),
+      'A: both host names got their own attribution', localProbe.daily.join(','));
+
+    // Turn upload on through the shipped UI: the 活动 tab, then the mode
+    // segment. No pref is written behind the page's back.
+    log(`  step A: 活动 tab → ${await clickButton(a.page, '活动', 'A')}`);
+    await waitStep(a.page, 'bodyText()', '采集设置', 'A: activity tab mounted', 10_000);
+    await clickAt(a.page,
+      await a.page.evaluate(`${HELPERS}return segmentRect('本地 + 上报');`), 'A: upload mode');
+    // Today's aggregates already exist, so the badge flips to 待上传 at once.
+    await waitStep(a.page, 'bodyText()', '天待上传', 'A: upload mode shows a queued day', 10_000);
+
+    // The flush message the 立即上传 button sends — the same path, driven
+    // directly so the run does not depend on where the button sits.
+    await runStep(a.page, `await chrome.runtime.sendMessage({ type: 'pontis/activity-flush' })`,
+      'A: flush message answered');
+    await waitStep(a.page, 'bodyText()', '已全部上传', 'A: queue drained to the server', 20_000);
+
+    const today = new Date();
+    const day = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const overview = await api('GET', `/api/v1/activity/overview?from=${day}&to=${day}`, { token });
+    check(overview.totals.seconds > 0, 'activity: server holds the dwell seconds',
+      JSON.stringify(overview.totals));
+    check(overview.metrics.switches >= 3, 'activity: switches made it through the batch',
+      JSON.stringify(overview.metrics));
+    check(overview.by_hour.some((s) => s > 0), 'activity: the hour histogram has attention in it',
+      JSON.stringify(overview.by_hour));
+    const serverHosts = await api('GET', `/api/v1/activity/hosts?from=${day}&to=${day}`, { token });
+    check(serverHosts.items.some((h) => h.host === '127.0.0.1' || h.host === 'localhost'),
+      'activity: the host ranking names the browsed hosts', JSON.stringify(serverHosts));
 
     // ─── 升级：同目录替换文件后重新加载 ─────────────────────────────
     // The release upgrade path a person walks (distribution doc §10.2): replace
