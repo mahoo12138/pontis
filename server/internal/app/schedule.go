@@ -20,6 +20,7 @@ func seedSystemSchedules(ctx context.Context, svc *schedule.Service, logger *slo
 		{Type: jobs.TypeJournalGC, Kind: schedule.KindDaily, TimeOfDay: "04:00", Timezone: systemTimezone},
 		{Type: jobs.TypeArtifactCleanup, Kind: schedule.KindDaily, TimeOfDay: "04:10", Timezone: systemTimezone},
 		{Type: jobs.TypeBackupRetention, Kind: schedule.KindDaily, TimeOfDay: "04:20", Timezone: systemTimezone},
+		{Type: jobs.TypeActivityGC, Kind: schedule.KindDaily, TimeOfDay: "04:30", Timezone: systemTimezone},
 	}
 	for _, seed := range seeds {
 		exists, err := svc.FindSystem(ctx, seed.Type)

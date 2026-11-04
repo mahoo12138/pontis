@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"pontis/internal/activity"
 	"pontis/internal/auth"
 	"pontis/internal/backup"
 	"pontis/internal/canonical"
@@ -101,7 +102,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 	organizerSvc := organizer.NewService(libraryStore, sqlite.NewLinkCheckStore(db),
 		organizer.Outbound{Allow: allow})
 	tokenStore := sqlite.NewTokenStore(db)
-	jobSvc, err := buildJobService(db, backupSvc, organizerSvc, accountStore, libraryStore, tokenStore)
+	activitySvc := activity.NewService(sqlite.NewActivityStore(db))
+	jobSvc, err := buildJobService(db, backupSvc, organizerSvc, activitySvc, accountStore, libraryStore, tokenStore)
 	if err != nil {
 		return err
 	}
@@ -134,6 +136,7 @@ func Run(ctx context.Context, cfg config.Config) error {
 		Distribution:  extensionRelease,
 		Deploy:        deploy,
 		Auth:          auth.NewService(sqlite.NewAuthStore(db), sessionTTL),
+		Activity:      activitySvc,
 		Devices:       device.NewService(deviceStore),
 		Spaces:        space.NewService(sqlite.NewSpaceStore(db)),
 		Sync:          sync.NewService(sqlite.NewSyncStore(db), changesetSvc),

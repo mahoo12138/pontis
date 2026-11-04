@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"pontis/internal/activity"
 	"pontis/internal/backup"
 	"pontis/internal/canonical"
 	"pontis/internal/jobs"
@@ -13,12 +14,20 @@ import (
 	"pontis/internal/store/sqlite"
 )
 
+// activityRetentionDays bounds how long uploaded browsing aggregates live on
+// the server. The client's own aggregate retention (180 days) is the tighter
+// bound in practice — days that fell off the client stop being re-sent — so
+// the server matches it rather than promising a longer memory than the
+// device the data came from keeps.
+const activityRetentionDays = 180
+
 // buildJobService wires the queue with the concrete handlers available in
 // this deployment (doc 13 §18).
 func buildJobService(
 	db *sql.DB,
 	backups *backup.Service,
 	organizerSvc *organizer.Service,
+	activitySvc *activity.Service,
 	accounts *sqlite.AccountStore,
 	library *sqlite.LibraryStore,
 	tokens *sqlite.TokenStore,
@@ -131,6 +140,22 @@ func buildJobService(
 	// reason and the queue keeps a visible record instead (doc 13 §14).
 	svc.Register(jobs.TypeMailSend, func(ctx context.Context, job jobs.Job, report jobs.ReportFunc) error {
 		return fmt.Errorf("%w: SMTP is not configured, nothing was sent", jobs.FatalError)
+	})
+
+	// activity.gc: browsing statistics outlive nothing. Aggregates past the
+	// retention day and the batch audit trail past 30 days are removed, the
+	// same promise the extension's own settings page makes about the device.
+	svc.Register(jobs.TypeActivityGC, func(ctx context.Context, job jobs.Job, report jobs.ReportFunc) error {
+		if err := report("按保留策略清理浏览统计", nil, nil); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		cutoffDay := now.AddDate(0, 0, -activityRetentionDays).Format("2006-01-02")
+		removed, err := activitySvc.Purge(ctx, cutoffDay, now.Add(-30*24*time.Hour))
+		if err != nil {
+			return err
+		}
+		return report(fmt.Sprintf("activity GC 完成,清理 %d 行", removed), nil, nil)
 	})
 
 	return svc, nil

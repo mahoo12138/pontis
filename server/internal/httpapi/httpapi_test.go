@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"pontis/internal/activity"
 	"pontis/internal/auth"
 	"pontis/internal/backup"
 	"pontis/internal/canonical"
@@ -70,6 +71,7 @@ func newTestServerWithDB(t *testing.T) (*Server, *httptest.Server, *sql.DB) {
 
 	srv := &Server{
 		Auth:          auth.NewService(sqlite.NewAuthStore(db), 24*time.Hour),
+		Activity:      activity.NewService(sqlite.NewActivityStore(db)),
 		Devices:       device.NewService(sqlite.NewDeviceStore(db)),
 		Spaces:        space.NewService(sqlite.NewSpaceStore(db)),
 		Sync:          sync.NewService(sqlite.NewSyncStore(db), changesetSvc),

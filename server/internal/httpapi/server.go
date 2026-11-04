@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"pontis/internal/activity"
 	"pontis/internal/auth"
 	"pontis/internal/backup"
 	"pontis/internal/canonical"
@@ -47,6 +48,7 @@ const SessionCookie = "pontis_session"
 // Server wires the HTTP API onto the domain services.
 type Server struct {
 	Auth          *auth.Service
+	Activity      *activity.Service
 	Devices       *device.Service
 	Spaces        *space.Service
 	Sync          *sync.Service
@@ -266,12 +268,26 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/v1/devices", s.handleRegisterDevice)
 	})
 
+	// Browsing statistics the extension uploads (core/activity). Ingest is
+	// device-credential territory and writes only the uploader's own rows;
+	// the reads are web-session territory and scoped to the session's user.
+	// There is no admin path to these numbers, on purpose.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireSession)
+		r.Get("/api/v1/activity/overview", s.handleActivityOverview)
+		r.Get("/api/v1/activity/hosts", s.handleActivityHosts)
+	})
+
 	// Device-scoped API (device credential).
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireDevice)
 		r.Get("/api/v1/device/spaces", s.handleDeviceSpaces)
 		r.Get("/api/v1/device/bindings", s.handleListBindings)
 		r.Post("/api/v1/device/bindings", s.handleCreateBinding)
+		// Replace-per-day browse-statistics batches (core/activity). The
+		// device identity decides whose rows are written; the body carries
+		// no user reference at all.
+		r.Post("/api/v1/device/activity/batches", s.handleDeviceActivityIngest)
 		// Unbind: the device drops its subscription; the space keeps its data.
 		r.Delete("/api/v1/device/bindings/{bindingID}", s.handleDeleteBinding)
 		// Unpair: the device revokes itself, which is what the settings page's

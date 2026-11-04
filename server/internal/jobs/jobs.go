@@ -35,6 +35,7 @@ const (
 	TypeBackupRetention Type = "backup.retention"
 	TypeMailSend        Type = "mail.send"
 	TypeImportRun       Type = "import.run"
+	TypeActivityGC      Type = "activity.gc"
 )
 
 // Definition describes one domain task in the registry (doc 13 §4.3).
@@ -58,6 +59,7 @@ var Definitions = []Definition{
 	{Type: TypeBackupRetention, UserVisible: false, Schedulable: false, TitleKey: "task.backup_retention"},
 	{Type: TypeMailSend, UserVisible: false, Schedulable: false, TitleKey: "task.mail_send"},
 	{Type: TypeImportRun, UserVisible: false, Schedulable: false, TitleKey: "task.import_run"},
+	{Type: TypeActivityGC, UserVisible: false, Schedulable: false, TitleKey: "task.activity_gc"},
 }
 
 // DefinitionOf returns the registry entry for a type.

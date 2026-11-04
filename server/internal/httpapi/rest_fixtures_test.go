@@ -78,6 +78,24 @@ func TestGoldenRESTFixtures(t *testing.T) {
 	initializeBinding(t, ts, map[string]string{"Authorization": "Bearer " + deviceToken},
 		created["id"].(string), emptyBrowserSnapshot())
 
+	// Browsing statistics need a day with real rows in it, so the overview
+	// and the host ranking prove their aggregate shapes (a 24-slot hour
+	// histogram with most slots zero, a host page with a total to page
+	// against). The ingest body is exactly what the extension's flush sends.
+	restPOST(t, ts, deviceToken, "/api/v1/device/activity/batches", map[string]any{
+		"days": []any{map[string]any{
+			"day": "2026-01-01",
+			"hosts": []any{
+				map[string]any{"host": "github.com", "seconds": 5400, "visits": 12},
+				map[string]any{"host": "news.example", "seconds": 1800, "visits": 4},
+			},
+			"hours": []any{
+				map[string]any{"hour": 9, "seconds": 2400},
+				map[string]any{"hour": 14, "seconds": 4800},
+			},
+		}},
+	})
+
 	// space_scope is either "all" or a JSON array of ids, so a single-space
 	// token carries an encoded string, not a nested array. The second token
 	// carries an expiry so the fixture shows both shapes of expires_at.
@@ -113,6 +131,12 @@ func TestGoldenRESTFixtures(t *testing.T) {
 		{"nodes", restGET(t, ts, token, "/api/v1/spaces/"+spaceID+"/nodes")},
 		{"root-slots", restGET(t, ts, token, "/api/v1/spaces/"+spaceID+"/root-slots")},
 		{"activity", restGET(t, ts, token, "/api/v1/spaces/"+spaceID+"/activity")},
+		// The browsing-analysis reads (user-scoped, from the rows the
+		// device ingest above wrote).
+		{"activity-overview", restGET(t, ts, token,
+			"/api/v1/activity/overview?from=2026-01-01&to=2026-01-07")},
+		{"activity-hosts", restGET(t, ts, token,
+			"/api/v1/activity/hosts?from=2026-01-01&to=2026-01-07&limit=1")},
 		{"device-overview", restGET(t, ts, token, "/api/v1/devices/overview")},
 		// What the install page reads to decide between "download this" and
 		// "this instance carries no package".
