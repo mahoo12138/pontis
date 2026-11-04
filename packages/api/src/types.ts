@@ -860,10 +860,18 @@ export interface ActivityDayTotal {
   visits: number;
 }
 
+/** Attention-quality summary: switches across the range and the single
+ *  longest focus episode. Days without a report contribute nothing. */
+export interface ActivityMetrics {
+  switches: number;
+  longest_focus_seconds: number;
+}
+
 export interface ActivityOverviewResponse {
   from: string;
   to: string;
   totals: ActivityTotals;
+  metrics: ActivityMetrics;
   by_day: ActivityDayTotal[];
   /** Exactly 24 slots, index = the uploading device's local hour. */
   by_hour: number[];

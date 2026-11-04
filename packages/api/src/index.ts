@@ -6,6 +6,7 @@ export * from './contract';
 export type {
   ActivityHostStat,
   ActivityHostsResponse,
+  ActivityMetrics,
   ActivityOverviewResponse,
   ActivityQuery,
   ActivityTotals,

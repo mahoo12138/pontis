@@ -27,6 +27,7 @@ import {
 } from '../styles/analytics.css';
 import { tokens } from '../styles/semantic-tokens.css';
 import { ACTIVITY_HOST_PAGE_SIZE, useBrowsingHosts, useBrowsingOverview } from '../hooks/use-activity';
+import { CATEGORY_LABELS, summarizeByCategory } from '../features/activity/categories';
 import { useDeviceOverview } from '../hooks/use-devices';
 
 type Range = '7' | '30' | '90';
@@ -69,9 +70,12 @@ function dayLabel(day: string): string {
 function DurationBarList({
   items,
   emptyText,
+  note,
 }: {
   items: { label: string; seconds: number; visits: number }[];
   emptyText: string;
+  /** Right-hand note; defaults to the episode count. */
+  note?: (item: { visits: number }) => string;
 }) {
   if (items.length === 0) return <EmptyState text={emptyText} />;
   const max = Math.max(...items.map((item) => item.seconds), 1);
@@ -89,7 +93,7 @@ function DurationBarList({
           </div>
           <div className={barValue}>
             {fmtDuration(item.seconds)}
-            <span className={barNote}> {item.visits} 段</span>
+            <span className={barNote}> {note ? note(item) : `${item.visits} 段`}</span>
           </div>
         </div>
       ))}
@@ -136,6 +140,10 @@ export default function ActivityPage() {
 
   const deviceOptions = (devices.data?.devices ?? []).map((d) => ({ value: d.id, label: d.name }));
 
+  // Categories are client-side rules over the loaded ranking; the caveat
+  // under the section says exactly what the grouping saw.
+  const categorySummary = useMemo(() => summarizeByCategory(hostItems), [hostItems]);
+
   return (
     <>
       <Header breadcrumb="浏览分析" />
@@ -179,6 +187,11 @@ export default function ActivityPage() {
                       label: '日均',
                       value: dayCount > 0 ? fmtDuration(dailyAvg) : '—',
                     },
+                    { label: '最长专注', value: data.metrics.longest_focus_seconds > 0 ? fmtDuration(data.metrics.longest_focus_seconds) : '—' },
+                    {
+                      label: '标签切换',
+                      value: data.metrics.switches > 0 ? `${data.metrics.switches.toLocaleString('zh-CN')} 次` : '—',
+                    },
                     { label: '最常去', value: topHost?.host ?? '—' },
                   ]}
                 />
@@ -205,6 +218,22 @@ export default function ActivityPage() {
                 <Histogram buckets={hourBuckets} unitLabel="24 小时注意力分布" />
               )}
             </Section>
+
+            {categorySummary.length > 0 && (
+              <Section title="分类构成" hint="内置规则把域名归到大类；仅统计当前已加载的排行">
+                <SectionBody>
+                  <DurationBarList
+                    items={categorySummary.map((c) => ({
+                      label: CATEGORY_LABELS[c.category],
+                      seconds: c.seconds,
+                      visits: c.hosts,
+                    }))}
+                    emptyText="这段时间没有记录"
+                    note={(item) => `${item.visits} 个域名`}
+                  />
+                </SectionBody>
+              </Section>
+            )}
 
             <Section title="域名排行" hint={hostTotal > hostItems.length ? `共 ${hostTotal} 个域名` : undefined}>
               <SectionBody>

@@ -93,6 +93,8 @@ func TestGoldenRESTFixtures(t *testing.T) {
 				map[string]any{"hour": 9, "seconds": 2400},
 				map[string]any{"hour": 14, "seconds": 4800},
 			},
+			"switches": 47,
+			"longest_focus_seconds": 1500,
 		}},
 	})
 

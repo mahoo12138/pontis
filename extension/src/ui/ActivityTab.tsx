@@ -20,6 +20,7 @@ import {
   Text,
 } from '@mantine/core';
 import { Section } from './Section';
+import { fmtDuration } from './duration';
 import { runtime } from './optionsRuntime';
 import { errText, type Runtime } from './runtime';
 import {
@@ -35,15 +36,6 @@ import {
   createSuggestedBookmark,
   type ActivitySuggestions,
 } from '../core/activity/suggest';
-
-function fmtDuration(sec: number): string {
-  const s = Math.max(0, Math.round(sec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (h > 0) return `${h} 小时 ${m} 分`;
-  if (m > 0) return `${m} 分 ${s % 60} 秒`;
-  return `${s} 秒`;
-}
 
 /** The trailing N local days, oldest first: `YYYY-MM-DD` strings the
  *  aggregate tables are keyed by. */
@@ -63,7 +55,7 @@ function dayLabel(day: string): string {
 
 interface ActivityView {
   prefs: ActivityPrefsRecord;
-  today: { total: number; visits: number; hosts: { host: string; seconds: number }[] };
+  today: { total: number; visits: number; switches: number; hosts: { host: string; seconds: number }[] };
   week: { day: string; seconds: number }[];
   weekTotal: number;
   queued: number;
@@ -76,12 +68,13 @@ async function readActivityView(activityDb: Runtime['activityDb'], adapter: Runt
   const week = lastNDays(7);
   const weekFrom = week[0]!;
   const weekTo = week[week.length - 1]!;
-  const [todayHosts, weekRows, todayTotals, weekTotals, queued] = await Promise.all([
+  const [todayHosts, weekRows, todayTotals, weekTotals, queued, todayMetrics] = await Promise.all([
     dayHosts(activityDb, today),
     rangeByDay(activityDb, weekFrom, weekTo),
     rangeTotals(activityDb, today, today),
     rangeTotals(activityDb, weekFrom, weekTo),
     activityDb.queue.where('status').equals('QUEUED').count(),
+    activityDb.metrics.get(today),
   ]);
   const suggestions = await computeSuggestions(activityDb, adapter);
   return {
@@ -89,6 +82,7 @@ async function readActivityView(activityDb: Runtime['activityDb'], adapter: Runt
     today: {
       total: todayTotals.seconds,
       visits: todayTotals.visits,
+      switches: todayMetrics?.switches ?? 0,
       hosts: todayHosts.slice(0, 6).map((r) => ({ host: r.host, seconds: r.seconds })),
     },
     week: weekRows.map((r) => ({ day: r.day, seconds: r.seconds })),
@@ -218,7 +212,7 @@ export function ActivityTab({ paired }: { paired: boolean }) {
 
       <Section
         title="今日"
-        hint={`共 ${fmtDuration(today.total)} · ${today.visits} 段专注`}
+        hint={`共 ${fmtDuration(today.total)} · ${today.visits} 段专注 · 切换 ${today.switches} 次`}
         right={
           prefs.mode === 'upload' ? (
             <Text size="xs" c="dimmed">

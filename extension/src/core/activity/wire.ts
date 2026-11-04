@@ -47,6 +47,14 @@ export interface ActivityDayWire {
   day: string;
   hosts: ActivityHostWire[];
   hours: ActivityHourWire[];
+  /**
+   * Focus metrics for the day, optional so an older uploader stays
+   * wire-compatible. `switches` counts tab activations the tracker saw;
+   * `longest_focus_seconds` is the longest single dwell episode — both are
+   * attention-quality readouts, not another way to name a host.
+   */
+  switches?: number;
+  longest_focus_seconds?: number;
 }
 
 export interface ActivityBatchWire {

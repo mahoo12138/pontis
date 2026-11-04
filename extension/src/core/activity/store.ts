@@ -53,6 +53,19 @@ export interface ActivityHourlyRecord {
 export type ActivityQueueStatus = 'QUEUED' | 'SENT';
 
 /**
+ * Per-day focus metrics. `switches` is an event counter — it cannot be
+ * derived from the segment rows (same-host activations never become
+ * segments, and flicks are discarded) — so it is bumped at event time.
+ * Longest focus needs no table of its own: it is the longest segment of
+ * the day, read at upload time.
+ */
+export interface ActivityMetricsRecord {
+  day: string;
+  switches: number;
+  updatedAt: number;
+}
+
+/**
  * One row per day that owes the server a batch entry. The payload is not
  * stored here: a replace-per-day batch is rebuilt from the aggregates at
  * send time, so a day re-sent after a correction carries the freshest
@@ -131,6 +144,7 @@ export class ActivityDB extends Dexie {
   segments!: Table<ActivitySegmentRecord, number>;
   daily!: Table<ActivityDailyRecord, [string, string]>;
   hourly!: Table<ActivityHourlyRecord, [string, number]>;
+  metrics!: Table<ActivityMetricsRecord, string>;
   queue!: Table<ActivityQueueRecord, string>;
   state!: Table<ActivityCurrentState, string>;
   prefs!: Table<ActivityPrefsRecord, string>;
@@ -141,6 +155,7 @@ export class ActivityDB extends Dexie {
       segments: '++id, day, startedAt',
       daily: '[day+host], day',
       hourly: '[day+hour], day',
+      metrics: 'day',
       // The flush walks QUEUED rows by backoff gate; SENT rows linger only
       // until retention prunes them.
       queue: 'day, status, nextAttemptAt',
@@ -173,25 +188,41 @@ export async function purgeActivityBefore(
   db: ActivityDB,
   segmentCutoffTs: number,
   aggregateCutoffDay: string,
-): Promise<{ segments: number; daily: number; hourly: number }> {
+): Promise<{ segments: number; daily: number; hourly: number; metrics: number }> {
   const oldSegments = await db.segments.where('startedAt').below(segmentCutoffTs).primaryKeys();
   await db.segments.bulkDelete(oldSegments);
   const oldDaily = await db.daily.where('day').below(aggregateCutoffDay).primaryKeys();
   await db.daily.bulkDelete(oldDaily);
   const oldHourly = await db.hourly.where('day').below(aggregateCutoffDay).primaryKeys();
   await db.hourly.bulkDelete(oldHourly);
-  return { segments: oldSegments.length, daily: oldDaily.length, hourly: oldHourly.length };
+  const oldMetrics = await db.metrics.where('day').below(aggregateCutoffDay).primaryKeys();
+  await db.metrics.bulkDelete(oldMetrics);
+  return { segments: oldSegments.length, daily: oldDaily.length, hourly: oldHourly.length, metrics: oldMetrics.length };
 }
 
 /** Drop everything local. The options page's 清除统计数据 button. */
 export async function clearActivityData(db: ActivityDB): Promise<void> {
-  await db.transaction('rw', [db.segments, db.daily, db.hourly, db.queue, db.state], async () => {
+  await db.transaction('rw', [db.segments, db.daily, db.hourly, db.metrics, db.queue, db.state], async () => {
     await Promise.all([
       db.segments.clear(),
       db.daily.clear(),
       db.hourly.clear(),
+      db.metrics.clear(),
       db.queue.clear(),
       db.state.clear(),
     ]);
   });
+}
+
+/** Count one tab activation against today's focus metrics. Failures are
+ *  swallowed: a lost switch count is noise, not a reason to break tracking. */
+export async function bumpSwitches(db: ActivityDB, day: string, now = Date.now()): Promise<void> {
+  try {
+    await db.transaction('rw', [db.metrics], async () => {
+      const row = await db.metrics.get(day);
+      await db.metrics.put({ day, switches: (row?.switches ?? 0) + 1, updatedAt: now });
+    });
+  } catch {
+    // metrics are a nice-to-have; the segments are the record of truth.
+  }
 }

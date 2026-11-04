@@ -89,6 +89,38 @@ func TestActivityIngestReplacesPerDay(t *testing.T) {
 	}
 }
 
+func TestActivityFocusMetricsReplaceAndAggregate(t *testing.T) {
+	_, ts := newTestServer(t)
+	token := restBootstrap(t, ts)
+	deviceToken := activityDeviceToken(t, ts, token, "Chrome@Home")
+
+	day := "2026-11-03"
+	switches := int64(42)
+	longest := int64(1500)
+	ingestBatch(t, ts, deviceToken, batchBody(dayEntry(day,
+		[]map[string]any{host("github.com", 600, 2)}, nil)))
+	// Re-send with focus metrics attached: the replace carries them, and a
+	// later batch without them would drop them again — one day, one truth.
+	ingestWithMetrics(t, ts, deviceToken, day, &switches, &longest)
+
+	overview := restGET(t, ts, token, "/api/v1/activity/overview?from=2026-11-01&to=2026-11-30")
+	metrics := overview["metrics"].(map[string]any)
+	if metrics["switches"].(float64) != 42 || metrics["longest_focus_seconds"].(float64) != 1500 {
+		t.Fatalf("metrics = %v, want switches 42 longest 1500", metrics)
+	}
+}
+
+// ingestWithMetrics posts a batch whose day entry carries the optional focus
+// fields; the plain batchBody helper cannot express nil-able pointers.
+func ingestWithMetrics(t *testing.T, ts *httptest.Server, deviceToken, day string, switches, longest *int64) map[string]any {
+	t.Helper()
+	body := map[string]any{"days": []any{map[string]any{
+		"day": day, "hosts": []any{}, "hours": []any{},
+		"switches": switches, "longest_focus_seconds": longest,
+	}}}
+	return restPOST(t, ts, deviceToken, "/api/v1/device/activity/batches", body)
+}
+
 func TestActivityIngestRequiresDeviceCredential(t *testing.T) {
 	_, ts := newTestServer(t)
 	restExpect(t, ts, "", http.StatusUnauthorized, http.MethodPost,

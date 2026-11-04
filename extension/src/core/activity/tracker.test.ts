@@ -274,6 +274,27 @@ describe('ActivityTracker', () => {
     f.tracker.stop();
   });
 
+  it('counts tab activations as context switches', async () => {
+    const f = await fixture();
+    f.chrome.setActive(tab(1, 'https://github.com/'));
+    f.tracker.start();
+    await f.tracker.drain();
+    f.chrome.setActive(tab(2, 'https://gitlab.com/'));
+    f.chrome.fireActivated({ tabId: 2, windowId: 1 });
+    await f.tracker.drain();
+    f.chrome.setActive(tab(1, 'https://github.com/'));
+    f.chrome.fireActivated({ tabId: 1, windowId: 1 });
+    await f.tracker.drain();
+    // Same-host reactivations count too — a switch is a switch.
+    f.chrome.setActive(tab(3, 'https://github.com/other'));
+    f.chrome.fireActivated({ tabId: 3, windowId: 1 });
+    await f.tracker.drain();
+
+    // Three activations fired; start()'s initial reading is not a switch.
+    expect((await f.db.metrics.get(DAY))?.switches).toBe(3);
+    f.tracker.stop();
+  });
+
   it('beats refresh lastBeatAt without rotating the episode', async () => {
     const f = await fixture();
     f.chrome.setActive(tab(1, 'https://github.com/'));

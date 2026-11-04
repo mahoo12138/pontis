@@ -9,6 +9,7 @@
 import type {
   ActivityAction,
   ActivityDayTotal,
+  ActivityMetrics,
   ActivityEntry,
   ActivityHostStat,
   ActivityHostsResponse,
@@ -779,6 +780,7 @@ export const checkActivityOverview: Checker<ActivityOverviewResponse> =
     from: str,
     to: str,
     totals: record<ActivityTotals>({ seconds: num, visits: num }),
+    metrics: record<ActivityMetrics>({ switches: num, longest_focus_seconds: num }),
     by_day: arr(record<ActivityDayTotal>({ day: str, seconds: num, visits: num })),
     // Fixed 24-slot histogram: the length is part of the contract, and a
     // chart that indexes it should fail loudly on anything else.

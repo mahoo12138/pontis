@@ -122,7 +122,12 @@ async function failDay(db: ActivityDB, row: ActivityQueueRecord, message: string
 
 /** Assemble one day's wire entry from the local aggregates. Hosts beyond
  *  MAX_HOSTS_PER_DAY are dropped from the tail: they are the long tail of
- *  seconds, and the cap is what bounds a batch for a pathological day. */
+ *  seconds, and the cap is what bounds a batch for a pathological day.
+ *
+ *  Focus metrics ride along: switches from the metrics table, longest focus
+ *  read off the segments (it is simply the longest episode of the day). Both
+ *  are omitted when there is nothing to report, keeping the payload honest
+ *  for days whose segments already aged out. */
 async function buildDayEntry(db: ActivityDB, day: string): Promise<ActivityDayWire | null> {
   const dailyRows = await db.daily.where('day').equals(day).toArray();
   const hourlyRows = await db.hourly.where('day').equals(day).toArray();
@@ -135,5 +140,17 @@ async function buildDayEntry(db: ActivityDB, day: string): Promise<ActivityDayWi
     .slice()
     .sort((a, b) => a.hour - b.hour)
     .map((r) => ({ hour: r.hour, seconds: r.seconds }));
-  return { day, hosts, hours };
+
+  const entry: ActivityDayWire = { day, hosts, hours };
+  const [metrics, segments] = await Promise.all([
+    db.metrics.get(day),
+    db.segments.where('day').equals(day).toArray(),
+  ]);
+  let longest = 0;
+  for (const seg of segments) {
+    longest = Math.max(longest, seg.endedAt - seg.startedAt);
+  }
+  if (metrics && metrics.switches > 0) entry.switches = metrics.switches;
+  if (longest > 0) entry.longest_focus_seconds = Math.round(longest / 1000);
+  return entry;
 }

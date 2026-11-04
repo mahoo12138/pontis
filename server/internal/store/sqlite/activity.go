@@ -68,7 +68,28 @@ func (s *ActivityStore) ReplaceDay(ctx context.Context, userID canonical.UserID,
 			return false, err
 		}
 	}
+	// Focus metrics replace with the same batch. Nil means the uploader does
+	// not report them — writing zeroes would erase nothing (the row was just
+	// deleted) but would also claim a reading that was never taken.
+	if entry.Switches != nil || entry.LongestFocusSeconds != nil {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO activity_metrics (user_id, device_id, day, switches, longest_focus_seconds)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(user_id, device_id, day) DO UPDATE SET
+				switches = excluded.switches, longest_focus_seconds = excluded.longest_focus_seconds`,
+			string(userID), deviceID, entry.Day,
+			derefOrZero(entry.Switches), derefOrZero(entry.LongestFocusSeconds)); err != nil {
+			return false, err
+		}
+	}
 	return true, tx.Commit()
+}
+
+func derefOrZero(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func (s *ActivityStore) rangeWhere(userID canonical.UserID, fromDay, toDay, deviceID string) (string, []any) {
@@ -132,7 +153,16 @@ func (s *ActivityStore) Overview(ctx context.Context, userID canonical.UserID,
 		}
 		out.ByHour[hour] = seconds
 	}
-	return out, hourRows.Err()
+	if err := hourRows.Err(); err != nil {
+		return out, err
+	}
+
+	// Focus metrics aggregate the same way the totals do: switches sum,
+	// longest focus takes the max. Devices that never reported them simply
+	// contribute no rows.
+	return out, s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(switches), 0), COALESCE(MAX(longest_focus_seconds), 0)
+		FROM activity_metrics WHERE `+where, args...).Scan(&out.Metrics.Switches, &out.Metrics.LongestFocusSeconds)
 }
 
 // Hosts ranks hosts by seconds across the range. The total counts distinct
@@ -179,6 +209,12 @@ func (s *ActivityStore) PurgeBefore(ctx context.Context, aggregateCutoffDay stri
 	n, _ := res.RowsAffected()
 	removed += n
 	res, err = s.db.ExecContext(ctx, `DELETE FROM activity_hourly WHERE day < ?`, aggregateCutoffDay)
+	if err != nil {
+		return removed, err
+	}
+	n, _ = res.RowsAffected()
+	removed += n
+	res, err = s.db.ExecContext(ctx, `DELETE FROM activity_metrics WHERE day < ?`, aggregateCutoffDay)
 	if err != nil {
 		return removed, err
 	}

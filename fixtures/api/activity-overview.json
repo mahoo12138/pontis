@@ -33,6 +33,10 @@
     0
   ],
   "from": "2026-01-01",
+  "metrics": {
+    "longest_focus_seconds": 1500,
+    "switches": 47
+  },
   "to": "2026-01-07",
   "totals": {
     "seconds": 7200,

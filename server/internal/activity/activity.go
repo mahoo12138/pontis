@@ -36,11 +36,17 @@ type HourRow struct {
 }
 
 // DayEntry is the complete upload for one (device, day): the batch entry the
-// server's stored rows are replaced with.
+// server's stored rows are replaced with. The focus fields are optional
+// (nil = this uploader does not report them); a pointer rather than a zero
+// value keeps "not reported" distinct from "a day of zero switches", which
+// is a real reading.
 type DayEntry struct {
-	Day   string
-	Hosts []HostRow
-	Hours []HourRow
+	Day   string    `json:"day"`
+	Hosts []HostRow `json:"hosts"`
+	Hours []HourRow `json:"hours"`
+	// wire: switches / longest_focus_seconds, both optional.
+	Switches            *int64 `json:"switches,omitempty"`
+	LongestFocusSeconds *int64 `json:"longest_focus_seconds,omitempty"`
 }
 
 // Batch limits, mirrored from the extension's wire module. A device that
@@ -106,11 +112,20 @@ type DayTotal struct {
 	Visits  int64  `json:"visits"`
 }
 
+// Metrics is the attention-quality summary of a range: switches across all
+// reported days, and the single longest focus episode seen. Days without a
+// report contribute nothing rather than zeroes.
+type Metrics struct {
+	Switches            int64 `json:"switches"`
+	LongestFocusSeconds int64 `json:"longest_focus_seconds"`
+}
+
 // Overview is the GET /activity/overview body.
 type Overview struct {
 	From    string     `json:"from"`
 	To      string     `json:"to"`
 	Totals  Totals     `json:"totals"`
+	Metrics Metrics    `json:"metrics"`
 	ByDay   []DayTotal `json:"by_day"`
 	// ByHour has exactly 24 slots, index = local clock hour. A fixed-length
 	// array spares the chart from re-bucketing and shows empty hours as 0.
@@ -204,8 +219,18 @@ func validateDay(entry DayEntry) error {
 		}
 		seenHours[hr.Hour] = true
 	}
+	if entry.Switches != nil && (*entry.Switches < 0 || *entry.Switches > maxSwitchesPerDay) {
+		return fmt.Errorf("%w: switches %d", ErrBadVisits, *entry.Switches)
+	}
+	if entry.LongestFocusSeconds != nil && (*entry.LongestFocusSeconds < 0 || *entry.LongestFocusSeconds > MaxSecondsPerDay) {
+		return fmt.Errorf("%w: longest focus %d", ErrBadSeconds, *entry.LongestFocusSeconds)
+	}
 	return nil
 }
+
+// A tab switch every two seconds all day is the sane ceiling; anything
+// beyond it is a client bug worth refusing rather than storing.
+const maxSwitchesPerDay = 86400 / 2
 
 // Overview aggregates the range for the user's own devices.
 func (s *Service) Overview(ctx context.Context, userID canonical.UserID,

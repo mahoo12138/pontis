@@ -24,6 +24,7 @@
 
 import {
   ActivityDB,
+  bumpSwitches,
   dayKeyOf,
   hourOf,
   loadActivityPrefs,
@@ -146,7 +147,17 @@ export class ActivityTracker {
       void op.finally(() => this.ops.delete(op));
     };
 
-    on(this.chrome.tabs.onActivated, () => run(this.resolveAndTrack()));
+    on(this.chrome.tabs.onActivated, (info) =>
+      run(
+        // A tab activation is one context switch, wherever it lands. Counted
+        // at event time because the segment rows cannot reproduce it: a
+        // switch between two tabs of the same host produces no rotation, and
+        // a flick is discarded as noise.
+        bumpSwitches(this.db, dayKeyOf(this.now(), new Date(this.now())), this.now()).then(() =>
+          this.resolveAndTrack(),
+        ),
+      ),
+    );
     // URL changes cover the "clicked a link to another host in the same tab"
     // case; same-host navigations land in the same-host branch and only
     // refresh the stored url/title.

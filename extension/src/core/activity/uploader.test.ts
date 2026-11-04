@@ -142,6 +142,34 @@ describe('flushActivity', () => {
     expect((await d.queue.where('status').equals('QUEUED').count())).toBe(6);
   });
 
+  it('carries focus metrics: switches from the counter, longest focus from segments', async () => {
+    const d = await db();
+    const t = new FakeTransport();
+    const startedAt1 = new Date(2026, 10, 4, 9, 0, 0).getTime();
+    const startedAt2 = new Date(2026, 10, 4, 10, 0, 0).getTime();
+    await d.segments.bulkAdd([
+      { startedAt: startedAt1, endedAt: startedAt1 + 600_000, host: 'github.com', url: 'https://github.com/', title: '', day: '2026-11-04', hour: 9 },
+      { startedAt: startedAt2, endedAt: startedAt2 + 1200_000, host: 'github.com', url: 'https://github.com/', title: '', day: '2026-11-04', hour: 10 },
+    ]);
+    await d.daily.bulkPut([{ day: '2026-11-04', host: 'github.com', seconds: 1800, visits: 2 }]);
+    await d.metrics.put({ day: '2026-11-04', switches: 31, updatedAt: NOW });
+    await d.queue.put({ day: '2026-11-04', status: 'QUEUED', attempts: 0, nextAttemptAt: 0 });
+
+    await flushActivity(d, t, gate(), NOW);
+    expect(t.batches[0]!.days[0]!.switches).toBe(31);
+    // The longest episode wins, not the sum: 20 minutes, not 30.
+    expect(t.batches[0]!.days[0]!.longest_focus_seconds).toBe(1200);
+  });
+
+  it('omits focus metrics a day does not have', async () => {
+    const d = await db();
+    const t = new FakeTransport();
+    await seedDay(d, '2026-11-04', [['github.com', 60, 1]]);
+    await flushActivity(d, t, gate(), NOW);
+    expect(t.batches[0]!.days[0]!.switches).toBeUndefined();
+    expect(t.batches[0]!.days[0]!.longest_focus_seconds).toBeUndefined();
+  });
+
   it('caps a day at MAX_HOSTS_PER_DAY host rows', async () => {
     const d = await db();
     const t = new FakeTransport();
