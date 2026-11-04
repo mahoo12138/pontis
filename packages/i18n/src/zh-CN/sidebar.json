@@ -18,6 +18,7 @@
   "blocked_schedule": "还有计划任务挂在这个空间上，请先停掉这些任务。",
   "name_invalid": "名称不能为空，也不能包含路径字符。",
   "space_gone": "这个空间已经不存在了。",
+  "browsing_activity": "浏览分析",
   "plaza": "广场",
   "recent_activity": "最近活动",
   "devices": "设备",

@@ -16,6 +16,7 @@ import {
   IconPlus,
   IconDots,
   IconLayoutGrid,
+  IconChartHistogram,
   IconClock,
   IconDeviceDesktop,
   IconListCheck,
@@ -242,6 +243,14 @@ export default function Sidebar() {
         >
           <IconLayoutGrid size={16} stroke={1.5} className={sidebarItemIcon} />
           {t('sidebar:plaza')}
+        </div>
+        <div
+          className={`${sidebarItem} ${currentPath.startsWith('/activity') ? sidebarItemSelected : ''}`}
+          style={{ cursor: 'pointer' }}
+          onClick={() => navigate('/activity')}
+        >
+          <IconChartHistogram size={16} stroke={1.5} className={sidebarItemIcon} />
+          {t('sidebar:browsing_activity')}
         </div>
         <div
           className={`${sidebarItem} ${activityPath && currentPath === activityPath ? sidebarItemSelected : ''}`}

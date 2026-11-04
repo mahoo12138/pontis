@@ -842,3 +842,47 @@ export interface StartPageSnapshot {
   snapshot: StartPageSnapshotMeta;
   nodes: StartPageSnapshotNode[];
 }
+
+// --- browsing activity analysis (core/activity) ---
+//
+// The extension uploads replace-per-day batches of day × host aggregates;
+// these are the two reads the analysis page is built from. The granularity
+// is the protocol's: a host label and counters, no URL, no title.
+
+export interface ActivityTotals {
+  seconds: number;
+  visits: number;
+}
+
+export interface ActivityDayTotal {
+  day: string;
+  seconds: number;
+  visits: number;
+}
+
+export interface ActivityOverviewResponse {
+  from: string;
+  to: string;
+  totals: ActivityTotals;
+  by_day: ActivityDayTotal[];
+  /** Exactly 24 slots, index = the uploading device's local hour. */
+  by_hour: number[];
+}
+
+export interface ActivityHostStat {
+  host: string;
+  seconds: number;
+  visits: number;
+}
+
+export interface ActivityHostsResponse {
+  /** Hosts before paging, so the page knows whether "load more" exists. */
+  total: number;
+  items: ActivityHostStat[];
+}
+
+export interface ActivityQuery {
+  from?: string;
+  to?: string;
+  device_id?: string;
+}

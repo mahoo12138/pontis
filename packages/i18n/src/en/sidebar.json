@@ -18,6 +18,7 @@
   "blocked_schedule": "It still has scheduled jobs. Stop those first.",
   "name_invalid": "The name must not be empty or contain path characters.",
   "space_gone": "That space no longer exists.",
+  "browsing_activity": "Browsing",
   "plaza": "Plaza",
   "recent_activity": "Recent activity",
   "devices": "Devices",

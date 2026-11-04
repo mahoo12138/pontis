@@ -15,6 +15,7 @@ import TasksPage from './routes/tasks';
 import SpacesIndexPage from './routes/spaces-index';
 import DevicesPage from './routes/devices';
 import PlazaPage from './routes/plaza';
+import ActivityPage from './routes/activity';
 import PlazaDetailPage from './routes/plaza-detail';
 import SettingsLayout, {
   AccountPanel as SettingsAccountPage,
@@ -81,6 +82,7 @@ export default function App() {
                   <Route path="/tasks" element={<TasksPage />} />
                   <Route path="/devices" element={<DevicesPage />} />
                   <Route path="/plaza" element={<PlazaPage />} />
+                  <Route path="/activity" element={<ActivityPage />} />
                   <Route path="/plaza/:publicationId" element={<PlazaDetailPage />} />
                   <Route path="/settings" element={<SettingsLayout />}>
                     <Route index element={<Navigate to="/settings/account" replace />} />

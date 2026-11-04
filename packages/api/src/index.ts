@@ -4,6 +4,11 @@ export type { ErrorEnvelope } from './errors';
 export * from './validate';
 export * from './contract';
 export type {
+  ActivityHostStat,
+  ActivityHostsResponse,
+  ActivityOverviewResponse,
+  ActivityQuery,
+  ActivityTotals,
   MetaResponse,
   User,
   SetupRequest,

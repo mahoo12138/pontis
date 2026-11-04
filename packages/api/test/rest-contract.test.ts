@@ -9,7 +9,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  checkActivityHosts,
   checkActivityList,
+  checkActivityOverview,
   checkAdminUserList,
   checkAcknowledged,
   checkApiTokenList,
@@ -51,7 +53,9 @@ import {
 import { ContractViolation } from '../src/validate';
 import type { ErrorEnvelope } from '../src/errors';
 import type {
+  ActivityHostsResponse,
   ActivityListResponse,
+  ActivityOverviewResponse,
   AdminUserListResponse,
   AdminUserView,
   ApiTokenListResponse,
@@ -107,6 +111,8 @@ const contract = {
   'nodes-empty': (v: unknown): NodeListResponse => checkNodeList(v, 'body'),
   'root-slots': (v: unknown): RootSlotListResponse => checkRootSlotList(v, 'body'),
   activity: (v: unknown): ActivityListResponse => checkActivityList(v, 'body'),
+  'activity-overview': (v: unknown): ActivityOverviewResponse => checkActivityOverview(v, 'body'),
+  'activity-hosts': (v: unknown): ActivityHostsResponse => checkActivityHosts(v, 'body'),
   'device-overview': (v: unknown): DeviceOverviewResponse => checkDeviceOverviewResponse(v, 'body'),
   // Extension distribution: the list the install page renders, and the same
   // read with nothing staged (`start-page-snapshot-empty` is the same idea).

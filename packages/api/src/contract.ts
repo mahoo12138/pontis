@@ -8,8 +8,13 @@
 
 import type {
   ActivityAction,
+  ActivityDayTotal,
   ActivityEntry,
+  ActivityHostStat,
+  ActivityHostsResponse,
   ActivityListResponse,
+  ActivityOverviewResponse,
+  ActivityTotals,
   AdminUserListResponse,
   AdminUserView,
   ApiToken,
@@ -84,6 +89,7 @@ import type {
 import type { ErrorEnvelope } from './errors';
 import {
   arr,
+  ContractViolation,
   bool,
   nullable,
   num,
@@ -754,4 +760,32 @@ export const checkStartPageSnapshot: Checker<StartPageSnapshot> = record<StartPa
   // The server answers `[]` for an empty folder. Anything else — null, an
   // absent key — is a read the page must not render as an empty room.
   nodes: arr(checkStartPageSnapshotNode),
+});
+
+// --- browsing activity analysis (core/activity) ---
+
+// The hour histogram is exactly 24 slots: the length is part of the
+// contract, and a chart that indexes it should fail loudly on anything else.
+const checkHourHistogram: Checker<number[]> = (value, at) => {
+  const items = arr(num)(value, at);
+  if (items.length !== 24) {
+    throw new ContractViolation(at, 'a 24-slot hour array', `length ${items.length}`);
+  }
+  return items;
+};
+
+export const checkActivityOverview: Checker<ActivityOverviewResponse> =
+  record<ActivityOverviewResponse>({
+    from: str,
+    to: str,
+    totals: record<ActivityTotals>({ seconds: num, visits: num }),
+    by_day: arr(record<ActivityDayTotal>({ day: str, seconds: num, visits: num })),
+    // Fixed 24-slot histogram: the length is part of the contract, and a
+    // chart that indexes it should fail loudly on anything else.
+    by_hour: checkHourHistogram,
+  });
+
+export const checkActivityHosts: Checker<ActivityHostsResponse> = record<ActivityHostsResponse>({
+  total: num,
+  items: arr(record<ActivityHostStat>({ host: str, seconds: num, visits: num })),
 });
