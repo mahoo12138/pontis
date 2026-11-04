@@ -1,4 +1,5 @@
-// First-run guide: connect to a server, pick a space and a folder, done.
+// First-run guide: connect to a server, pick a space and a folder, say what
+// to do about browsing statistics, done.
 //
 // This page exists so the settings page does not have to be a wizard. Steps are
 // numbered here — where a person arrives once — and nowhere else; every step
@@ -7,7 +8,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Badge, Box, Button, Group, Stack, Text } from '@mantine/core';
+import { Badge, Box, Button, Group, SegmentedControl, Stack, Text } from '@mantine/core';
+import { loadActivityPrefs, saveActivityPrefs, type ActivityMode, type ActivityPrefsRecord } from '../../core/activity/store';
 import { originPatternFor } from '../../core/pairing/pairing';
 import { PontisLogo } from '../../ui/PontisLogo';
 import { createRuntime, errText, wakeWorker } from '../../ui/runtime';
@@ -29,6 +31,9 @@ export function App() {
   const [boundSpaceIds, setBoundSpaceIds] = useState<string[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [redoStep, setRedoStep] = useState<number | null>(null);
+  // The browsing-statistics ask: the full prefs row lives in state, so a
+  // click writes the record back whole instead of guessing the other fields.
+  const [activityPrefs, setActivityPrefs] = useState<ActivityPrefsRecord | null>(null);
 
   const refresh = useCallback(async () => {
     const b = await runtime.bootstrap.get();
@@ -56,7 +61,15 @@ export function App() {
 
   useEffect(() => {
     void refresh();
+    void loadActivityPrefs(runtime.activityDb).then(setActivityPrefs);
   }, [refresh]);
+
+  const doSetActivityMode = (mode: string) => {
+    if (!activityPrefs) return;
+    const next = { ...activityPrefs, mode: mode as ActivityMode };
+    setActivityPrefs(next);
+    void saveActivityPrefs(runtime.activityDb, next).catch(() => undefined);
+  };
 
   async function run(key: string, fn: () => Promise<void>) {
     setBusy(key);
@@ -106,7 +119,7 @@ export function App() {
           </Text>
         </Group>
         <Text size="xs" c="dimmed">
-          三步，之后都在设置页里管理
+          三步完成，浏览统计那一步可选；之后都在设置页里管理
         </Text>
       </header>
 
@@ -143,10 +156,50 @@ export function App() {
             />
           </GuideStep>
 
-          <GuideStep index={3} title="打开设置页" active={step === 3} done={false}>
+          <GuideStep
+            index={3}
+            title="浏览统计（可选）"
+            // "Chosen" is a touched pref (updatedAt rises on every save);
+            // the never-touched default row reads as not asked yet.
+            done={(activityPrefs?.updatedAt ?? 0) > 0}
+            summary={
+              (activityPrefs?.updatedAt ?? 0) > 0
+                ? activityPrefs?.mode === 'off'
+                  ? '已关闭，不记录任何浏览数据'
+                  : activityPrefs?.mode === 'upload'
+                    ? '本机统计并按天上报域名汇总'
+                    : '仅保存在本机，不上传'
+                : undefined
+            }
+            active={step === 3}
+          >
             <Stack gap="sm">
               <Text size="sm" c="dimmed">
-                绑定会在后台自动同步。设置页里可以看每个空间的书签数、暂停某个空间的同步、重新挂载目录，以及本地日志。
+                Pontis 可以记录你访问过的网站和停留时长，用来生成浏览分析、并在起始页和设置里给出收藏建议。原始记录（含
+                URL 和标题）只保存在这台浏览器里；开启上报后，发送给服务器的只有「日期 + 域名 + 时长」级别的汇总。
+              </Text>
+              <Group gap="sm">
+                <SegmentedControl
+                  size="xs"
+                  value={activityPrefs?.mode ?? 'local'}
+                  onChange={doSetActivityMode}
+                  data={[
+                    { value: 'off', label: '关闭' },
+                    { value: 'local', label: '仅本机' },
+                    { value: 'upload', label: '本机 + 上报' },
+                  ]}
+                />
+                <Text size="xs" c="dimmed">
+                  之后可以在设置页的「活动」里随时修改。
+                </Text>
+              </Group>
+            </Stack>
+          </GuideStep>
+
+          <GuideStep index={4} title="打开设置页" active={step === 3} done={false}>
+            <Stack gap="sm">
+              <Text size="sm" c="dimmed">
+                绑定会在后台自动同步。设置页里可以看每个空间的书签数、暂停某个空间的同步、重新挂载目录、浏览统计，以及本地日志。
               </Text>
               <Group gap="xs">
                 <Button
