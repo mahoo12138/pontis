@@ -42,6 +42,7 @@ import type { FolderTreeNode } from '../../ui/folderTree';
 import { PairingForm } from '../../ui/PairingForm';
 import { errText } from '../../ui/runtime';
 import { StartPageSettings } from '../../ui/StartPageSettings';
+import { ActivityTab } from '../../ui/ActivityTab';
 import { bindingStatus } from '../../ui/bindingStatus';
 import { scopeLabel } from '../../ui/diagnosticLabels';
 import { PontisLogo } from '../../ui/PontisLogo';
@@ -56,7 +57,7 @@ import { chromeApi } from '../../runtime/chromeApi';
  */
 const newtabBuild = typeof __PONTIS_NEWTAB_BUILD__ !== 'undefined' && __PONTIS_NEWTAB_BUILD__;
 
-type Tab = 'account' | 'sync' | 'start-page' | 'log';
+type Tab = 'account' | 'sync' | 'activity' | 'start-page' | 'log';
 
 /**
  * Where the page opens. The guide and the popup each mean a particular tab when
@@ -65,7 +66,7 @@ type Tab = 'account' | 'sync' | 'start-page' | 'log';
  */
 function initialTab(): Tab {
   const h = window.location.hash.slice(1);
-  if (h === 'sync' || h === 'log') return h;
+  if (h === 'sync' || h === 'log' || h === 'activity') return h;
   if (h === 'start-page' && newtabBuild) return h;
   return 'account';
 }
@@ -212,6 +213,7 @@ export function App() {
               同步管理
             </Tabs.Tab>
             {newtabBuild && <Tabs.Tab value="start-page">起始页</Tabs.Tab>}
+            <Tabs.Tab value="activity">活动</Tabs.Tab>
             <Tabs.Tab value="log">本地日志</Tabs.Tab>
           </Tabs.List>
 
@@ -245,6 +247,10 @@ export function App() {
               </Section>
             </Tabs.Panel>
           )}
+
+          <Tabs.Panel value="activity">
+            <ActivityTab paired={paired} />
+          </Tabs.Panel>
 
           <Tabs.Panel value="log">
             <DiagnosticsPanel diagnostics={diagnostics} />

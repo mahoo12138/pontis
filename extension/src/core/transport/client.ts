@@ -36,6 +36,11 @@ import {
   parseExtensionRelease,
   type ExtensionReleaseWire,
 } from '../update/release';
+import {
+  parseActivityBatchAck,
+  type ActivityBatchAckWire,
+  type ActivityBatchWire,
+} from '../activity/wire';
 
 /** What a conditional GET answers when the bytes have not changed.
  *
@@ -125,7 +130,7 @@ export interface ReconciliationTransport {
 }
 
 export class ApiClient
-  implements SyncTransport, SnapshotTransport, TransferTransport, ReconciliationTransport, StartPageTransport {
+  implements SyncTransport, SnapshotTransport, TransferTransport, ReconciliationTransport, StartPageTransport, ActivityTransport {
   constructor(private resolveConfig: () => Promise<ClientConfig>) {}
 
   private async request<T>(
@@ -362,6 +367,25 @@ export class ApiClient
       { ifNoneMatch, validate: parseStartPageSnapshot },
     );
   }
+
+  /**
+   * One replace-per-day activity batch, sent with the resolved device
+   * credential, matching the endpoint's auth group. The body carries only
+   * host-level day aggregates — the wire type has nowhere to put a URL, and
+   * that is the point (core/activity/wire §privacy).
+   */
+  uploadActivityBatch(req: ActivityBatchWire): Promise<ActivityBatchAckWire> {
+    return this.request<ActivityBatchAckWire>('/api/v1/device/activity/batches', {
+      method: 'POST',
+      body: req,
+      validate: parseActivityBatchAck,
+    });
+  }
+}
+
+/** Browse-statistics upload (core/activity); optional transport extension. */
+export interface ActivityTransport {
+  uploadActivityBatch(req: ActivityBatchWire): Promise<ActivityBatchAckWire>;
 }
 
 /**

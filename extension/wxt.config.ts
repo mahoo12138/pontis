@@ -87,7 +87,15 @@ export default defineConfig({
     // `search` is here for one call: handing a typed query to the browser's
     // own default search provider. It is not a site-access permission, and the
     // start page asks for nothing else (§16.4).
-    permissions: ['bookmarks', 'storage', 'alarms', 'search'],
+    //
+    // `tabs` is here for one reader: the activity tracker (core/activity) needs
+    // the active tab's url/title to attribute dwell time. `idle` feeds it the
+    // idle/locked signal so "the browser sat open all night" is not counted as
+    // browsing. Neither permission grants site access — no host permission is
+    // requested — and both only ever feed the local database; uploading is a
+    // setting the person turns on themselves, and the payload is domain-level
+    // aggregates, never a URL.
+    permissions: ['bookmarks', 'storage', 'alarms', 'search', 'tabs', 'idle'],
     optional_host_permissions: ['http://*/*', 'https://*/*'],
     ...(e2eOrigin ? { host_permissions: [e2eOrigin] } : {}),
   },

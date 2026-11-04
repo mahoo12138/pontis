@@ -17,6 +17,9 @@ import { RemoteChangeApplier } from '../core/sync/remoteChangeApplier';
 import { ResyncService, type IntentDecision } from '../core/sync/resync';
 import { SyncCoordinator } from '../core/sync/syncCoordinator';
 import { WorkerLoop } from '../core/sync/workerLoop';
+import { ActivityDB, loadActivityPrefs } from '../core/activity/store';
+import { ActivityTracker, type ActivityChromeApi } from '../core/activity/tracker';
+import { flushActivity } from '../core/activity/uploader';
 import { chromeApi, kvArea } from '../runtime/chromeApi';
 
 export default defineBackground(() => {
@@ -34,6 +37,28 @@ export default defineBackground(() => {
   const resync = new ResyncService(db, bootstrap, reconciler, verifier);
   const loop = new WorkerLoop({ db, adapter, coordinator, reconciler, resync, verifier });
 
+  // --- browsing statistics (core/activity) ---
+  //
+  // A separate concern from sync: its own database, its own alarm, its own
+  // mode switch. Collection starts immediately in 'local' mode; touching the
+  // network requires the person to pick 'upload' in settings, and the flush
+  // additionally requires a paired device credential.
+  const activityDb = new ActivityDB();
+  const tracker = new ActivityTracker(activityDb, chrome as unknown as ActivityChromeApi);
+  tracker.start();
+  const flushActivityNow = () =>
+    void (async () => {
+      const [b, prefs] = await Promise.all([bootstrap.get(), loadActivityPrefs(activityDb)]);
+      await flushActivity(activityDb, client, {
+        mode: prefs.mode,
+        paired: Boolean(b.serverUrl && b.deviceToken),
+      });
+    })().catch(() => {
+      // The queue rows hold the failure (attempts, backoff, lastError); the
+      // next alarm piggyback retries. A flush that throws out of here would
+      // only risk an unhandled rejection on a worker that is about to die.
+    });
+
   // A fresh install has nothing paired and no way to know where to start.
   // Opening the guide is the only moment the extension puts a window in front of
   // a person; after that everything is theirs to reopen. An update never does
@@ -50,13 +75,22 @@ export default defineBackground(() => {
 
   chrome.alarms.create('pontis-sync', { periodInMinutes: 5 });
   chrome.alarms.create('pontis-integrity', { periodInMinutes: 24 * 60 });
+  // The dwell tracker's beat: keeps an open segment's lastBeatAt fresh while
+  // the person really is on the page, and is the wake path that settles a
+  // segment left open by a dead worker.
+  chrome.alarms.create('pontis-activity-hb', { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === 'pontis-sync') void loop.runSync('alarm');
+    if (alarm.name === 'pontis-sync') {
+      void loop.runSync('alarm');
+      flushActivityNow();
+    }
     if (alarm.name === 'pontis-integrity') void loop.runIntegrity('daily');
+    if (alarm.name === 'pontis-activity-hb') void tracker.onHeartbeat();
   });
   chrome.runtime.onStartup.addListener(() => {
     void loop.runSync('startup');
     void loop.runIntegrity('startup');
+    flushActivityNow();
   });
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

@@ -5,6 +5,7 @@
 
 import { createChromiumAdapter } from '../core/browser/chromium';
 import type { BrowserAdapter } from '../core/browser/types';
+import { ActivityDB } from '../core/activity/store';
 import { PairingService } from '../core/pairing/pairing';
 import { BootstrapStore } from '../core/store/bootstrap';
 import { PontisDB } from '../core/store/db';
@@ -15,6 +16,9 @@ import type { ChromeGlobal } from '../runtime/chromeApi';
 export interface Runtime {
   chrome: ChromeGlobal;
   db: PontisDB;
+  /** The browsing-statistics store; Dexie opens it lazily, so surfaces that
+   *  never touch the 活动 tab pay nothing for the handle. */
+  activityDb: ActivityDB;
   bootstrap: BootstrapStore;
   client: ApiClient;
   adapter: BrowserAdapter;
@@ -24,6 +28,7 @@ export interface Runtime {
 export function createRuntime(onBindingCreated?: () => Promise<void>): Runtime {
   const chrome = chromeApi();
   const db = new PontisDB();
+  const activityDb = new ActivityDB();
   const bootstrap = new BootstrapStore(kvArea(chrome.storage.local));
   const client = new ApiClient(async () => {
     const b = await bootstrap.get();
@@ -31,7 +36,7 @@ export function createRuntime(onBindingCreated?: () => Promise<void>): Runtime {
   });
   const adapter = createChromiumAdapter(chrome.bookmarks);
   const pairing = new PairingService(client, bootstrap, db, onBindingCreated ?? (async () => undefined));
-  return { chrome, db, bootstrap, client, adapter, pairing };
+  return { chrome, db, activityDb, bootstrap, client, adapter, pairing };
 }
 
 /** An ApiError carries a stable code; showing only its message loses the part
