@@ -59,10 +59,15 @@ const PACKAGES = [
 
 const PLATFORM = 'chromium';
 const MANIFEST_VERSION = 3;
-// Compared as sets. `tabs` is not on this list by design: the permission
-// boundary in start-page doc §16.4 is a stated constraint, and a build that
-// grew one should fail a release build rather than ship and be noticed later.
-const PERMISSIONS = ['alarms', 'bookmarks', 'search', 'storage'];
+// Compared as sets. This is the stated permission boundary (start-page doc
+// §16.4): no site access, no history/cookies/injection. `tabs` and `idle`
+// joined deliberately with the activity tracker — read-only signals that
+// attribute dwell time and keep an idle browser out of it, without granting
+// access to any page. `notifications` stays OFF this list on purpose: it is
+// optional_permissions, requested only inside the click that adds the first
+// daily limit, so it must never appear in the install-time grant. A build
+// that grew any other permission should fail here rather than ship.
+const PERMISSIONS = ['alarms', 'bookmarks', 'idle', 'search', 'storage', 'tabs'];
 // Oldest server these packages are tested against. It is a declaration, not a
 // derivation: the extension compares it with `/meta`, so it changes when the
 // extension stops working against an older server, not when a server releases.
