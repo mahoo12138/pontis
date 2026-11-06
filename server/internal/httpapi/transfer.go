@@ -29,9 +29,9 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"filename":      filename,
-		"content_type":  contentType,
-		"content":       content,
+		"filename":     filename,
+		"content_type": contentType,
+		"content":      content,
 	})
 }
 
@@ -95,6 +95,17 @@ func (s *Server) writeTransferError(w http.ResponseWriter, r *http.Request, err 
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_STRATEGY", "strategy must be merge or replace")
 	case errors.Is(err, canonical.ErrSpaceNotFound):
 		s.writeError(w, r, http.StatusNotFound, "SPACE_NOT_FOUND", "unknown space")
+	// The import target comes from the client's own modal state; a location
+	// that does not resolve is a client error, not an internal one. These map
+	// like their library.go counterparts instead of falling to 500.
+	case errors.Is(err, canonical.ErrNodeNotFound):
+		s.writeError(w, r, http.StatusNotFound, "NODE_NOT_FOUND", "import target does not exist")
+	case errors.Is(err, canonical.ErrRootSlotNotFound):
+		s.writeError(w, r, http.StatusNotFound, "ROOT_SLOT_NOT_FOUND", "import target root slot does not exist")
+	case errors.Is(err, canonical.ErrParentMissing),
+		errors.Is(err, canonical.ErrParentNotFolder),
+		errors.Is(err, canonical.ErrNodeIsBookmark):
+		s.writeError(w, r, http.StatusBadRequest, "INVALID_PARENT", "import target is not a valid location")
 	default:
 		s.Logger.Error("transfer internal error", "err", err)
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")

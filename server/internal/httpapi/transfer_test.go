@@ -139,3 +139,40 @@ func TestTransferExportImportRoundTrip(t *testing.T) {
 		t.Fatalf("replace left the old child behind")
 	}
 }
+
+// An apply whose target the client cannot resolve (a bare 'root:' placeholder
+// or a node id that is not a folder) is a client error, not a server fault:
+// the web import modal can send it while its location select is still
+// settling. Same contract the plaza apply already pins down.
+func TestTransferApplyRejectsUnknownTargetParent(t *testing.T) {
+	f := bootstrapLibraryFlow(t)
+	h := map[string]string{"Authorization": "Bearer " + f.sessionToken}
+	root := f.ts.URL + "/api/v1/spaces/" + f.spaceID
+
+	code, body := doJSON(t, "POST", root+"/import/preview", h,
+		map[string]string{"format": "netscape_html", "content": "<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<HTML><HEAD><TITLE>x</TITLE></HEAD>\n<BODY><DL><p>\n<DT><A HREF=\"https://go.dev/\">x</A>\n</DL><p>\n</BODY></HTML>"})
+	if code != http.StatusOK {
+		t.Fatalf("preview = %d %v", code, body)
+	}
+	planID := body["plan_id"].(string)
+
+	code, body = doJSON(t, "POST", root+"/import/apply", h,
+		map[string]any{"plan_id": planID, "parent": map[string]string{"type": "root"}, "strategy": "merge"})
+	if code != http.StatusNotFound || errCode(t, body) != "ROOT_SLOT_NOT_FOUND" {
+		t.Fatalf("apply with empty root key = %d %v, want 404 ROOT_SLOT_NOT_FOUND", code, body)
+	}
+
+	code, body = doJSON(t, "POST", root+"/import/apply", h,
+		map[string]any{"plan_id": planID, "parent": map[string]string{"type": "node", "id": "does-not-exist"}, "strategy": "merge"})
+	if code != http.StatusNotFound || errCode(t, body) != "NODE_NOT_FOUND" {
+		t.Fatalf("apply with unknown node parent = %d %v, want 404 NODE_NOT_FOUND", code, body)
+	}
+
+	// The plan survives both refused applies: nothing was written, so the
+	// caller can retry with a corrected location.
+	code, body = doJSON(t, "POST", root+"/import/apply", h,
+		map[string]any{"plan_id": planID, "parent": map[string]string{"type": "root", "key": "main"}, "strategy": "merge"})
+	if code != http.StatusOK {
+		t.Fatalf("apply after refused targets = %d %v", code, body)
+	}
+}
