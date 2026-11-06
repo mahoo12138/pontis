@@ -1,4 +1,4 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   previewImport,
   applyImport,
@@ -17,8 +17,15 @@ export function useImportPreview(spaceId: string | undefined) {
 }
 
 export function useImportApply(spaceId: string | undefined) {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: (params: ImportApplyRequest) => applyImport(spaceId!, params),
+    onSuccess: () => {
+      // Same contract as use-node-crud: every write invalidates the space's
+      // node list, or the explorer keeps showing the pre-import tree until
+      // the cache happens to go stale.
+      qc.invalidateQueries({ queryKey: ['spaces', spaceId, 'nodes'] });
+    },
   });
 }
 

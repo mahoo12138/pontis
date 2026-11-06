@@ -92,6 +92,18 @@ export default function ImportModal({
     return opts;
   }, [rootSlots, nodesData]);
 
+  // The on-open reset points the location at the bare 'root:' placeholder,
+  // which is not one of the options once the space has root slots — confirming
+  // with it asks the server for a root slot that does not exist. Keep the
+  // selection pointing at a location the space actually has (the same snap
+  // the plaza import modal does).
+  useEffect(() => {
+    const first = locationOptions[0];
+    if (first && !locationOptions.some((o) => o.value === location)) {
+      setLocation(first.value);
+    }
+  }, [locationOptions, location]);
+
   const runPreview = (content: string, name: string | null, fmt: ImportFormat) => {
     setFileContent(content);
     setFileName(name);
