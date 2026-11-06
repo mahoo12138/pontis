@@ -350,6 +350,57 @@ IndexedDB schema 迁移——那需要两个真实发布版本才能验证。
   起来就退出，Playwright 报 `Target page, context or browser has been closed`）。这时不要
   抢救它，重新 rsync 一份 + 重新配对，比修 profile 快。
 
+### Web 控制台业务流程全链路（`pnpm e2e:web`）
+
+双 profile 收敛覆盖的是扩展侧；Web 控制台自己的业务面——从首次初始化到广场双用户——由
+`scripts/e2e-web-console.mjs` 走：同一套"不引入 Playwright 依赖、Node 全局 fetch/WebSocket
+直说 DevTools 协议"的做法，驱动**构建产物**（内嵌 Web 的单个二进制，干净数据目录）里的
+真实 Chromium，按章节走完：
+
+1. setup 向导（首管理员、空表单校验、重复 setup 409）→ 登录/错误密码/登出；
+2. 空间新建/重命名/删除；
+3. 书签树：新建（含上下文菜单、新建落点跟随当前选中目录）、重命名（行内输入）、移动模态、
+   详情面板、键盘选择、键盘删除 → 最近活动页撤销恢复；
+4. 导出 Netscape HTML（真实落盘下载）→ 回导合并 → Native JSON 导出 → 替换导入另一空间
+   （含安全备份警告），并用 REST API 交叉核对服务端树；
+5. 整理：失效链接检查（对真实外网 URL；`organizer` 的 SSRF 策略永不放行 loopback，所以
+   可达目标用 example.com、不可达目标用必然 DNS 失败的 `.invalid`）+ 删除所选；重复书签
+   保留第一项；
+6. 备份：手动创建、恢复（Epoch 递增）、替换导入留下的安全备份核对；
+7. 任务：新建自动备份计划 → 立即运行 → 定时备份出现；
+8. 广场：发布文件夹 → 开放注册 → 成员注册（并断言看不到管理员的私有空间、API 403、无管理
+   入口）→ 成员导入 v1 → 发布者从空间更新快照到 v2 → 成员一键"更新到 v2" → 取消发布；
+9. 管理：新增用户 → 禁用（登录被指名拒绝）→ 重置链接 → 启用 → 注册模式恢复关闭；
+10. 设备：注册（一次性密钥）→ 撤销 → 删除记录；
+11. 设置：资料保存、API Token 创建（读取/写入书签作用域，脚本侧真实调用 REST 验证读写、
+    会话专用路由 403、撤销后 401）、修改密码（旧会话失效、旧密码被拒）并恢复原密码；
+12. 搜索页命中跳转并聚焦树内节点、命令面板开合。
+
+跑法与约束：
+
+- `pnpm build && pnpm e2e:web`（CI 在 e2e job 里多一步；headless 即可，无需 Xvfb）。
+- 选择器全走可见文本、label、role 与组件自带的 aria-label（更多操作：{标题}、选择 {标题}、
+  空间操作……），vanilla-extract 的哈希类名一律不碰。
+- 合成事件的三条硬约束，都是实测踩出来的：**Escape 键永不发送**（合成 Escape 在焦点交接
+  期落进每个 Modal 的全局捕获监听，渲染进程会 wedge 进死循环——用 Debugger.pause 抓到过
+  现场）；**合成 keyup 不发送**（React 只听 keydown，keyup 落在 Modal 挂载/卸载的间隙同样
+  能 wedge）；Mantine Select 一律**键盘开下拉**（focus + ArrowDown，合成鼠标点击 combobox
+  会把 Modal 一起关掉）。凡有吞点击风险的交互（菜单、菜单项、登出、禁用/启用确认）都带
+  "点开 → 验证 → 重试"的自愈循环，重试间用点击空白处而非 Escape 关残留层。
+- 导入/广场导入后树查询由各自的 mutation 钩子失效（use-transfer 与 use-plaza），脚本在
+  不重载页面的情况下断言新行就地出现，服务端真值同时用 REST API 交叉核对。
+- headless 渲染器偶发整体 wedge（CDP 全部无应答、无 JS 帧、无崩溃——用 Debugger.pause
+  探过：不在 JS 里）。脚本在整体失败时自动从零重跑一次；这不是产品行为，是 headless 的
+  偶发状态。
+
+这条链路钉住过两个真实缺陷，均已修复并转为回归断言：**导入 apply 之后树查询不失效**
+（UI 停留在旧树，刷新才看见——useImportApply 现在与 use-node-crud 同一契约，成功即失效
+节点查询）；**导入模态的"目标位置"默认值 `root:` 不在选项里**，直接点确认会让服务端以
+500 `root slot not found` 拒绝——模态现在与广场导入一致，把默认吸附到第一个真实根槽位；
+服务端 `writeTransferError` 也补上了 canonical 的客户端错误映射（缺失根键 →
+404 `ROOT_SLOT_NOT_FOUND`、未知节点 → 404 `NODE_NOT_FOUND`、非法父引用 →
+400 `INVALID_PARENT`），不再落入 500。
+
 ## 11. Release Testing
 
 Release 前至少：
@@ -376,6 +427,7 @@ CI（`.github/workflows/ci.yml`）复用根命令；本地验证与 CI 结果分
 | `pnpm test:go:race` | `go test -race ./...`，并发与任务队列的边界只在带 race 时才算测过 |
 | `pnpm test:fixtures` | 两组 golden 协议/REST fixture 的漂移检查 |
 | `pnpm e2e:dual-profile` | 两个真实 Chromium profile 经真服务端收敛，并跑一遍同目录替换文件的发布升级连续性（见 §10；要开窗口） |
+| `pnpm e2e:web` | Web 控制台业务流程全链路：以构建产物（内嵌 Web 的单个二进制）起干净服务端，真实 Chromium 走完 setup → 登录 → 空间 → 书签树 → 撤销 → 导入导出 → 整理 → 备份 → 任务 → 广场双用户 → 管理 → 设备 → Token → 搜索 → 改密（见 §10；headless 即可） |
 | `pnpm build` | 可部署产物：web 的 `vite build` → 扩展 `wxt zip` → 两份产物分别暂存进 `server/internal/{webui,distribution}/*` → `go build`（PR-F1 已落地） |
 | `pnpm --filter @pontis/extension build` | `wxt build` → `extension/.output/chrome-mv3`（解压目录，开发时手动加载用） |
 | `pnpm --filter @pontis/extension zip` | `wxt zip` → `extension/.output/pontis-chromium-<version>.zip`，包名由 `wxt.config.ts` 的 `zip.artifactTemplate` 钉死 |

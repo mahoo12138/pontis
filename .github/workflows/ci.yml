@@ -187,3 +187,10 @@ jobs:
           # 脚本据此加 --no-sandbox,而不是让两个 Profile 静默起不来。
           PONTIS_E2E_NO_SANDBOX: '1'
         run: xvfb-run -a --server-args="-screen 0 1280x1024x24" node scripts/e2e-dual-profile.mjs
+      # Web 控制台的业务流程全链路:setup 向导 → 空间/书签树 → 撤销 → 导入导出 →
+      # 整理 → 备份 → 任务 → 广场双用户 → 管理 → 设备 → Token → 搜索 → 改密。
+      # 无扩展页面参与,headless 直接跑,不用 Xvfb。
+      - name: run the web console walk
+        env:
+          PONTIS_E2E_NO_SANDBOX: '1'
+        run: node scripts/e2e-web-console.mjs

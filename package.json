@@ -21,6 +21,7 @@
     "test:go:race": "cd server && go test -race ./...",
     "test:fixtures": "cd server && go test -count=1 ./internal/httpapi -run 'TestGolden(Protocol|REST)Fixtures' && pnpm --filter @pontis/protocol test",
     "e2e:dual-profile": "node scripts/e2e-dual-profile.mjs",
+    "e2e:web": "node scripts/e2e-web-console.mjs",
     "e2e:api": "node scripts/e2e-api.mjs"
   },
   "devDependencies": {
