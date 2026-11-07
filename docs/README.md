@@ -33,6 +33,8 @@
 22. [21-development-and-testing.md](./21-development-and-testing.md) — 开发顺序、测试与 syncsim
 23. [22-decisions-and-invariants.md](./22-decisions-and-invariants.md) — 关键决策、不变量与术语表
 24. [23-ui-design-system.md](./23-ui-design-system.md) — Cold Rational Workspace UI 主题与规范
+25. [24-information-architecture.md](./24-information-architecture.md) — 信息架构
+26. [25-oidc-sso.md](./25-oidc-sso.md) — OIDC 单点登录与设备配对码
 
 ## 文档约定
 
