@@ -25,6 +25,7 @@
 //   pnpm build && node scripts/e2e-web-console.mjs [--headed] [--keep] [--debug]
 
 import { spawn } from 'node:child_process';
+import { StubOIDC } from './e2e-stub-oidc.mjs';
 import { existsSync, openSync, readdirSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -296,6 +297,8 @@ class Browser {
 
 // --- the server --------------------------------------------------------------
 
+let stubIdP;
+
 async function startServer() {
   const bin = path.join(ROOT, 'server', 'pontis');
   if (!existsSync(bin)) die('server/pontis missing — run `pnpm build` first');
@@ -307,6 +310,12 @@ async function startServer() {
       PONTIS_LISTEN: `127.0.0.1:${PORT}`,
       PONTIS_DATA_DIR: path.join(WORK, 'data'),
       PONTIS_LOG_LEVEL: 'info',
+      // SSO against the local stub IdP: the login page then offers the real
+      // flow, and ch13 walks it end to end in the browser.
+      PONTIS_OIDC_ENABLED: 'true',
+      PONTIS_OIDC_ISSUER_URL: stubIdP.issuer,
+      PONTIS_OIDC_CLIENT_ID: stubIdP.clientId,
+      PONTIS_OIDC_CLIENT_SECRET: stubIdP.clientSecret,
     },
     stdio: DEBUG ? 'inherit' : ['ignore', logFd, logFd],
     detached: true,
@@ -324,6 +333,7 @@ async function startServer() {
 function stopServer() {
   if (serverProc) killGroup(serverProc);
   serverProc = undefined;
+  stubIdP?.stop();
 }
 
 /** Script-side HTTP against the same API the page uses. */
@@ -1108,6 +1118,14 @@ async function main() {
   mkdirSync(WORK, { recursive: true });
 
   log(`starting the server on ${ORIGIN} (fresh data dir)…`);
+  stubIdP = new StubOIDC({
+    clientId: 'pontis-e2e',
+    clientSecret: 'pontis-e2e-secret',
+    claims: { sub: 'e2e-sso-sub', preferred_username: 'sso-user',
+              email: 'sso-user@pontis-e2e.test', email_verified: true },
+  });
+  const issuer = await stubIdP.start();
+  log(`  stub IdP on ${issuer}`);
   await startServer();
 
   log('launching Chromium…');
@@ -1926,6 +1944,61 @@ async function main() {
     check(true, 'ch12: command palette opens', '');
     await clickAt(page, '{"x":10,"y":10}', 'ch12: click away from palette');
     await waitStep(page, paletteProbe, 'no', 'ch12: palette closed', 10_000);
+  });
+
+  // ─── 13. SSO 登录与设备配对码 ─────────────────────────────────────
+  log('ch13: pairing code + SSO login');
+  await stepShowingPage('ch13 sso', page, async () => {
+    // The web half of extension pairing: mint a code in the console, redeem
+    // it the way the extension's PairingForm does, and watch it burn.
+    await goto(page, '/devices', '生成配对码', 'ch13: devices page');
+    await clickButton(page, '生成配对码', 'ch13: open pairing dialog');
+    await waitStep(page, `bodyText().includes('扩展配对码')`, 'true', 'ch13: pairing dialog opens', 10_000);
+    // A single expression: waitStep wraps probes as `return <expr>;`, so a
+    // statement-bodied probe is a SyntaxError there.
+    const codeProbe = `(() => {
+      const cands = (document.body.innerText.match(/[2-9A-Z]{4}-[2-9A-Z]{4}/g) || [])
+        .filter((c) => !/[ILO01]/.test(c));
+      return cands.length === 1 ? cands[0] : 'pending';
+    })()`;
+    await waitStep(page, `${codeProbe} !== 'pending'`, 'true', 'ch13: pairing code shown', 10_000);
+    const pairingCode = String(await page.evaluate(`${HELPERS}return ${codeProbe};`));
+    log(`  step ch13: pairing code ${pairingCode}`);
+
+    const paired = await api('POST', '/api/v1/devices/pair',
+      { body: { code: pairingCode, name: 'e2e-paired-client', client_type: 'extension' }, status: 201 });
+    check(Boolean(paired.data?.token), 'ch13: extension redeeming the code gets a device credential',
+      JSON.stringify(paired.data ?? paired).slice(0, 120));
+    const reused = await api('POST', '/api/v1/devices/pair',
+      { body: { code: pairingCode, name: 'again' }, status: 403 });
+    check(reused.data?.error?.code === 'PAIRING_CODE_INVALID', 'ch13: a used code is dead',
+      reused.data?.error?.code ?? 'no error body');
+
+    // The SSO half: log out, find the entry, and let the browser walk the
+    // whole redirect chain through the stub IdP.
+    // A click away dismisses the modal (the script avoids synthetic Escape).
+    await clickAt(page, '{"x":10,"y":10}', 'ch13: close pairing dialog');
+    await logout(page, 'ch13');
+    await waitStep(page, `bodyText().includes('使用 SSO 登录')`, 'true', 'ch13: login page offers SSO', 10_000);
+    await clickAt(page, await page.evaluate(`${HELPERS}
+      const a = [...document.querySelectorAll('a')].filter(visible)
+        .find((el) => (el.textContent || '').trim() === '使用 SSO 登录');
+      return rectOf(a);`), 'ch13: click the SSO entry');
+    // The stub approves instantly: start → IdP → callback → /.
+    // Single async expression: waitStep wraps probes as `return <expr>;`.
+    const meProbe = `(async () => {
+      const r = await fetch('/api/v1/auth/me', { credentials: 'include' });
+      if (!r.ok) return 'unauthenticated';
+      return (await r.json()).username;
+    })()`;
+    await waitStep(page, meProbe, 'sso-user', 'ch13: SSO lands in the provisioned account', 25_000);
+
+    // The provisioned account gets the workspace every account is promised.
+    await waitStep(page, `bodyText().includes('Personal')`, 'true', 'ch13: SSO account opens its Personal space', 15_000);
+
+    // And it is a real session, not a leftover: sign back in as the admin.
+    await logout(page, 'ch13');
+    await loginAs(page, ADMIN.username, ADMIN.password, 'ch13', mainSpace);
   });
 
   if (failed) {
