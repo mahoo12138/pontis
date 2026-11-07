@@ -27,6 +27,10 @@ export const mockStatus: SystemStatusResponse = {
   // screens can be opened without a Go server, and /register is one of them.
   registration_mode: 'open',
   allow_registration: true,
+  // Password login stays the mock's primary path; the SSO entry only renders
+  // when a real deployment configures a provider.
+  oidc_enabled: false,
+  password_login_enabled: true,
 };
 
 export function mockUser(username: string): User {

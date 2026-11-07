@@ -13,13 +13,18 @@ export interface MetaResponse {
  * The public projection of the instance settings — all an anonymous visitor
  * can learn. `allow_registration` is the server's own gate rather than a field
  * to re-derive: it folds the mode and the initialization state together, so a
- * page cannot disagree with the endpoint that enforces it. The remaining
- * `SystemSettings` keys stay behind a session.
+ * page cannot disagree with the endpoint that enforces it. The two SSO fields
+ * are the same idea for the login page's second entry: `oidc_enabled` says the
+ * provider-backed flow is live, `password_login_enabled` says the credential
+ * form is worth rendering. The remaining `SystemSettings` keys stay behind a
+ * session.
  */
 export interface SystemStatusResponse {
   initialized: boolean;
   registration_mode: 'closed' | 'open' | 'invite';
   allow_registration: boolean;
+  oidc_enabled: boolean;
+  password_login_enabled: boolean;
 }
 
 // ─── Auth ───────────────────────────────────────────────────
@@ -97,6 +102,25 @@ export interface RegisterDeviceRequest {
 export interface RegisterDeviceResponse {
   device: Device;
   token: string;
+}
+
+/**
+ * A one-time pairing code minted by a signed-in web session and redeemed by a
+ * client that cannot hold one (the extension). The server returns it in
+ * display form XXXX-XXXX; the secret behind it is stored only hashed.
+ */
+export interface PairingCodeResponse {
+  code: string;
+  expires_at: string;
+}
+
+/** Redeeming a code registers the device: same response shape as /devices. */
+export interface PairWithCodeRequest {
+  code: string;
+  name: string;
+  client_type?: string;
+  browser?: string;
+  platform?: string;
 }
 
 // ─── Device overview (pinned by fixtures/api) ──────────────────────────────

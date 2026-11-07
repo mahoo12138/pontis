@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
+  Alert,
   Badge,
   Button,
   CopyButton,
@@ -15,6 +16,7 @@ import {
 } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 import {
+  IconAlertCircle,
   IconBrandChrome,
   IconBrandEdge,
   IconBrandFirefox,
@@ -26,6 +28,8 @@ import {
   IconDeviceDesktop,
   IconDotsVertical,
   IconPlus,
+  IconQrcode,
+  IconRefresh,
   IconShieldOff,
   IconTrash,
 } from '@tabler/icons-react';
@@ -48,6 +52,7 @@ import {
   useRegisterDevice,
   useRevokeDevice,
   useDeleteDevice,
+  usePairingCode,
 } from '../hooks/use-devices';
 import { formatRelativeTime } from '../lib/format';
 
@@ -168,6 +173,7 @@ export default function DevicesPage() {
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [addOpen, setAddOpen] = useState(false);
+  const [pairOpen, setPairOpen] = useState(false);
   /** Which device a confirmation is about, and which of the two steps it is. */
   const [confirm, setConfirm] = useState<{ device: DeviceOverview; action: 'revoke' | 'delete' } | null>(null);
 
@@ -213,6 +219,14 @@ export default function DevicesPage() {
           <Text fz={13} c="dimmed">
             设备是浏览器 Profile 中的一次扩展安装。每个设备可以绑定一个或多个同步空间。
           </Text>
+          <Button
+            size="compact-sm"
+            variant="subtle"
+            leftSection={<IconQrcode size={14} stroke={1.5} />}
+            onClick={() => setPairOpen(true)}
+          >
+            生成配对码
+          </Button>
         </Group>
 
         {isError ? (
@@ -270,6 +284,10 @@ export default function DevicesPage() {
         </div>
       </div>
 
+      <PairingCodeModal
+        opened={pairOpen}
+        onClose={() => setPairOpen(false)}
+      />
       <AddDeviceModal
         opened={addOpen}
         onClose={() => setAddOpen(false)}
@@ -620,5 +638,121 @@ function EmptyDevices({ onAdd }: { onAdd: () => void }) {
         添加设备
       </Button>
     </div>
+  );
+}
+
+// ─── Pairing code ────────────────────────────────────────────
+
+/** Seconds a freshly minted pairing code stays redeemable (mirrors the server). */
+const PAIRING_CODE_TTL_SECONDS = 600;
+
+/**
+ * Shows a one-time code the extension can redeem for a device credential —
+ * for an SSO account that has no password to type, and for anyone who would
+ * rather not paste one into a form. A fresh code is minted on every open;
+ * the countdown says how long the screen still means anything.
+ */
+function PairingCodeModal({ opened, onClose }: { opened: boolean; onClose: () => void }) {
+  const pairing = usePairingCode();
+  const [remaining, setRemaining] = useState<number>(0);
+
+  const mint = () => {
+    pairing.mutate(undefined, {
+      onSuccess: (res) => {
+        const expiresAt = new Date(res.expires_at).getTime();
+        const tick = () => setRemaining(Math.max(0, Math.round((expiresAt - Date.now()) / 1000)));
+        tick();
+        const timer = window.setInterval(() => {
+          tick();
+          // Stop counting a code that is already spent or expired.
+          if (Date.now() >= expiresAt) window.clearInterval(timer);
+        }, 1000);
+        window.setTimeout(() => window.clearInterval(timer), (PAIRING_CODE_TTL_SECONDS + 2) * 1000);
+      },
+    });
+  };
+
+  // Every open mints a new code: an old one on screen may already be spent,
+  // and the dialog must never show a code it cannot vouch for.
+  useEffect(() => {
+    if (opened) mint();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [opened]);
+
+  const code = pairing.data?.code ?? '';
+  const minutes = Math.floor(remaining / 60);
+  const seconds = String(remaining % 60).padStart(2, '0');
+
+  return (
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title="扩展配对码"
+      size={440}
+      styles={{ header: { fontSize: 15, fontWeight: 600 } }}
+    >
+      <Text fz={13}>
+        在扩展登录界面选择「配对码登录」,输入下面的码即可完成配对,无需输入账号密码。
+        <strong style={{ fontWeight: 600 }}>配对码 10 分钟内有效,且只能使用一次</strong>。
+      </Text>
+      {pairing.isPending ? (
+        <Skeleton height={52} mt={12} radius={6} />
+      ) : pairing.isError ? (
+        <>
+          <Alert color="errorRed" variant="light" mt={12} icon={<IconAlertCircle size={16} />}>
+            {pairing.error instanceof Error ? pairing.error.message : '生成配对码失败'}
+          </Alert>
+          <Group justify="flex-end" mt="lg">
+            <Button onClick={mint} leftSection={<IconRefresh size={14} stroke={1.5} />}>
+              重试
+            </Button>
+          </Group>
+        </>
+      ) : (
+        <>
+          <div
+            className={mono}
+            style={{
+              marginTop: 12,
+              padding: '10px 12px',
+              backgroundColor: tokens.raisedBg,
+              border: `1px solid ${tokens.subtleBorder}`,
+              borderRadius: 6,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+            }}
+          >
+            <span style={{ flex: 1, fontSize: 20, letterSpacing: 2 }}>{code}</span>
+            <CopyButton value={code}>
+              {({ copied, copy }) => (
+                <Tooltip label={copied ? '已复制' : '复制'} withArrow>
+                  <UnstyledButton
+                    onClick={copy}
+                    aria-label="复制配对码"
+                    style={{ color: copied ? tokens.syncHealthy : tokens.textSecondary, display: 'inline-flex' }}
+                  >
+                    {copied ? <IconCheck size={15} stroke={1.7} /> : <IconCopy size={15} stroke={1.5} />}
+                  </UnstyledButton>
+                </Tooltip>
+              )}
+            </CopyButton>
+          </div>
+          <Group justify="space-between" mt="sm">
+            <Text fz="xs" c={remaining > 0 ? 'dimmed' : 'errorRed'}>
+              {remaining > 0 ? `有效期剩余 ${minutes}:${seconds}` : '已过期,请重新生成'}
+            </Text>
+            <Button
+              size="compact-sm"
+              variant="subtle"
+              leftSection={<IconRefresh size={14} stroke={1.5} />}
+              onClick={mint}
+            >
+              重新生成
+            </Button>
+          </Group>
+        </>
+      )}
+    </Modal>
   );
 }

@@ -65,6 +65,7 @@ import type {
   PublicationVersion,
   PublicationVersionListResponse,
   PublicationVisibility,
+  PairingCodeResponse,
   PlazaFacetsResponse,
   RegisterDeviceResponse,
   RestoreBackupResponse,
@@ -153,14 +154,17 @@ export const checkMeta: Checker<MetaResponse> = record<MetaResponse>({
   sync_protocol_versions: arr(num),
 });
 
-// The anonymous view of the instance. Only these three keys are public — an
+// The anonymous view of the instance. Only these five keys are public — an
 // extra field here would be the client accepting a server that leaked operator
-// policy to visitors.
+// policy to visitors. The two SSO flags are the login page's own gates, the
+// same idea as allow_registration.
 export const checkSystemStatus: Checker<SystemStatusResponse> =
   record<SystemStatusResponse>({
     initialized: bool,
     registration_mode: oneOf('closed', 'open', 'invite'),
     allow_registration: bool,
+    oidc_enabled: bool,
+    password_login_enabled: bool,
   });
 
 export const checkUser: Checker<User> = record<User>({
@@ -669,6 +673,14 @@ export const checkLogin: Checker<LoginResponse> = record<LoginResponse>({
 
 export const checkRegisterDevice: Checker<RegisterDeviceResponse> =
   record<RegisterDeviceResponse>({ device: checkDevice, token: str });
+
+// The pairing code response: display form + expiry. Redeeming one answers
+// with checkRegisterDevice — the server deliberately keeps both registration
+// paths in one response shape.
+export const checkPairingCode: Checker<PairingCodeResponse> = record<PairingCodeResponse>({
+  code: str,
+  expires_at: str,
+});
 
 export const checkCreateToken: Checker<CreateTokenResponse> = record<CreateTokenResponse>({
   token: checkApiToken,

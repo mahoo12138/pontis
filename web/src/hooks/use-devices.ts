@@ -4,6 +4,7 @@ import {
   revokeDevice,
   deleteDevice,
   registerDevice,
+  createPairingCode,
 } from '@pontis/api/endpoints/devices';
 import type { RegisterDeviceRequest } from '@pontis/api';
 
@@ -43,5 +44,15 @@ export function useRegisterDevice() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['devices'] });
     },
+  });
+}
+
+/**
+ * Mint a one-time pairing code. Not cached: every open of the dialog mints a
+ * fresh code, so a stale one never sits on screen past its own expiry.
+ */
+export function usePairingCode() {
+  return useMutation({
+    mutationFn: () => createPairingCode(),
   });
 }
