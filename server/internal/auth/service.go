@@ -144,18 +144,29 @@ func (s *Service) Login(ctx context.Context, username, password, userAgent strin
 		return "", Session{}, User{}, ErrUserDisabled
 	}
 
-	token, tokenHash, err := newSessionToken()
+	token, session, err = s.startSession(ctx, u, userAgent)
 	if err != nil {
 		return "", Session{}, User{}, err
+	}
+	return token, session, u, nil
+}
+
+// startSession mints an opaque web session for an already-authenticated
+// user. Every login path — password and OIDC — converges here, so no path
+// can grow its own token format or TTL.
+func (s *Service) startSession(ctx context.Context, u User, userAgent string) (string, Session, error) {
+	token, tokenHash, err := newSessionToken()
+	if err != nil {
+		return "", Session{}, err
 	}
 
 	sessionID, err := uuid.NewV7()
 	if err != nil {
-		return "", Session{}, User{}, err
+		return "", Session{}, err
 	}
 
 	now := time.Now().UTC()
-	session = Session{
+	session := Session{
 		ID:        sessionID.String(),
 		UserID:    u.ID,
 		TokenHash: tokenHash,
@@ -165,9 +176,9 @@ func (s *Service) Login(ctx context.Context, username, password, userAgent strin
 		UserAgent: userAgent,
 	}
 	if err := s.store.InsertSession(ctx, session); err != nil {
-		return "", Session{}, User{}, err
+		return "", Session{}, err
 	}
-	return token, session, u, nil
+	return token, session, nil
 }
 
 // VerifySession resolves a raw session token to its session and user.

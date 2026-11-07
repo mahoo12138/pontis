@@ -66,6 +66,11 @@ type Server struct {
 	StartPage     *startpage.Service
 	Accounts      *sqlite.AccountStore
 
+	// OIDC is the single sign-on relying party. Nil on an instance without
+	// a configured provider: the /auth/oidc/* endpoints then redirect the
+	// browser back with OIDC_UNAVAILABLE and password login stays open.
+	OIDC *auth.OIDCService
+
 	// Web serves the compiled Web app for any path the API routes do not
 	// claim. Nil in a checkout that never staged a build; the server then
 	// answers with a hint instead of an empty page.
@@ -127,6 +132,12 @@ func (s *Server) Router() http.Handler {
 	r.Post("/api/v1/auth/setup", s.handleSetup)
 	r.Post("/api/v1/auth/login", s.handleLogin)
 	r.Post("/api/v1/auth/reset", s.handleResetPassword)
+
+	// OIDC single sign-on. Browser navigations, not API calls: start
+	// redirects to the provider, callback returns with the code and leaves
+	// with a session cookie. Public like the login they sit next to.
+	r.Get("/api/v1/auth/oidc/start", s.handleOIDCStart)
+	r.Get("/api/v1/auth/oidc/callback", s.handleOIDCCallback)
 
 	// Public surface for a visitor with no session yet: the login page reads
 	// /system/status to decide between the init and register entry points.
@@ -266,7 +277,15 @@ func (s *Server) Router() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireSession)
 		r.Post("/api/v1/devices", s.handleRegisterDevice)
+		// A pairing code is how the extension gets that secret without the
+		// user typing a password into it (and the only way for an
+		// SSO-provisioned account, which has no password).
+		r.Post("/api/v1/devices/pairing-codes", s.handleCreatePairingCode)
 	})
+
+	// Pairing redemption is public like the login it stands in for: the
+	// redeemer holds no credential yet, just a code shown on a screen.
+	r.Post("/api/v1/devices/pair", s.handlePairWithCode)
 
 	// Browsing statistics the extension uploads (core/activity). Ingest is
 	// device-credential territory and writes only the uploader's own rows;
@@ -458,6 +477,12 @@ const defaultSpaceName = "Personal"
 // that already has an admin, and only while the operator keeps
 // registration_mode on `open`.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	// Local signups on a pure-SSO instance would create accounts that can
+	// never log in with them; auto-provisioning through the provider is the
+	// way in instead.
+	if s.passwordLoginBlocked(w, r) {
+		return
+	}
 	settings, err := s.currentSettings(r.Context())
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
@@ -522,6 +547,9 @@ type loginRequest struct {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if s.passwordLoginBlocked(w, r) {
+		return
+	}
 	var req loginRequest
 	if !decodeJSON(w, r, &req) {
 		return

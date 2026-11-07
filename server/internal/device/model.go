@@ -50,6 +50,14 @@ var (
 	// ErrSyncModeConflict is returned when the requested sync mode changes
 	// an existing device's mode while bindings exist.
 	ErrSyncModeConflict = errors.New("device: sync mode change requires unbinding first")
+
+	// ErrPairingCodeInvalid is returned for unknown, expired or already
+	// used pairing codes.
+	ErrPairingCodeInvalid = errors.New("device: pairing code invalid")
+
+	// ErrPairingUnavailable is returned when the store the service was built
+	// on does not implement the pairing contract.
+	ErrPairingUnavailable = errors.New("device: pairing flow unavailable")
 )
 
 // SyncMode is the device-level sync mode. Full and partial are mutually

@@ -1,5 +1,7 @@
 {
   "allow_registration": false,
   "initialized": true,
+  "oidc_enabled": false,
+  "password_login_enabled": true,
   "registration_mode": "closed"
 }

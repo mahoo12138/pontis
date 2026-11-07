@@ -129,13 +129,35 @@ func Run(ctx context.Context, cfg config.Config) error {
 		extensionRelease = distribution.Empty()
 	}
 
+	authSvc := auth.NewService(sqlite.NewAuthStore(db), sessionTTL)
+
+	// Discovery runs once, here: an OIDC deployment whose provider cannot be
+	// reached or whose metadata is broken must fail the boot rather than the
+	// first login that needs it.
+	var oidcSvc *auth.OIDCService
+	if cfg.OIDC.Enabled {
+		oidcSvc, err = auth.NewOIDCService(ctx, authSvc, auth.OIDCSettings{
+			IssuerURL:            cfg.OIDC.IssuerURL,
+			ClientID:             cfg.OIDC.ClientID,
+			ClientSecret:         cfg.OIDC.ClientSecret,
+			Scopes:               cfg.OIDC.ScopeList(),
+			AutoProvision:        cfg.OIDC.AutoProvision,
+			DisablePasswordLogin: cfg.OIDC.DisablePasswordLogin,
+		})
+		if err != nil {
+			return err
+		}
+		logger.Info("oidc single sign-on enabled", "issuer", cfg.OIDC.IssuerURL)
+	}
+
 	api := &httpapi.Server{
 		// Paths the API does not claim are served from the Web dist embedded
 		// in this binary (doc 21 §12: one artifact, no Node on the target).
 		Web:           webui.Assets(),
 		Distribution:  extensionRelease,
 		Deploy:        deploy,
-		Auth:          auth.NewService(sqlite.NewAuthStore(db), sessionTTL),
+		Auth:          authSvc,
+		OIDC:          oidcSvc,
 		Activity:      activitySvc,
 		Devices:       device.NewService(deviceStore),
 		Spaces:        space.NewService(sqlite.NewSpaceStore(db)),

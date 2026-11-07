@@ -26,6 +26,12 @@ type systemStatusResponse struct {
 	// AllowRegistration is what the login page acts on: the server's own gate,
 	// so no client re-derives the rule and disagrees with it.
 	AllowRegistration bool `json:"allow_registration"`
+	// OIDCEnabled says the login page may offer "single sign-on": the
+	// /auth/oidc/start endpoint is live and configured.
+	OIDCEnabled bool `json:"oidc_enabled"`
+	// PasswordLoginEnabled is false on a pure-SSO deployment, where the
+	// password form would only collect rejections.
+	PasswordLoginEnabled bool `json:"password_login_enabled"`
 }
 
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
@@ -40,9 +46,12 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := settings["registration_mode"]
+	oidcEnabled := s.OIDC != nil
 	writeJSON(w, http.StatusOK, systemStatusResponse{
-		Initialized:       !needs,
-		RegistrationMode:  mode,
-		AllowRegistration: !needs && mode == registrationOpen,
+		Initialized:          !needs,
+		RegistrationMode:     mode,
+		AllowRegistration:    !needs && mode == registrationOpen,
+		OIDCEnabled:          oidcEnabled,
+		PasswordLoginEnabled: !oidcEnabled || !s.OIDC.PasswordLoginDisabled(),
 	})
 }

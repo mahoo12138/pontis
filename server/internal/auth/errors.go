@@ -29,4 +29,38 @@ var (
 
 	// ErrEmailTaken is returned when the email is already in use.
 	ErrEmailTaken = errors.New("auth: email already in use")
+
+	// ErrUserNotFound is returned by account lookups that find no row. The
+	// credential paths keep answering ErrInvalidCredentials so they cannot
+	// disclose which half was wrong; administrative and SSO lookups have no
+	// such audience and can say "not found" plainly.
+	ErrUserNotFound = errors.New("auth: user not found")
+
+	// ErrOIDCStateInvalid is returned when the state token of a sign-in flow
+	// is unknown, already consumed or expired: the browser retry the login.
+	ErrOIDCStateInvalid = errors.New("auth: oidc flow state invalid or expired")
+
+	// ErrOIDCTokenExchange is returned when the provider rejects the
+	// authorization code.
+	ErrOIDCTokenExchange = errors.New("auth: oidc code exchange failed")
+
+	// ErrOIDCTokenInvalid is returned when the ID token fails verification
+	// (signature, issuer, audience, expiry or nonce).
+	ErrOIDCTokenInvalid = errors.New("auth: oidc token invalid")
+
+	// ErrOIDCAccountNotLinked is returned when a verified identity matches no
+	// local account and auto-provisioning is switched off.
+	ErrOIDCAccountNotLinked = errors.New("auth: oidc identity matches no local account")
+
+	// ErrOIDCNotInitialized is returned when SSO reaches an instance with no
+	// admin yet. Bootstrap is /auth/setup; SSO must never mint that role.
+	ErrOIDCNotInitialized = errors.New("auth: instance has no admin yet")
+
+	// ErrOIDCUnavailable is returned when the endpoints are hit without a
+	// configured provider.
+	ErrOIDCUnavailable = errors.New("auth: oidc is not configured")
+
+	// ErrOIDCProvisionFailed is returned when automatic account creation
+	// could not complete after its bounded retries.
+	ErrOIDCProvisionFailed = errors.New("auth: oidc provisioning failed")
 )

@@ -189,6 +189,11 @@ func (s *Server) handleCreateResetLink(w http.ResponseWriter, r *http.Request) {
 
 // handleResetPassword is the public counterpart: token + new password.
 func (s *Server) handleResetPassword(w http.ResponseWriter, r *http.Request) {
+	// On a pure-SSO instance a reset link has nothing to reset into; an
+	// operator who needs one re-enables password login in the config.
+	if s.passwordLoginBlocked(w, r) {
+		return
+	}
 	var req struct {
 		Token       string `json:"token"`
 		NewPassword string `json:"new_password"`
