@@ -15,7 +15,7 @@ import { PontisLogo } from '../../ui/PontisLogo';
 import { createRuntime, errText, wakeWorker } from '../../ui/runtime';
 import { notifyError } from '../../ui/notify';
 import { BindForm, type SpaceOption } from '../../ui/BindForm';
-import { PairingForm } from '../../ui/PairingForm';
+import { PairingForm, type PairingParams } from '../../ui/PairingForm';
 import { mountFolderTree } from '../../ui/mountFolders';
 import type { FolderTreeNode } from '../../ui/folderTree';
 
@@ -84,21 +84,24 @@ export function App() {
     }
   }
 
-  const doPair = (params: { serverUrl: string; username: string; password: string; deviceName: string }) =>
+  const doPair = (params: PairingParams) =>
     void run('pair', async () => {
       const origin = originPatternFor(params.serverUrl);
       const granted = await new Promise<boolean>((resolve) => {
         runtime.chrome.permissions.request({ origins: [origin] }, resolve);
       });
       if (!granted) throw new Error(`需要允许扩展访问 ${origin}`);
-      await runtime.pairing.pair({
+      const common = {
         serverUrl: params.serverUrl,
-        username: params.username,
-        password: params.password,
         deviceName: params.deviceName || '浏览器插件',
         browser: 'chromium',
         platform: navigator.platform,
-      });
+      };
+      if (params.mode === 'code') {
+        await runtime.pairing.pairWithCode({ ...common, code: params.code });
+      } else {
+        await runtime.pairing.pair({ ...common, username: params.username, password: params.password });
+      }
     });
 
   const doBind = (spaceId: string, folderId: string, spaceName: string) =>

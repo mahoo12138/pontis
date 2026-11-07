@@ -7,14 +7,13 @@
 // first statement rather than awaiting anything here.
 
 import { useState } from 'react';
-import { Button, Group, PasswordInput, Stack, TextInput } from '@mantine/core';
+import { Button, Group, PasswordInput, SegmentedControl, Stack, TextInput } from '@mantine/core';
 
-export interface PairingParams {
-  serverUrl: string;
-  username: string;
-  password: string;
-  deviceName: string;
-}
+export type PairingMode = 'password' | 'code';
+
+export type PairingParams =
+  | { mode: 'password'; serverUrl: string; username: string; password: string; deviceName: string }
+  | { mode: 'code'; serverUrl: string; code: string; deviceName: string };
 
 export function PairingForm({
   initialServerUrl = '',
@@ -28,15 +27,25 @@ export function PairingForm({
   onPair: (params: PairingParams) => void;
 }) {
   const [serverUrl, setServerUrl] = useState(initialServerUrl);
+  const [mode, setMode] = useState<PairingMode>('password');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
   const [deviceName, setDeviceName] = useState('');
 
   const submit = () => {
-    onPair({ serverUrl: serverUrl.trim(), username, password, deviceName: deviceName.trim() });
-    // The secret is the only field with no reason to survive the attempt: the
-    // address and the device name describe what was just registered.
-    setPassword('');
+    const trimmedUrl = serverUrl.trim();
+    const trimmedName = deviceName.trim();
+    if (mode === 'password') {
+      onPair({ mode, serverUrl: trimmedUrl, username, password, deviceName: trimmedName });
+      // The secret is the only field with no reason to survive the attempt: the
+      // address and the device name describe what was just registered.
+      setPassword('');
+    } else {
+      onPair({ mode, serverUrl: trimmedUrl, code: code.trim(), deviceName: trimmedName });
+      // Same rule for the code: one-time, and spent by the attempt.
+      setCode('');
+    }
   };
 
   return (
@@ -51,23 +60,46 @@ export function PairingForm({
         onChange={(e) => setServerUrl(e.currentTarget.value)}
         required
       />
-      <Group grow align="flex-start" wrap="wrap">
-        <TextInput
-          label="用户名"
-          value={username}
-          onChange={(e) => setUsername(e.currentTarget.value)}
-          autoComplete="username"
-          required
+      <Stack gap="sm">
+        <SegmentedControl
+          fullWidth
+          value={mode}
+          onChange={(v) => setMode(v as PairingMode)}
+          data={[
+            { value: 'password', label: '账号密码' },
+            { value: 'code', label: '配对码' },
+          ]}
         />
-        <PasswordInput
-          label="密码"
-          value={password}
-          onChange={(e) => setPassword(e.currentTarget.value)}
-          onKeyDown={(e) => e.key === 'Enter' && submit()}
-          autoComplete="current-password"
-          required
-        />
-      </Group>
+        {mode === 'password' ? (
+          <Group grow align="flex-start" wrap="wrap">
+            <TextInput
+              label="用户名"
+              value={username}
+              onChange={(e) => setUsername(e.currentTarget.value)}
+              autoComplete="username"
+              required
+            />
+            <PasswordInput
+              label="密码"
+              value={password}
+              onChange={(e) => setPassword(e.currentTarget.value)}
+              onKeyDown={(e) => e.key === 'Enter' && submit()}
+              autoComplete="current-password"
+              required
+            />
+          </Group>
+        ) : (
+          <TextInput
+            label="配对码"
+            description="在网页控制台「设备」页生成，10 分钟内有效，只能用一次；单点登录账号没有密码，配对码是唯一的配对方式"
+            placeholder="例如：ABCD-2345"
+            value={code}
+            onChange={(e) => setCode(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === 'Enter' && submit()}
+            required
+          />
+        )}
+      </Stack>
       <TextInput
         label="设备名称"
         description="这台浏览器在服务器上显示的名字，方便日后单独撤销它"
@@ -78,7 +110,7 @@ export function PairingForm({
       {/* A Stack stretches its children; a full-width primary button on a form
           this narrow reads like a page-level action. */}
       <Button onClick={submit} loading={busy} style={{ alignSelf: 'flex-start' }}>
-        {submitLabel}
+        {mode === 'code' ? '用配对码注册设备' : submitLabel}
       </Button>
     </Stack>
   );

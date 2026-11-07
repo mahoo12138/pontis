@@ -77,6 +77,44 @@ export class PairingService {
     return { deviceId: device.id, instanceId: meta.instance_id };
   }
 
+  /**
+   * Redeem a pairing code minted in the web console: register device → persist
+   * bootstrap, with no password anywhere in the call. An SSO-provisioned
+   * account has no password at all, so this is not a convenience but the only
+   * way it can pair. Same bootstrap shape as {@link pair}, so everything
+   * downstream — bindings, replicas, worker nudge — behaves identically.
+   */
+  async pairWithCode(params: {
+    serverUrl: string;
+    code: string;
+    deviceName: string;
+    browser: string;
+    platform: string;
+  }): Promise<PairingResult> {
+    const previous = await this.bootstrap.get();
+    const meta = await this.client.meta(params.serverUrl);
+    const { device, token } = await this.client.pairWithCode(
+      {
+        code: params.code,
+        name: params.deviceName,
+        client_type: 'extension',
+        browser: params.browser,
+        platform: params.platform,
+      },
+      params.serverUrl,
+    );
+    await this.bootstrap.set({
+      serverUrl: params.serverUrl.replace(/\/+$/, ''),
+      instanceId: meta.instance_id,
+      deviceId: device.id,
+      deviceToken: token,
+      deviceName: params.deviceName,
+      pairedAt: Date.now(),
+    });
+    if (previous.deviceId && previous.deviceId !== device.id) await this.dropForeignReplicas(previous.deviceId);
+    return { deviceId: device.id, instanceId: meta.instance_id };
+  }
+
   async listSpaces(): Promise<{ id: string; name: string }[]> {
     const { deviceToken } = await this.bootstrap.get();
     if (!deviceToken) throw new Error('not paired');

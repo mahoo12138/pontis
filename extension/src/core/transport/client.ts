@@ -218,6 +218,16 @@ export class ApiClient
     return this.request('/api/v1/devices', { method: 'POST', token: sessionToken, body, serverUrl });
   }
 
+  /**
+   * Redeem a one-time pairing code (minted in the web console) for a device
+   * credential. Same response shape as registerDevice, and no password ever
+   * crosses this call — the code is the credential, and an SSO-only account
+   * has no password to send anyway.
+   */
+  pairWithCode(body: { code: string; name: string; client_type: string; browser: string; platform: string }, serverUrl?: string): Promise<{ device: DeviceWire; token: string }> {
+    return this.request('/api/v1/devices/pair', { method: 'POST', body, serverUrl });
+  }
+
   deviceSpaces(deviceToken: string): Promise<{ spaces: SpaceWire[] }> {
     return this.request('/api/v1/device/spaces', { token: deviceToken });
   }

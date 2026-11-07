@@ -39,7 +39,7 @@ import { BindForm } from '../../ui/BindForm';
 import { mountFolderTree } from '../../ui/mountFolders';
 import { FolderPickerField } from '../../ui/FolderPickerField';
 import type { FolderTreeNode } from '../../ui/folderTree';
-import { PairingForm } from '../../ui/PairingForm';
+import { PairingForm, type PairingParams } from '../../ui/PairingForm';
 import { errText } from '../../ui/runtime';
 import { StartPageSettings } from '../../ui/StartPageSettings';
 import { ActivityTab } from '../../ui/ActivityTab';
@@ -110,12 +110,7 @@ export function App() {
     setError(null);
   }, [error, setError]);
 
-  const doPair = (params: {
-    serverUrl: string;
-    username: string;
-    password: string;
-    deviceName: string;
-  }) =>
+  const doPair = (params: PairingParams) =>
     void run(
       'pair',
       async () => {
@@ -127,14 +122,17 @@ export function App() {
           chrome.permissions.request({ origins: [origin] }, resolve);
         });
         if (!granted) throw new Error(`需要允许扩展访问 ${origin}`);
-        await pairing.pair({
+        const common = {
           serverUrl: params.serverUrl,
-          username: params.username,
-          password: params.password,
           deviceName: params.deviceName || '浏览器插件',
           browser: 'chromium',
           platform: navigator.platform,
-        });
+        };
+        if (params.mode === 'code') {
+          await pairing.pairWithCode({ ...common, code: params.code });
+        } else {
+          await pairing.pair({ ...common, username: params.username, password: params.password });
+        }
       },
       () => setEditPairing(false),
     );
