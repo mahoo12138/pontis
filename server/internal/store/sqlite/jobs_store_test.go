@@ -290,13 +290,13 @@ func TestJobFencingCancelTypeCapsAndPoisonPill(t *testing.T) {
 	}
 
 	// R50: per-type limit caps organizer.link_check at 1 while letting journal.gc claim.
-	if err := store.Enqueue(ctx, jobs.Job{ID: "lc-1", Type: jobs.TypeLinkCheck, MaxAttempts: 3, ScheduledAt: now}); err != nil {
+	if err := store.Enqueue(ctx, jobs.Job{ID: "lc-1", Type: jobs.TypeLinkCheck, MaxAttempts: 3, ScheduledAt: now.Add(-3 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Enqueue(ctx, jobs.Job{ID: "lc-2", Type: jobs.TypeLinkCheck, MaxAttempts: 3, ScheduledAt: now.Add(time.Millisecond)}); err != nil {
+	if err := store.Enqueue(ctx, jobs.Job{ID: "lc-2", Type: jobs.TypeLinkCheck, MaxAttempts: 3, ScheduledAt: now.Add(-2 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Enqueue(ctx, jobs.Job{ID: "gc-1", Type: jobs.TypeJournalGC, MaxAttempts: 3, Priority: 0, ScheduledAt: now.Add(2 * time.Millisecond)}); err != nil {
+	if err := store.Enqueue(ctx, jobs.Job{ID: "gc-1", Type: jobs.TypeJournalGC, MaxAttempts: 3, Priority: 0, ScheduledAt: now.Add(-1 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	limits := map[jobs.Type]int{jobs.TypeLinkCheck: 1}
