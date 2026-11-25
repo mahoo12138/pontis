@@ -47,7 +47,7 @@ func applyOp(t *testing.T, svc *changeset.Service, store *Store, space canonical
 	committed = true
 
 	var id string
-	if err := store.db.QueryRow(`SELECT id FROM changesets WHERE space_id = ? ORDER BY last_revision DESC LIMIT 1`,
+	if err := store.db.QueryRow(`SELECT id FROM changesets WHERE space_id = ? ORDER BY epoch DESC, last_revision DESC LIMIT 1`,
 		string(space)).Scan(&id); err != nil {
 		t.Fatalf("load changeset id: %v", err)
 	}
@@ -501,5 +501,100 @@ func TestChangeSetJournalLinkAndSummary(t *testing.T) {
 	}
 	if row.Kind != changeset.KindNodeCreate || row.FirstRevision != row.LastRevision {
 		t.Fatalf("changeset = %+v", row)
+	}
+}
+
+// R40: undoing a CREATE ChangeSet must enter REVIEW_REQUIRED if a created
+// bookmark was later renamed or moved by the user.
+func TestUndoCreateBookmarkRequiresReviewAfterEditOrMove(t *testing.T) {
+	svc, store, space := setupUndoTest(t)
+	main := canonical.NewRootParent("main")
+
+	applyOp(t, svc, store, space, canonical.CreateNode{
+		SpaceID: space, NodeID: "fav", Type: canonical.NodeTypeFolder, Title: "常用", Parent: main,
+	})
+	csCreate := applyOp(t, svc, store, space, canonical.CreateNode{
+		SpaceID: space, NodeID: "bm", Type: canonical.NodeTypeBookmark,
+		Title: "Go", URL: "https://go.dev", Parent: main,
+	})
+	// User organizes the newly created bookmark into "常用" and renames it.
+	applyOp(t, svc, store, space, canonical.MoveNode{
+		SpaceID: space, NodeID: "bm", Parent: canonical.NewNodeParent("fav"),
+	})
+	applyOp(t, svc, store, space, canonical.UpdateNodeTitle{
+		SpaceID: space, NodeID: "bm", Title: "Go Official",
+	})
+
+	res := undo(t, svc, space, csCreate)
+	if res.Status != changeset.PlanReviewRequired {
+		t.Fatalf("undo create after edit/move = %s, want review_required", res.Status)
+	}
+	if !nodeExists(t, store, space, "bm") {
+		t.Fatal("review deleted user-organized bookmark")
+	}
+}
+
+// Undo P3: MOVE cycle enters REVIEW_REQUIRED instead of 500; DELETE restore
+// puts the node back at its original position; no-op CREATE undo still marks
+// the changeset undone; R44 ListChangeSets orders current epoch first.
+func TestUndoEdgeCasesAndEpochOrdering(t *testing.T) {
+	svc, store, space := setupUndoTest(t)
+	ctx := context.Background()
+	main := canonical.NewRootParent("main")
+
+	// 1. DELETE restore preserves original sibling position (0 -> between nothing and B).
+	applyOp(t, svc, store, space, canonical.CreateNode{SpaceID: space, NodeID: "a", Type: canonical.NodeTypeBookmark, Title: "A", URL: "https://a.dev", Parent: main})
+	applyOp(t, svc, store, space, canonical.CreateNode{SpaceID: space, NodeID: "b", Type: canonical.NodeTypeBookmark, Title: "B", URL: "https://b.dev", Parent: main})
+	applyOp(t, svc, store, space, canonical.CreateNode{SpaceID: space, NodeID: "c", Type: canonical.NodeTypeBookmark, Title: "C", URL: "https://c.dev", Parent: main})
+	csDelB := applyOp(t, svc, store, space, canonical.DeleteNode{SpaceID: space, NodeID: "b"})
+	if res := undo(t, svc, space, csDelB); res.Status != changeset.PlanClean {
+		t.Fatalf("undo delete B = %s", res.Status)
+	}
+	if got := loadNode(t, store, space, "b").Position; got != 1 {
+		t.Fatalf("restored B position = %d, want 1", got)
+	}
+
+	// 2. MOVE cycle: B starts under A, move B to root, then move A under B;
+	// undoing "B to root" would place B under A (its descendant) -> review_required.
+	applyOp(t, svc, store, space, canonical.CreateNode{SpaceID: space, NodeID: "fa", Type: canonical.NodeTypeFolder, Title: "FA", Parent: main})
+	applyOp(t, svc, store, space, canonical.CreateNode{SpaceID: space, NodeID: "fb", Type: canonical.NodeTypeFolder, Title: "FB", Parent: canonical.NewNodeParent("fa")})
+	csMoveB := applyOp(t, svc, store, space, canonical.MoveNode{SpaceID: space, NodeID: "fb", Parent: main})
+	applyOp(t, svc, store, space, canonical.MoveNode{SpaceID: space, NodeID: "fa", Parent: canonical.NewNodeParent("fb")})
+	resCycle := undo(t, svc, space, csMoveB)
+	if resCycle.Status != changeset.PlanReviewRequired {
+		t.Fatalf("cyclic move undo = %s, want review_required", resCycle.Status)
+	}
+
+	// 3. CREATE undo when created node was already deleted marks changeset undone.
+	csGone := applyOp(t, svc, store, space, canonical.CreateNode{
+		SpaceID: space, NodeID: "temp", Type: canonical.NodeTypeBookmark, Title: "Temp", URL: "https://temp.dev", Parent: main,
+	})
+	applyOp(t, svc, store, space, canonical.DeleteNode{SpaceID: space, NodeID: "temp"})
+	if res := undo(t, svc, space, csGone); res.Status != changeset.PlanClean {
+		t.Fatalf("already-absent create undo = %s, want clean", res.Status)
+	}
+	if _, err := svc.Undo(ctx, space, csGone, "u1"); !errors.Is(err, changeset.ErrAlreadyUndone) {
+		t.Fatalf("second undo after already-absent create = %v, want ErrAlreadyUndone", err)
+	}
+
+	// 4. R44: after an epoch bump (backup restore), new epoch rev=1 ranks BEFORE
+	// old epoch rev=5000 in ListChangeSets.
+	if _, err := store.db.Exec(`UPDATE sync_spaces SET epoch = 2, current_revision = 0 WHERE id = ?`, string(space)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`
+		INSERT INTO changesets (id, space_id, epoch, kind, summary, origin_type, first_revision, last_revision, created_at)
+		VALUES ('old-huge', ?, 1, 'node_create', 'old high rev', 'user', 5000, 5000, '2026-01-01T00:00:00Z')`, string(space)); err != nil {
+		t.Fatal(err)
+	}
+	newCS := applyOp(t, svc, store, space, canonical.CreateNode{
+		SpaceID: space, NodeID: "after-restore", Type: canonical.NodeTypeBookmark, Title: "Fresh", URL: "https://fresh.dev", Parent: main,
+	})
+	list, err := NewChangeSetStore(store.db).ListChangeSets(ctx, space, 10)
+	if err != nil {
+		t.Fatalf("ListChangeSets: %v", err)
+	}
+	if len(list) == 0 || list[0].ID != newCS {
+		t.Fatalf("ListChangeSets[0] = %+v, want current-epoch %s first", list[0], newCS)
 	}
 }

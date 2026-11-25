@@ -7,6 +7,8 @@ package transfer
 import (
 	"encoding/json"
 	"errors"
+	"html"
+	"sort"
 	"strings"
 )
 
@@ -38,9 +40,11 @@ var (
 
 // ImportNode is one parsed node of an import tree.
 type ImportNode struct {
-	Title    string
-	URL      string
-	Children []ImportNode
+	Title     string
+	URL       string
+	RootKey   string
+	RootSlots []portableSlot
+	Children  []ImportNode
 }
 
 // portableFile is the native JSON wire format. Node ids inside the file
@@ -101,7 +105,11 @@ func parseNetscapeHTML(content string) (*ImportNode, []string, error) {
 	warnings := []string{}
 	root := &htmlNode{title: "imported"}
 	stack := []*htmlNode{root}
-	depth := 1
+	// dlPushed tracks whether each open <DL> pushed a pending <H3> folder onto
+	// stack, so empty folders without a following <DL> never swallow siblings
+	// and unmatched <DL> tags cannot desync the stack.
+	dlPushed := []bool{}
+	var pendingFolder *htmlNode
 	nodes := 0
 
 	for _, line := range strings.Split(content, "\n") {
@@ -109,43 +117,54 @@ func parseNetscapeHTML(content string) (*ImportNode, []string, error) {
 		upper := strings.ToUpper(line)
 		switch {
 		case strings.Contains(upper, "<DL"):
-			depth++
-			if depth > MaxDepth {
+			pushed := pendingFolder != nil
+			if pushed {
+				stack = append(stack, pendingFolder)
+				pendingFolder = nil
+			}
+			dlPushed = append(dlPushed, pushed)
+			if len(stack) > MaxDepth || len(dlPushed) > MaxDepth {
 				return nil, nil, ErrTooDeep
 			}
 		case strings.Contains(upper, "</DL"):
-			if len(stack) > 1 {
-				stack = stack[:len(stack)-1]
+			pendingFolder = nil
+			if len(dlPushed) > 0 {
+				pushed := dlPushed[len(dlPushed)-1]
+				dlPushed = dlPushed[:len(dlPushed)-1]
+				if pushed && len(stack) > 1 {
+					stack = stack[:len(stack)-1]
+				}
 			}
-			depth--
 		case strings.Contains(upper, "<DT"):
+			// Any previous <H3> without an immediate <DL> is an empty folder;
+			// it was already attached to its parent and must not become the
+			// parent of subsequent siblings.
+			pendingFolder = nil
 			parent := stack[len(stack)-1]
-			if title, ok := extractTag(line, "h3"); ok {
+			if rawTitle, ok := extractTag(line, "h3"); ok {
 				if nodes >= MaxNodes {
 					return nil, nil, ErrTooManyNodes
 				}
 				nodes++
-				if len(title) > MaxTitleLen {
-					title = title[:MaxTitleLen]
-				}
+				title := truncateRunes(html.UnescapeString(rawTitle), MaxTitleLen)
 				folder := &htmlNode{title: title}
 				parent.children = append(parent.children, folder)
-				stack = append(stack, folder)
-			} else if href, ok := extractHRef(line); ok {
+				pendingFolder = folder
+			} else if rawHref, ok := extractHRef(line); ok {
 				if nodes >= MaxNodes {
 					return nil, nil, ErrTooManyNodes
 				}
 				nodes++
-				title, _ := extractTag(line, "a")
+				href := html.UnescapeString(rawHref)
+				if len(href) > MaxURLLen {
+					return nil, nil, ErrInvalidPayload
+				}
+				rawTitle, _ := extractTag(line, "a")
+				title := html.UnescapeString(rawTitle)
 				if title == "" {
 					title = href
 				}
-				if len(title) > MaxTitleLen {
-					title = title[:MaxTitleLen]
-				}
-				if len(href) > MaxURLLen {
-					href = href[:MaxURLLen]
-				}
+				title = truncateRunes(title, MaxTitleLen)
 				if strings.Contains(upper, "ICON=") || strings.Contains(upper, "ADD_DATE=") {
 					if len(warnings) < 5 && !containsString(warnings, "部分条目包含将被忽略的属性(ICON / ADD_DATE)。") {
 						warnings = append(warnings, "部分条目包含将被忽略的属性(ICON / ADD_DATE)。")
@@ -159,6 +178,14 @@ func parseNetscapeHTML(content string) (*ImportNode, []string, error) {
 		return nil, nil, ErrInvalidPayload
 	}
 	return convertHTML(root), warnings, nil
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
 }
 
 func containsString(list []string, s string) bool {
@@ -178,22 +205,59 @@ func convertHTML(n *htmlNode) *ImportNode {
 	return out
 }
 
+// findTagEnd returns the index of the closing '>' of an HTML start tag,
+// ignoring '>' inside single- or double-quoted attribute values.
+func findTagEnd(s string) int {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			quote = c
+			continue
+		}
+		if c == '>' {
+			return i
+		}
+	}
+	return -1
+}
+
 // extractTag pulls the inner text of <tag ...>inner</tag> (case-insensitive).
 func extractTag(line, tag string) (string, bool) {
 	open := "<" + tag
 	lower := strings.ToLower(line)
-	i := strings.Index(lower, open)
-	if i < 0 {
+	start := 0
+	idx := -1
+	for {
+		i := strings.Index(lower[start:], open)
+		if i < 0 {
+			break
+		}
+		pos := start + i
+		after := pos + len(open)
+		if after >= len(lower) || lower[after] == '>' || lower[after] == ' ' || lower[after] == '\t' || lower[after] == '/' {
+			idx = pos
+			break
+		}
+		start = after
+	}
+	if idx < 0 {
 		return "", false
 	}
-	rest := line[i:]
-	gt := strings.Index(rest, ">")
+	rest := line[idx:]
+	gt := findTagEnd(rest)
 	if gt < 0 {
 		return "", false
 	}
 	rest = rest[gt+1:]
-	close := "</" + tag + ">"
-	j := strings.Index(strings.ToLower(rest), close)
+	closeTag := "</" + tag + ">"
+	j := strings.Index(strings.ToLower(rest), closeTag)
 	if j < 0 {
 		// Tolerate unclosed tags by taking the rest of the line.
 		return strings.TrimSpace(rest), rest != ""
@@ -240,12 +304,13 @@ func parsePortableJSON(content string) (*ImportNode, []string, error) {
 	}
 
 	byID := make(map[string]*ImportNode, len(file.Nodes))
+	posOf := make(map[string]int64, len(file.Nodes))
 	for _, n := range file.Nodes {
-		title := n.Title
-		if len(title) > MaxTitleLen {
-			title = title[:MaxTitleLen]
-		}
+		title := truncateRunes(n.Title, MaxTitleLen)
 		node := &ImportNode{Title: title}
+		if n.RootKey != nil {
+			node.RootKey = *n.RootKey
+		}
 		if n.URL != nil {
 			if len(*n.URL) > MaxURLLen {
 				return nil, nil, ErrInvalidPayload
@@ -256,6 +321,7 @@ func parsePortableJSON(content string) (*ImportNode, []string, error) {
 			return nil, nil, ErrInvalidPayload
 		}
 		byID[n.ID] = node
+		posOf[n.ID] = n.Position
 	}
 	// Wire children by parent id, then verify the graph is a forest:
 	// every node reachable from exactly one root, no cycles, no orphans.
@@ -270,6 +336,12 @@ func parsePortableJSON(content string) (*ImportNode, []string, error) {
 		} else {
 			rootIDs = append(rootIDs, n.ID)
 		}
+	}
+	sort.SliceStable(rootIDs, func(i, j int) bool { return posOf[rootIDs[i]] < posOf[rootIDs[j]] })
+	for k := range childrenOf {
+		list := childrenOf[k]
+		sort.SliceStable(list, func(i, j int) bool { return posOf[list[i]] < posOf[list[j]] })
+		childrenOf[k] = list
 	}
 	visited := map[string]bool{}
 	var visit func(id string, depth int) bool
@@ -300,14 +372,14 @@ func parsePortableJSON(content string) (*ImportNode, []string, error) {
 	var build func(id string, depth int) *ImportNode
 	build = func(id string, depth int) *ImportNode {
 		n := byID[id]
-		out := &ImportNode{Title: n.Title, URL: n.URL}
+		out := &ImportNode{Title: n.Title, URL: n.URL, RootKey: n.RootKey}
 		for _, c := range childrenOf[id] {
 			out.Children = append(out.Children, *build(c, depth+1))
 		}
 		return out
 	}
 
-	root := &ImportNode{Title: "imported"}
+	root := &ImportNode{Title: "imported", RootSlots: file.RootSlots}
 	for _, r := range rootIDs {
 		root.Children = append(root.Children, *build(r, 1))
 	}

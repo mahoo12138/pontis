@@ -34,6 +34,7 @@ export interface User {
   username: string;
   display_name: string;
   email: string;
+  has_password: boolean;
   role: 'admin' | 'user';
   status: 'active' | 'disabled';
   locale: string;
@@ -232,9 +233,9 @@ export interface CreateBindingRequest {
 // ─── Sync ───────────────────────────────────────────────────
 
 /**
- * The /sync wire contract lives in @pontis/protocol, which the extension
- * validates with real parsers. Nothing here repeated it — this section keeps
- * only the parent reference the write endpoints share.
+ * The /sync wire contract and runtime validators live in the extension's
+ * core/protocol module (with reference fixtures under packages/protocol).
+ * This section keeps only the parent reference shared by the REST write APIs.
  */
 export interface ParentRef {
   type: 'node' | 'root';
@@ -462,6 +463,9 @@ export interface UpdatePublicationRequest {
   tags?: string[];
   visibility?: PublicationVisibility;
   snapshot?: boolean;
+  space_id?: string;
+  root_node_id?: string;
+  allow_empty?: boolean;
 }
 
 export interface ApplyPublicationRequest {
@@ -473,6 +477,7 @@ export interface ApplyPublicationRequest {
 export interface ApplyPublicationResponse {
   created: number;
   updated: number;
+  deleted: number;
   kept: number;
 }
 
@@ -532,6 +537,8 @@ export interface ImportPlan {
 export interface ImportPreviewRequest {
   format: ImportFormat;
   content: string;
+  strategy?: ImportStrategy;
+  parent?: ParentRef;
 }
 
 export interface ImportApplyRequest {

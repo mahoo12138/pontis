@@ -179,12 +179,17 @@ func (s *PublicationStore) ListByOwner(ctx context.Context, userID string) ([]pl
 	return out, rows.Err()
 }
 
-// UpdateSnapshot rewrites the tree and appends the version row it belongs to.
-func (s *PublicationStore) UpdateSnapshot(ctx context.Context, id string, tree plaza.Node,
+// UpdateSnapshot rewrites the source reference and tree and appends the
+// version row it belongs to.
+func (s *PublicationStore) UpdateSnapshot(ctx context.Context, id string, spaceID, rootNodeID string, tree plaza.Node,
 	bookmarks, folders int64, version int, note string, at time.Time) error {
 	treeJSON, err := json.Marshal(tree)
 	if err != nil {
 		return err
+	}
+	var rootNode any
+	if rootNodeID != "" {
+		rootNode = rootNodeID
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -193,8 +198,8 @@ func (s *PublicationStore) UpdateSnapshot(ctx context.Context, id string, tree p
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE publications SET tree = ?, bookmark_count = ?, folder_count = ?, version = ?, updated_at = ?
-		WHERE id = ?`, string(treeJSON), bookmarks, folders, version, formatTime(at), id); err != nil {
+		UPDATE publications SET space_id = ?, root_node_id = ?, tree = ?, bookmark_count = ?, folder_count = ?, version = ?, updated_at = ?
+		WHERE id = ?`, spaceID, rootNode, string(treeJSON), bookmarks, folders, version, formatTime(at), id); err != nil {
 		return err
 	}
 	if err := insertVersion(ctx, tx, id, plaza.Version{

@@ -172,6 +172,7 @@ export const checkUser: Checker<User> = record<User>({
   username: str,
   display_name: str,
   email: str,
+  has_password: bool,
   role: oneOf('admin', 'user'),
   status: oneOf('active', 'disabled'),
   locale: str,
@@ -539,7 +540,7 @@ export const checkPlazaFacets: Checker<PlazaFacetsResponse> = record<PlazaFacets
 });
 
 export const checkApplyPublication: Checker<ApplyPublicationResponse> =
-  record<ApplyPublicationResponse>({ created: num, updated: num, kept: num });
+  record<ApplyPublicationResponse>({ created: num, updated: num, deleted: num, kept: num });
 
 const publicationVersionShape = {
   version: num,

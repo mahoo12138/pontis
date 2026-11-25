@@ -184,7 +184,10 @@ func (s *ChangeSetStore) GetChangeSet(ctx context.Context, id string) (changeset
 func (s *ChangeSetStore) ListChangeSets(ctx context.Context, space canonical.SpaceID, limit int) ([]changeset.ChangeSet, error) {
 	rows, err := s.db.QueryContext(ctx, changeSetColumns+`
 		WHERE space_id = ?
-		ORDER BY last_revision DESC, created_at DESC
+		ORDER BY (epoch = COALESCE((SELECT epoch FROM sync_spaces WHERE id = changesets.space_id), 0)) DESC,
+		         epoch DESC,
+		         last_revision DESC,
+		         created_at DESC
 		LIMIT ?`, string(space), limit)
 	if err != nil {
 		return nil, err

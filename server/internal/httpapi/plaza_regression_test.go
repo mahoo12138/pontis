@@ -651,3 +651,123 @@ func containsString(raw any, want string) bool {
 	}
 	return false
 }
+
+// R42: subtree publication Replace deletes ONLY the publication's own folder
+// under target parent, preserves unrelated siblings, and reports deleted counts
+// in both preview and apply.
+// R45: UpdateSnapshot refuses accidental empty overwrite and allows re-targeting
+// space_id / root_node_id after the original source is moved or replaced.
+func TestPlazaSubtreeReplacePreservesSiblingsAndRetargetSnapshot(t *testing.T) {
+	f := bootstrapLibraryFlow(t)
+	alice := plazaAuth(f.sessionToken)
+	bob := plazaAuth(f.bobToken)
+
+	bobSpace := plazaCreateSpace(t, f, f.bobToken, "Bob R42")
+	srcFolder := plazaCreateNode(t, f, f.bobToken, bobSpace, map[string]any{
+		"type": "folder", "title": "Go 资源", "parent": plazaMain,
+	})
+	plazaCreateNode(t, f, f.bobToken, bobSpace, map[string]any{
+		"type": "bookmark", "title": "Go Docs", "url": "https://go.dev/doc",
+		"parent": plazaNodeParent(srcFolder),
+	})
+
+	code, pub := doJSON(t, "POST", f.ts.URL+"/api/v1/publications", bob, map[string]any{
+		"space_id": bobSpace, "root_node_id": srcFolder, "title": "Go 资源",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("publish = %d %v", code, pub)
+	}
+	pubID := pub["id"].(string)
+
+	// Alice already has a "开发" folder with unrelated personal bookmarks and an
+	// older copy of "Go 资源".
+	devFolder := plazaCreateNode(t, f, f.sessionToken, f.spaceID, map[string]any{
+		"type": "folder", "title": "开发", "parent": plazaMain,
+	})
+	unrelated := plazaCreateNode(t, f, f.sessionToken, f.spaceID, map[string]any{
+		"type": "bookmark", "title": "My Private Note", "url": "https://private.local/note",
+		"parent": plazaNodeParent(devFolder),
+	})
+
+	// First merge apply puts "Go 资源" (2 nodes) inside "开发".
+	code, res := doJSON(t, "POST", f.ts.URL+"/api/v1/publications/"+pubID+"/apply", alice, map[string]any{
+		"space_id": f.spaceID, "parent": plazaNodeParent(devFolder), "strategy": "merge",
+	})
+	if code != http.StatusOK || res["created"].(float64) != 2 {
+		t.Fatalf("initial merge = %d %v", code, res)
+	}
+
+	// Preview Replace: must report deleted=2 (only "Go 资源" + its child), NOT 3!
+	code, prev := doJSON(t, "POST", f.ts.URL+"/api/v1/publications/"+pubID+"/apply/preview", alice, map[string]any{
+		"space_id": f.spaceID, "parent": plazaNodeParent(devFolder), "strategy": "replace",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("replace preview = %d %v", code, prev)
+	}
+	if prev["deleted"].(float64) != 2 || prev["created"].(float64) != 2 {
+		t.Fatalf("replace preview = %v, want deleted=2 created=2", prev)
+	}
+
+	// Apply Replace: deletes only the 2 publication nodes, keeps Alice's unrelated bookmark!
+	code, res = doJSON(t, "POST", f.ts.URL+"/api/v1/publications/"+pubID+"/apply", alice, map[string]any{
+		"space_id": f.spaceID, "parent": plazaNodeParent(devFolder), "strategy": "replace",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("replace apply = %d %v", code, res)
+	}
+	if res["deleted"].(float64) != 2 || res["created"].(float64) != 2 {
+		t.Fatalf("replace apply = %v, want deleted=2 created=2", res)
+	}
+	stillHasUnrelated := false
+	for _, n := range plazaNodes(t, f, f.sessionToken, f.spaceID) {
+		if n["id"] == unrelated {
+			stillHasUnrelated = true
+		}
+	}
+	if !stillHasUnrelated {
+		t.Fatal("subtree publication replace wiped unrelated sibling bookmark")
+	}
+
+	// R45: Bob moves/replaces his source into a new space and re-targets snapshot update.
+	bobSpace2 := plazaCreateSpace(t, f, f.bobToken, "Bob R45 New")
+	newFolder := plazaCreateNode(t, f, f.bobToken, bobSpace2, map[string]any{
+		"type": "folder", "title": "Go 资源 v2", "parent": plazaMain,
+	})
+	plazaCreateNode(t, f, f.bobToken, bobSpace2, map[string]any{
+		"type": "bookmark", "title": "Go Blog", "url": "https://go.dev/blog",
+		"parent": plazaNodeParent(newFolder),
+	})
+	plazaCreateNode(t, f, f.bobToken, bobSpace2, map[string]any{
+		"type": "bookmark", "title": "Go Tour", "url": "https://go.dev/tour",
+		"parent": plazaNodeParent(newFolder),
+	})
+
+	// Delete the original source folder so plain snapshot update would 404.
+	if c := doEmpty(t, "DELETE", f.ts.URL+"/api/v1/spaces/"+bobSpace+"/nodes/"+srcFolder, bob); c >= 300 {
+		t.Fatalf("delete old source = %d", c)
+	}
+	// Re-targeting to an empty space (whole-space) refuses silent empty overwrite.
+	code, errBody := doJSON(t, "PATCH", f.ts.URL+"/api/v1/publications/"+pubID, bob, map[string]any{
+		"snapshot": true, "space_id": bobSpace, "root_node_id": "",
+	})
+	if code != http.StatusBadRequest || errCode(t, errBody) != "EMPTY_SOURCE" {
+		t.Fatalf("empty overwrite = %d %v, want 400 EMPTY_SOURCE", code, errBody)
+	}
+	// Re-targeting to Alice's space is forbidden.
+	code, _ = doJSON(t, "PATCH", f.ts.URL+"/api/v1/publications/"+pubID, bob, map[string]any{
+		"snapshot": true, "space_id": f.spaceID, "root_node_id": "",
+	})
+	if code != http.StatusForbidden {
+		t.Fatalf("retarget foreign space = %d, want 403", code)
+	}
+	// Re-targeting to Bob's new folder in bobSpace2 succeeds and bumps version to 2.
+	code, updated := doJSON(t, "PATCH", f.ts.URL+"/api/v1/publications/"+pubID, bob, map[string]any{
+		"snapshot": true, "space_id": bobSpace2, "root_node_id": newFolder,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("retarget snapshot = %d %v", code, updated)
+	}
+	if updated["version"].(float64) != 2 || updated["bookmark_count"].(float64) != 2 {
+		t.Fatalf("retargeted publication = %v, want v2 with 2 bookmarks", updated)
+	}
+}

@@ -86,8 +86,48 @@ func TestDeleteSpaceReportsEveryBlocker(t *testing.T) {
 		t.Errorf("blockers = %v, but the space holds no node", notEmpty.Blockers)
 	}
 
-	// The gate is not a wall: a space nothing references still goes.
+	// The gate is not a wall: a space nothing references still goes, and any
+	// residual history/reconciliation/transfer metadata for it is purged (R36).
+	for _, stmt := range []string{
+		`INSERT INTO journal (space_id, epoch, revision, change_type, node_id, payload, origin_type, created_at)
+		 VALUES ('space-empty', 1, 1, 'create', 'n1', '{}', 'user', '` + now + `')`,
+		`INSERT INTO tombstones (space_id, node_id, deleted_epoch, deleted_revision, deleted_at)
+		 VALUES ('space-empty', 'n1', 1, 1, '` + now + `')`,
+		`INSERT INTO changesets (id, space_id, epoch, kind, summary, origin_type, first_revision, last_revision, created_at)
+		 VALUES ('cs-empty', 'space-empty', 1, 'node_create', 's', 'user', 1, 1, '` + now + `')`,
+		`INSERT INTO reconciliations (id, binding_id, space_id, type, state, phase, created_at, updated_at)
+		 VALUES ('rec-empty', 'b-gone', 'space-empty', 'initial', 'completed', 'done', '` + now + `', '` + now + `')`,
+		`INSERT INTO sync_artifacts (id, binding_id, kind, storage_key, created_at)
+		 VALUES ('art-empty', 'b-gone', 'client_snapshot', 'k', '` + now + `')`,
+		`INSERT INTO server_snapshots (id, binding_id, space_id, epoch, revision, node_count, checksum, created_at)
+		 VALUES ('snap-empty', 'b-gone', 'space-empty', 1, 1, 0, 'c', '` + now + `')`,
+		`INSERT INTO cross_space_transfers (id, owner_user_id, source_space_id, target_space_id, state, request_hash, created_at)
+		 VALUES ('xfer-empty', '` + string(owner) + `', 'space-empty', 'space-held', 'completed', 'h', '` + now + `')`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("seed residual row (%s): %v", stmt[:40], err)
+		}
+	}
 	if _, err := stores.DeleteSpace(ctx, owner, "space-empty"); err != nil {
 		t.Fatalf("delete of an empty space: %v", err)
+	}
+	for _, check := range []struct {
+		name, query string
+	}{
+		{"journal", `SELECT COUNT(*) FROM journal WHERE space_id = 'space-empty'`},
+		{"tombstones", `SELECT COUNT(*) FROM tombstones WHERE space_id = 'space-empty'`},
+		{"changesets", `SELECT COUNT(*) FROM changesets WHERE space_id = 'space-empty'`},
+		{"reconciliations", `SELECT COUNT(*) FROM reconciliations WHERE space_id = 'space-empty'`},
+		{"sync_artifacts", `SELECT COUNT(*) FROM sync_artifacts WHERE id = 'art-empty'`},
+		{"server_snapshots", `SELECT COUNT(*) FROM server_snapshots WHERE space_id = 'space-empty'`},
+		{"cross_space_transfers", `SELECT COUNT(*) FROM cross_space_transfers WHERE source_space_id = 'space-empty'`},
+	} {
+		var count int
+		if err := db.QueryRowContext(ctx, check.query).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", check.name, err)
+		}
+		if count != 0 {
+			t.Errorf("DeleteSpace left %d residual rows in %s", count, check.name)
+		}
 	}
 }

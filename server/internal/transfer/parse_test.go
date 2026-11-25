@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 const netscapeSample = `<!DOCTYPE NETSCAPE-Bookmark-file-1>
@@ -199,5 +200,67 @@ func TestParseImportContentTooLarge(t *testing.T) {
 	huge := strings.Repeat("x", MaxContentLen+1)
 	if _, _, err := ParseImport(FormatNativeJSON, huge); !errors.Is(err, ErrContentTooLarge) {
 		t.Errorf("err = %v, want ErrContentTooLarge", err)
+	}
+}
+
+func TestParseNetscapeHTMLUnescapesEntitiesAndHandlesEmptyFolders(t *testing.T) {
+	doc := `<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<DL><p>
+    <DT><H3>EmptyNoDL</H3>
+    <DT><H3>EmptyWithDL</H3>
+    <DL><p>
+    </DL><p>
+    <DT><H3>Q&amp;A &quot;Docs&quot;</H3>
+    <DL><p>
+        <DT><A HREF="https://a.com/?x=1&amp;y=2">A &amp; B &lt;tag&gt;</A>
+    </DL><p>
+    <DT><H3></H3>
+    <DT><A HREF="https://after.example">After</A>
+</DL><p>
+`
+	root, _, err := ParseImport(FormatNetscapeHTML, doc)
+	if err != nil {
+		t.Fatalf("ParseImport error: %v", err)
+	}
+	if len(root.Children) != 5 {
+		t.Fatalf("root children = %d (%+v), want 5 siblings", len(root.Children), root.Children)
+	}
+	if root.Children[0].Title != "EmptyNoDL" || len(root.Children[0].Children) != 0 {
+		t.Fatalf("empty folder without DL swallowed siblings: %+v", root.Children[0])
+	}
+	if root.Children[1].Title != "EmptyWithDL" || len(root.Children[1].Children) != 0 {
+		t.Fatalf("empty folder with DL wrong: %+v", root.Children[1])
+	}
+	qa := root.Children[2]
+	if qa.Title != `Q&A "Docs"` || len(qa.Children) != 1 {
+		t.Fatalf("unescaped folder wrong: %+v", qa)
+	}
+	if qa.Children[0].URL != "https://a.com/?x=1&y=2" || qa.Children[0].Title != "A & B <tag>" {
+		t.Fatalf("unescaped bookmark wrong: %+v", qa.Children[0])
+	}
+	if root.Children[3].Title != "" || root.Children[3].URL != "" {
+		t.Fatalf("empty folder title wrong: %+v", root.Children[3])
+	}
+	if root.Children[4].Title != "After" {
+		t.Fatalf("trailing sibling wrong: %+v", root.Children[4])
+	}
+}
+
+func TestParseNetscapeHTMLRuneSafeTitleAndRejectsOverlongURL(t *testing.T) {
+	longCJK := strings.Repeat("书", MaxTitleLen+20)
+	doc := "<DL><p>\n  <DT><A HREF=\"https://cjk.example\">" + longCJK + "</A>\n</DL><p>\n"
+	root, _, err := ParseImport(FormatNetscapeHTML, doc)
+	if err != nil {
+		t.Fatalf("ParseImport CJK error: %v", err)
+	}
+	got := root.Children[0].Title
+	if !utf8.ValidString(got) || len([]rune(got)) != MaxTitleLen {
+		t.Fatalf("title invalid UTF-8 or rune count=%d, want %d", len([]rune(got)), MaxTitleLen)
+	}
+
+	overlongURL := "https://example.com/" + strings.Repeat("a", MaxURLLen)
+	badDoc := "<DL><p>\n  <DT><A HREF=\"" + overlongURL + "\">Bad</A>\n</DL><p>\n"
+	if _, _, err := ParseImport(FormatNetscapeHTML, badDoc); !errors.Is(err, ErrInvalidPayload) {
+		t.Fatalf("overlong URL err = %v, want ErrInvalidPayload", err)
 	}
 }

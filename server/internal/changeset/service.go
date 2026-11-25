@@ -332,7 +332,7 @@ func (s *Service) Undo(ctx context.Context, space canonical.SpaceID, changeSetID
 	if !found || cs.SpaceID != space {
 		return UndoResult{}, ErrChangeSetNotFound
 	}
-	if cs.UndoneByChangeSet != "" {
+	if cs.UndoneByChangeSet != "" || cs.UndoneAt != "" {
 		return UndoResult{Status: PlanNotUndoable, Summary: cs.Summary}, ErrAlreadyUndone
 	}
 	if cs.UndoDataJSON == "" {
@@ -436,10 +436,19 @@ func (s *Service) reviewReasons(ctx context.Context, tx canonical.Tx, space cano
 			return nil, err
 		} else if !ok {
 			add("「%s」的原位置已不存在", m.Title)
+		} else if m.OldParent.Type == "node" {
+			cycle, err := tx.IsAncestorOrSelf(ctx, space, m.NodeID, canonical.NodeID(m.OldParent.ID))
+			if err != nil {
+				return nil, err
+			}
+			if cycle {
+				add("「%s」恢复到原位置会产生循环引用，撤销需要人工确认", m.Title)
+			}
 		}
 	}
 
-	// CREATE: folders must not contain data added after this ChangeSet.
+	// CREATE: nodes modified or moved since creation and folders containing
+	// foreign data added after this ChangeSet must be protected (doc 15 §6).
 	created := make(map[canonical.NodeID]bool, len(ud.Creates))
 	for _, c := range ud.Creates {
 		created[c.NodeID] = true
@@ -451,6 +460,10 @@ func (s *Service) reviewReasons(ctx context.Context, tx canonical.Tx, space cano
 		}
 		if err != nil {
 			return nil, err
+		}
+		if node.TitleRevision > cs.LastRevision || node.URLRevision > cs.LastRevision || node.StructureRevision > cs.LastRevision {
+			add("「%s」在创建后已被修改或移动，撤销需要人工确认", node.Title)
+			continue
 		}
 		if node.Type != canonical.NodeTypeFolder {
 			continue
@@ -478,10 +491,11 @@ func (s *Service) reviewReasons(ctx context.Context, tx canonical.Tx, space cano
 	return reasons, nil
 }
 
-// applyInverse executes the inverse commands as one new ChangeSet and
-// returns its id (empty when there was nothing to invert).
+// applyInverse executes the inverse commands as one new undoable ChangeSet
+// (doc 15 §8: undo itself is undoable) and returns its id (empty when there
+// was nothing left to invert).
 func (s *Service) applyInverse(ctx context.Context, tx canonical.Tx, space canonical.SpaceID, cs ChangeSet, ud *UndoData, actor canonical.UserID) (string, error) {
-	b := s.BeginBatch(space, KindUndo, canonical.Origin{Type: canonical.OriginUser, UserID: actor}, false)
+	b := s.BeginBatch(space, KindUndo, canonical.Origin{Type: canonical.OriginUser, UserID: actor}, true)
 	b.inverseOf = cs.ID
 
 	// 1. Restore deleted subtrees, last deleted first: a parent deleted
@@ -559,6 +573,7 @@ func createdSetHas(creates []CreateUndo, id canonical.NodeID) bool {
 // recovery root instead of being lost (doc 15 §7).
 func (s *Service) restoreSnapshot(ctx context.Context, tx canonical.Tx, b *Batch, space canonical.SpaceID, snap SubtreeSnapshot) error {
 	rootParent := snap.Parent.toParent()
+	restoredToOriginal := true
 	if ok, err := parentExists(ctx, tx, space, rootParent); err != nil {
 		return err
 	} else if !ok {
@@ -566,17 +581,29 @@ func (s *Service) restoreSnapshot(ctx context.Context, tx canonical.Tx, b *Batch
 			return err
 		}
 		rootParent = canonical.NewRootParent(undoRecoveryRootKey)
+		restoredToOriginal = false
+	}
+	var rootBefore *canonical.NodeID
+	if restoredToOriginal {
+		var err error
+		rootBefore, err = anchorAt(ctx, tx, space, rootParent, snap.Position)
+		if err != nil {
+			return err
+		}
 	}
 	ids := make([]canonical.NodeID, 0, len(snap.Nodes))
 	for i, n := range snap.Nodes {
 		parent := rootParent
-		if i > 0 {
+		var before *canonical.NodeID
+		if i == 0 {
+			before = rootBefore
+		} else {
 			// In-subtree parents are restored just before their children.
 			parent = n.Parent.toParent()
 		}
 		if err := b.Apply(ctx, tx, canonical.CreateNode{
 			SpaceID: space, NodeID: n.ID, Type: n.Type,
-			Title: n.Title, URL: n.URL, Parent: parent,
+			Title: n.Title, URL: n.URL, Parent: parent, BeforeID: before,
 		}); err != nil {
 			return err
 		}

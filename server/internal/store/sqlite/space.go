@@ -150,7 +150,39 @@ func (s *SpaceStore) DeleteSpace(ctx context.Context, owner canonical.UserID, id
 		`UPDATE users SET default_space_id = NULL WHERE default_space_id = ?`, string(id)); err != nil {
 		return false, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM root_slots WHERE space_id = ?`, string(id)); err != nil {
+	// Clean up every space-scoped table that does not carry an ON DELETE
+	// CASCADE foreign key so deleted space titles/URLs never remain in SQLite
+	// (R36 / Space Delete P3).
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM sync_artifacts
+		WHERE id IN (
+			SELECT client_snapshot_artifact_id FROM reconciliations WHERE space_id = ? AND client_snapshot_artifact_id IS NOT NULL
+			UNION SELECT server_snapshot_artifact_id FROM reconciliations WHERE space_id = ? AND server_snapshot_artifact_id IS NOT NULL
+			UNION SELECT plan_artifact_id FROM reconciliations WHERE space_id = ? AND plan_artifact_id IS NOT NULL
+			UNION SELECT steps_artifact_id FROM reconciliations WHERE space_id = ? AND steps_artifact_id IS NOT NULL
+		) OR binding_id IN (SELECT binding_id FROM reconciliations WHERE space_id = ?)`,
+		string(id), string(id), string(id), string(id), string(id)); err != nil {
+		return false, err
+	}
+	for _, stmt := range []string{
+		`DELETE FROM server_snapshots WHERE space_id = ?`,
+		`DELETE FROM reconciliations WHERE space_id = ?`,
+		`DELETE FROM journal WHERE space_id = ?`,
+		`DELETE FROM tombstones WHERE space_id = ?`,
+		`DELETE FROM changesets WHERE space_id = ?`,
+		`DELETE FROM change_set_undo_data WHERE change_set_id IN (SELECT id FROM change_sets WHERE space_id = ?)`,
+		`DELETE FROM change_sets WHERE space_id = ?`,
+		`DELETE FROM link_check_runs WHERE space_id = ?`,
+		`DELETE FROM publication_imports WHERE target_space_id = ?`,
+		`DELETE FROM root_slots WHERE space_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, string(id)); err != nil {
+			return false, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM cross_space_transfers WHERE source_space_id = ? OR target_space_id = ?`,
+		string(id), string(id)); err != nil {
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sync_spaces WHERE id = ?`, string(id)); err != nil {

@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"pontis/internal/canonical"
+	"pontis/internal/device"
 	"pontis/internal/spacetransfer"
 )
 
@@ -75,6 +76,8 @@ func toTransferRequest(req transferRequest, sourceSpace string) (spacetransfer.R
 }
 
 // handleDeviceTransfer: POST /api/v1/sync/transfers (device credential).
+// Least privilege (doc 08 §4): a device may only transfer between two spaces
+// for which it holds an active binding.
 func (s *Server) handleDeviceTransfer(w http.ResponseWriter, r *http.Request) {
 	dev, _ := currentDevice(r)
 	var req transferRequest
@@ -86,6 +89,37 @@ func (s *Server) handleDeviceTransfer(w http.ResponseWriter, r *http.Request) {
 		s.writeSpaceTransferError(w, r, err)
 		return
 	}
+	srcBinding, err := s.Devices.GetBinding(r.Context(), dev.ID, parsed.SourceSpace)
+	if errors.Is(err, device.ErrBindingNotFound) {
+		s.writeError(w, r, http.StatusForbidden, "NOT_BINDING_OWNER", "device is not bound to source space")
+		return
+	}
+	if err != nil {
+		s.Logger.Error("load source binding failed", "err", err)
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
+		return
+	}
+	if srcBinding.State != device.StateActive {
+		s.writeError(w, r, http.StatusConflict, "BINDING_NOT_ACTIVE", "source space binding is not active")
+		return
+	}
+	tgtBinding, err := s.Devices.GetBinding(r.Context(), dev.ID, parsed.TargetSpace)
+	if errors.Is(err, device.ErrBindingNotFound) {
+		s.writeError(w, r, http.StatusForbidden, "NOT_BINDING_OWNER", "device is not bound to target space")
+		return
+	}
+	if err != nil {
+		s.Logger.Error("load target binding failed", "err", err)
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
+		return
+	}
+	if tgtBinding.State != device.StateActive {
+		s.writeError(w, r, http.StatusConflict, "BINDING_NOT_ACTIVE", "target space binding is not active")
+		return
+	}
+	parsed.SourceBindingID = srcBinding.ID
+	parsed.TargetBindingID = tgtBinding.ID
+
 	res, err := s.SpaceTransfer.Transfer(r.Context(), canonical.UserID(dev.OwnerUserID), parsed)
 	if err != nil {
 		s.writeSpaceTransferError(w, r, err)

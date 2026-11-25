@@ -88,7 +88,7 @@ func TestActivityUndoFlow(t *testing.T) {
 		t.Fatalf("renamed entry after undo = %v", rename)
 	}
 	undoEntry := findEntryBySummary(t, entries, "撤销：修改了「GitHub」的标题")
-	if undoEntry["action"] != "undo" || undoEntry["undoable"] != false {
+	if undoEntry["action"] != "undo" || undoEntry["undoable"] != true {
 		t.Fatalf("undo entry = %v", undoEntry)
 	}
 
@@ -96,6 +96,22 @@ func TestActivityUndoFlow(t *testing.T) {
 	code, body = doJSON(t, "POST", root+"/changesets/"+renameID+"/undo", h, nil)
 	if code != http.StatusConflict || errCode(t, body) != "ALREADY_UNDONE" {
 		t.Fatalf("double undo = %d %v", code, body)
+	}
+
+	// Undoing the undo itself (redo) restores the renamed title (R40).
+	undoID := undoEntry["id"].(string)
+	code, body = doJSON(t, "POST", root+"/changesets/"+undoID+"/undo", h, nil)
+	if code != http.StatusOK || body["status"] != "clean" {
+		t.Fatalf("redo via undo-of-undo = %d %v", code, body)
+	}
+	code, body = doJSON(t, "GET", root+"/nodes", h, nil)
+	if code != http.StatusOK {
+		t.Fatalf("list nodes after redo = %d", code)
+	}
+	for _, n := range body["nodes"].([]any) {
+		if n.(map[string]any)["id"] == bookmarkID && n.(map[string]any)["title"] != "GH" {
+			t.Fatalf("title after redo = %v, want GH", n.(map[string]any)["title"])
+		}
 	}
 }
 

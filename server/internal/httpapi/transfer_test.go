@@ -176,3 +176,145 @@ func TestTransferApplyRejectsUnknownTargetParent(t *testing.T) {
 		t.Fatalf("apply after refused targets = %d %v", code, body)
 	}
 }
+
+// Regression test for R38, R39, R41, R42: entity round-trip, empty folders,
+// root-slot export including nested subtrees, replace preview delete counts,
+// and automatic safety backup on root-level replace.
+func TestTransferEntitiesRootSlotExportEmptyFoldersAndReplacePreview(t *testing.T) {
+	f := bootstrapLibraryFlow(t)
+	h := map[string]string{"Authorization": "Bearer " + f.sessionToken}
+	root := f.ts.URL + "/api/v1/spaces/" + f.spaceID
+
+	// Create: Empty folder A, folder B ("Q&A") with nested bookmark ("a.com/?x=1&y=2"),
+	// and a trailing top-level bookmark.
+	code, body := doJSON(t, "POST", root+"/nodes", h, map[string]any{
+		"type": "folder", "title": "EmptyA", "parent": map[string]string{"type": "root", "key": "main"},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("EmptyA = %d %v", code, body)
+	}
+	code, body = doJSON(t, "POST", root+"/nodes", h, map[string]any{
+		"type": "folder", "title": `Q&A "Docs"`, "parent": map[string]string{"type": "root", "key": "main"},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("Q&A = %d %v", code, body)
+	}
+	qaID := body["id"].(string)
+	code, body = doJSON(t, "POST", root+"/nodes", h, map[string]any{
+		"type": "bookmark", "title": "Search & Filter", "url": "https://a.com/?x=1&y=2",
+		"parent": map[string]string{"type": "node", "id": qaID},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("nested bookmark = %d %v", code, body)
+	}
+	code, body = doJSON(t, "POST", root+"/nodes", h, map[string]any{
+		"type": "bookmark", "title": "Trailing", "url": "https://trailing.example",
+		"parent": map[string]string{"type": "root", "key": "main"},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("trailing = %d %v", code, body)
+	}
+
+	// R39: Export scoped to root_key="main" MUST include nested folder contents!
+	code, body = doJSON(t, "POST", root+"/export", h, map[string]string{"format": "netscape_html", "root_key": "main"})
+	if code != http.StatusOK {
+		t.Fatalf("root export html = %d %v", code, body)
+	}
+	exportedHTML := body["content"].(string)
+	if !strings.Contains(exportedHTML, "https://a.com/?x=1&amp;y=2") {
+		t.Fatalf("root-slot HTML export lost nested bookmark: %s", exportedHTML)
+	}
+
+	code, body = doJSON(t, "POST", root+"/export", h, map[string]string{"format": "native_json", "root_key": "main"})
+	if code != http.StatusOK {
+		t.Fatalf("root export json = %d %v", code, body)
+	}
+	// Go's json.Marshal escapes '&' as \u0026; verify via real JSON round-trip preview.
+	code, jsonPrev := doJSON(t, "POST", root+"/import/preview", h, map[string]any{
+		"format": "native_json", "content": body["content"].(string),
+	})
+	if code != http.StatusOK || jsonPrev["total"].(float64) != 4 {
+		t.Fatalf("root-slot JSON export lost nested bookmark: preview=%d %v", code, jsonPrev)
+	}
+
+	// R38: Previewing the exported HTML against the same space matches existing
+	// entities (keep=4, create=0) instead of corrupting & into &amp;.
+	code, body = doJSON(t, "POST", root+"/import/preview", h, map[string]any{
+		"format": "netscape_html", "content": exportedHTML,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("entity preview = %d %v", code, body)
+	}
+	counts := body["counts"].(map[string]any)
+	if counts["keep"].(float64) != 4 || counts["create"] != nil {
+		t.Fatalf("entity preview counts = %v, want keep=4 create=0", counts)
+	}
+
+	// R42: Replace preview reports deleted nodes up front.
+	code, body = doJSON(t, "POST", root+"/import/preview", h, map[string]any{
+		"format": "netscape_html", "content": exportedHTML,
+		"strategy": "replace", "parent": map[string]string{"type": "root", "key": "main"},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("replace preview = %d %v", code, body)
+	}
+	counts = body["counts"].(map[string]any)
+	if counts["delete"].(float64) != 4 || counts["create"].(float64) != 4 {
+		t.Fatalf("replace preview counts = %v, want delete=4 create=4", counts)
+	}
+	planID := body["plan_id"].(string)
+
+	// Apply replace at root: creates a safety backup and preserves empty folder + sibling hierarchy (R41).
+	code, body = doJSON(t, "POST", root+"/import/apply", h, map[string]any{
+		"plan_id": planID, "parent": map[string]string{"type": "root", "key": "main"}, "strategy": "replace",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("replace apply = %d %v", code, body)
+	}
+	if body["deleted"].(float64) != 4 || body["created"].(float64) != 4 {
+		t.Fatalf("replace apply counters = %v, want deleted=4 created=4", body)
+	}
+
+	// Verify safety backup was captured before root replace.
+	code, body = doJSON(t, "GET", root+"/backups", h, nil)
+	if code != http.StatusOK {
+		t.Fatalf("backups = %d %v", code, body)
+	}
+	backups, _ := body["backups"].([]any)
+	if len(backups) != 1 || backups[0].(map[string]any)["kind"] != "safety" {
+		t.Fatalf("expected 1 safety backup after root replace, got %v", backups)
+	}
+
+	// Verify restored tree structure: EmptyA has 0 children, Q&A "Docs" is a
+	// sibling at root with Search & Filter (exact URL with &), Trailing is at root.
+	code, body = doJSON(t, "GET", root+"/nodes", h, nil)
+	if code != http.StatusOK {
+		t.Fatalf("nodes after roundtrip = %d %v", code, body)
+	}
+	var rootEmptyA, rootQA, nestedBM, rootTrailing map[string]any
+	for _, raw := range body["nodes"].([]any) {
+		n := raw.(map[string]any)
+		switch n["title"] {
+		case "EmptyA":
+			rootEmptyA = n
+		case `Q&A "Docs"`:
+			rootQA = n
+		case "Search & Filter":
+			nestedBM = n
+		case "Trailing":
+			rootTrailing = n
+		}
+	}
+	if rootEmptyA == nil || rootEmptyA["root_key"] != "main" {
+		t.Fatalf("EmptyA wrong: %v", rootEmptyA)
+	}
+	if rootQA == nil || rootQA["root_key"] != "main" {
+		t.Fatalf("Q&A swallowed by EmptyA: %v", rootQA)
+	}
+	if nestedBM == nil || nestedBM["parent_id"] != rootQA["id"] || nestedBM["url"] != "https://a.com/?x=1&y=2" {
+		t.Fatalf("nested bookmark wrong after roundtrip: %v", nestedBM)
+	}
+	if rootTrailing == nil || rootTrailing["root_key"] != "main" {
+		t.Fatalf("Trailing swallowed by empty folder: %v", rootTrailing)
+	}
+}

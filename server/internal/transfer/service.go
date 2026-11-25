@@ -64,8 +64,16 @@ type Plan struct {
 	Warnings      []string       `json:"warnings"`
 	Entries       []Entry        `json:"entries"`
 	BoundRevision int64          `json:"bound_revision"`
+	BoundEpoch    int64          `json:"-"`
 	CreatedAt     time.Time      `json:"-"`
 	Tree          *ImportNode    `json:"-"`
+}
+
+// PreviewOptions optionally scopes a preview to a target strategy and parent
+// so replace previews can report deletions accurately (R42).
+type PreviewOptions struct {
+	Strategy string
+	Parent   *canonical.ParentRef
 }
 
 // ApplyResult reports real counters from the committed transaction.
@@ -86,6 +94,10 @@ type Service struct {
 	writer     Writer
 	changesets *changeset.Service
 
+	// SafetyBackup, when wired, captures a safety backup before a root-level
+	// replace import overwrites existing bookmarks (doc 11 §9).
+	SafetyBackup func(ctx context.Context, space canonical.SpaceID) error
+
 	mu    sync.Mutex
 	plans map[string]Plan
 }
@@ -104,13 +116,31 @@ func (s *Service) Export(ctx context.Context, space canonical.SpaceID, format Fo
 		return "", "", "", err
 	}
 	if rootKey != "" {
-		var scoped []canonical.Node
+		// Collect the root slot's direct children AND all of their descendants.
+		childrenOf := make(map[canonical.NodeID][]canonical.Node)
+		var queue []canonical.Node
 		for _, n := range nodes {
-			if n.Parent.Type == canonical.ParentTypeRoot && n.Parent.RootKey == rootKey {
-				scoped = append(scoped, n)
+			if n.Parent.Type == canonical.ParentTypeNode {
+				childrenOf[n.Parent.NodeID] = append(childrenOf[n.Parent.NodeID], n)
+			} else if n.Parent.RootKey == rootKey {
+				queue = append(queue, n)
 			}
 		}
+		scoped := make([]canonical.Node, 0, len(queue))
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			scoped = append(scoped, cur)
+			queue = append(queue, childrenOf[cur.ID]...)
+		}
 		nodes = scoped
+		var filteredSlots []canonical.RootSlot
+		for _, sl := range slots {
+			if sl.Key == rootKey {
+				filteredSlots = append(filteredSlots, sl)
+			}
+		}
+		slots = filteredSlots
 	}
 
 	switch format {
@@ -129,13 +159,13 @@ func (s *Service) Export(ctx context.Context, space canonical.SpaceID, format Fo
 
 func renderHTML(nodes []canonical.Node, slots []canonical.RootSlot) string {
 	childrenOf := map[string][]canonical.Node{}
-	var roots []canonical.Node
+	rootsBySlot := map[string][]canonical.Node{}
 	for _, n := range nodes {
 		if n.Parent.Type == canonical.ParentTypeNode {
 			key := string(n.Parent.NodeID)
 			childrenOf[key] = append(childrenOf[key], n)
 		} else {
-			roots = append(roots, n)
+			rootsBySlot[n.Parent.RootKey] = append(rootsBySlot[n.Parent.RootKey], n)
 		}
 	}
 	for k := range childrenOf {
@@ -143,7 +173,14 @@ func renderHTML(nodes []canonical.Node, slots []canonical.RootSlot) string {
 		sort.Slice(list, func(i, j int) bool { return list[i].Position < list[j].Position })
 		childrenOf[k] = list
 	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].Position < roots[i].Position })
+	for k := range rootsBySlot {
+		list := rootsBySlot[k]
+		sort.Slice(list, func(i, j int) bool { return list[i].Position < list[j].Position })
+		rootsBySlot[k] = list
+	}
+
+	sortedSlots := append([]canonical.RootSlot(nil), slots...)
+	sort.Slice(sortedSlots, func(i, j int) bool { return sortedSlots[i].Position < sortedSlots[j].Position })
 
 	esc := func(s string) string {
 		r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
@@ -161,18 +198,76 @@ func renderHTML(nodes []canonical.Node, slots []canonical.RootSlot) string {
 		for _, n := range list {
 			if n.Type == canonical.NodeTypeFolder {
 				b.WriteString(pad + "<DT><H3>" + esc(n.Title) + "</H3>\n")
-				kids := childrenOf[string(n.ID)]
-				if len(kids) > 0 {
-					b.WriteString(pad + "<DL><p>\n")
+				// Always emit <DL><p> ... </DL><p> for folders (even empty ones),
+				// matching Chrome/Firefox Netscape bookmark output.
+				b.WriteString(pad + "<DL><p>\n")
+				if kids := childrenOf[string(n.ID)]; len(kids) > 0 {
 					writeLevel(kids, depth+1)
-					b.WriteString(pad + "</DL><p>\n")
 				}
+				b.WriteString(pad + "</DL><p>\n")
 			} else {
 				b.WriteString(pad + "<DT><A HREF=\"" + esc(n.URL) + "\">" + esc(n.Title) + "</A>\n")
 			}
 		}
 	}
-	writeLevel(roots, 1)
+
+	// Preserve distinct root slots as top-level <H3> folders when more than one
+	// slot holds content; single-slot exports write their children directly so
+	// round-tripping into a root slot does not add a redundant wrapper folder.
+	nonEmptySlots := 0
+	for _, list := range rootsBySlot {
+		if len(list) > 0 {
+			nonEmptySlots++
+		}
+	}
+	if nonEmptySlots > 1 {
+		seen := map[string]bool{}
+		for _, sl := range sortedSlots {
+			list := rootsBySlot[sl.Key]
+			if len(list) == 0 {
+				continue
+			}
+			seen[sl.Key] = true
+			name := sl.DisplayName
+			if name == "" {
+				name = sl.Key
+			}
+			b.WriteString("    <DT><H3>" + esc(name) + "</H3>\n")
+			b.WriteString("    <DL><p>\n")
+			writeLevel(list, 2)
+			b.WriteString("    </DL><p>\n")
+		}
+		var extras []string
+		for k, list := range rootsBySlot {
+			if !seen[k] && len(list) > 0 {
+				extras = append(extras, k)
+			}
+		}
+		sort.Strings(extras)
+		for _, k := range extras {
+			b.WriteString("    <DT><H3>" + esc(k) + "</H3>\n")
+			b.WriteString("    <DL><p>\n")
+			writeLevel(rootsBySlot[k], 2)
+			b.WriteString("    </DL><p>\n")
+		}
+	} else {
+		var roots []canonical.Node
+		for _, sl := range sortedSlots {
+			if list := rootsBySlot[sl.Key]; len(list) > 0 {
+				roots = append(roots, list...)
+				delete(rootsBySlot, sl.Key)
+			}
+		}
+		var extras []string
+		for k := range rootsBySlot {
+			extras = append(extras, k)
+		}
+		sort.Strings(extras)
+		for _, k := range extras {
+			roots = append(roots, rootsBySlot[k]...)
+		}
+		writeLevel(roots, 1)
+	}
 	b.WriteString("</DL><p>\n")
 	return b.String()
 }
@@ -213,17 +308,22 @@ func renderJSON(sp canonical.SyncSpace, nodes []canonical.Node, slots []canonica
 
 // Preview parses the content and plans against the space's whole tree:
 // bookmarks are matched by exact raw URL anywhere in the space, folders by
-// full path. The apply call re-plans against the concrete target parent
-// and reports real counters.
-func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format Format, content string) (*Plan, error) {
+// full path. Optional PreviewOptions supply a concrete strategy/parent so
+// replace previews report deletions up front (R42).
+func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format Format, content string, opts ...PreviewOptions) (*Plan, error) {
+	var opt PreviewOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.Strategy != "" && opt.Strategy != "merge" && opt.Strategy != "replace" {
+		return nil, ErrInvalidStrategy
+	}
 	tree, warnings, err := ParseImport(format, content)
 	if err != nil {
 		return nil, err
 	}
-	// One snapshot: the plan records the revision it binds to *and* the tree it
-	// matched against, and those two have to describe the same instant. A plan
-	// stamped at R that holds R+1's nodes would pass the staleness check at
-	// head R+1 and apply onto a tree it never saw.
+	// One snapshot: the plan records the revision and epoch it binds to *and*
+	// the tree it matched against, so Apply can verify both inside its write tx.
 	sp, nodes, _, err := s.trees.SnapshotTree(ctx, space)
 	if err != nil {
 		return nil, err
@@ -232,8 +332,12 @@ func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format F
 	pathSet := map[string]bool{}
 	var pathOf func(n canonical.Node) string
 	byID := map[canonical.NodeID]canonical.Node{}
+	childrenOf := map[canonical.NodeID][]canonical.Node{}
 	for _, n := range nodes {
 		byID[n.ID] = n
+		if n.Parent.Type == canonical.ParentTypeNode {
+			childrenOf[n.Parent.NodeID] = append(childrenOf[n.Parent.NodeID], n)
+		}
 		if n.Type == canonical.NodeTypeBookmark {
 			urlSet[n.URL] = true
 		}
@@ -263,8 +367,33 @@ func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format F
 		Counts:        map[string]int{},
 		Warnings:      warnings,
 		BoundRevision: sp.CurrentRevision,
+		BoundEpoch:    sp.Epoch,
 		CreatedAt:     time.Now().UTC(),
 		Tree:          tree,
+	}
+
+	isReplace := opt.Strategy == "replace"
+	if isReplace && opt.Parent != nil {
+		var queue []canonical.Node
+		for _, n := range nodes {
+			if sameParent(n.Parent, *opt.Parent) {
+				queue = append(queue, n)
+			}
+		}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			plan.Counts[string(ActionDelete)]++
+			if len(plan.Entries) < 50 {
+				plan.Entries = append(plan.Entries, Entry{
+					Title:  cur.Title,
+					URL:    cur.URL,
+					Path:   pathOf(cur),
+					Action: string(ActionDelete),
+				})
+			}
+			queue = append(queue, childrenOf[cur.ID]...)
+		}
 	}
 
 	var walk func(n ImportNode, path string)
@@ -274,7 +403,7 @@ func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format F
 			if c.URL != "" {
 				plan.Total++
 				switch {
-				case urlSet[c.URL]:
+				case !isReplace && urlSet[c.URL]:
 					plan.Counts[string(ActionKeep)]++
 					plan.Entries = append(plan.Entries, Entry{Title: c.Title, URL: c.URL, Path: path, Action: string(ActionKeep)})
 				default:
@@ -283,7 +412,7 @@ func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format F
 				}
 			} else {
 				plan.Total++
-				if pathSet[p] {
+				if !isReplace && pathSet[p] {
 					plan.Counts[string(ActionKeep)]++
 					plan.Entries = append(plan.Entries, Entry{Title: c.Title, Path: path, Action: string(ActionKeep)})
 				} else {
@@ -320,6 +449,16 @@ func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format F
 	return plan, nil
 }
 
+func sameParent(a, b canonical.ParentRef) bool {
+	if a.Type != b.Type {
+		return false
+	}
+	if a.Type == canonical.ParentTypeNode {
+		return a.NodeID == b.NodeID
+	}
+	return a.RootKey == b.RootKey
+}
+
 // Apply re-plans against the concrete target parent with the chosen
 // strategy and commits the result through the canonical executor. The
 // whole apply — replace deletes plus every merge create — is ONE ChangeSet
@@ -327,20 +466,35 @@ func (s *Service) Preview(ctx context.Context, space canonical.SpaceID, format F
 func (s *Service) Apply(ctx context.Context, user canonical.UserID, space canonical.SpaceID, planID string, parent canonical.ParentRef, strategy string) (ApplyResult, error) {
 	s.mu.Lock()
 	plan, ok := s.plans[planID]
+	expired := ok && time.Since(plan.CreatedAt) > planTTL
+	if expired {
+		delete(s.plans, planID)
+	}
 	s.mu.Unlock()
-	if !ok || plan.SpaceID != string(space) {
+	if !ok || expired || plan.SpaceID != string(space) {
 		return ApplyResult{}, ErrPlanNotFound
 	}
 	if strategy != "merge" && strategy != "replace" {
 		return ApplyResult{}, ErrInvalidStrategy
 	}
-	// Stale plan: the space moved on since the preview (doc 11 §8).
-	sp, err := s.trees.Space(ctx, space)
-	if err != nil {
-		return ApplyResult{}, err
-	}
-	if sp.CurrentRevision != plan.BoundRevision {
-		return ApplyResult{}, ErrPlanStale
+
+	// Capture a safety backup before a root-level replace import overwrites
+	// existing bookmarks (doc 11 §9). Runs outside the canonical write tx
+	// because backup capture reads and writes its own catalog row; it does
+	// not mutate space revision or epoch.
+	if strategy == "replace" && parent.Type == canonical.ParentTypeRoot && s.SafetyBackup != nil {
+		sp, existingNodes, _, err := s.trees.SnapshotTree(ctx, space)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		if sp.Epoch != plan.BoundEpoch || sp.CurrentRevision != plan.BoundRevision {
+			return ApplyResult{}, ErrPlanStale
+		}
+		if len(existingNodes) > 0 {
+			if err := s.SafetyBackup(ctx, space); err != nil {
+				return ApplyResult{}, err
+			}
+		}
 	}
 
 	origin := canonical.Origin{Type: canonical.OriginUser, UserID: user}
@@ -355,6 +509,58 @@ func (s *Service) Apply(ctx context.Context, user canonical.UserID, space canoni
 		}
 	}()
 
+	// Re-verify epoch AND revision inside the write transaction so concurrent
+	// writes or backup restores cannot slip between preview and apply.
+	sp, err := tx.LoadSpace(ctx, space)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if sp.Epoch != plan.BoundEpoch || sp.CurrentRevision != plan.BoundRevision {
+		return ApplyResult{}, ErrPlanStale
+	}
+
+	// When importing a multi-slot native JSON export to a space root, preserve
+	// each top-level node's RootKey whenever that root slot exists in the space.
+	multiSlot := false
+	targetParents := []canonical.ParentRef{parent}
+	routeFor := func(c ImportNode) canonical.ParentRef { return parent }
+	if plan.Format == FormatNativeJSON && parent.Type == canonical.ParentTypeRoot {
+		distinctKeys := map[string]bool{}
+		for _, c := range plan.Tree.Children {
+			if c.RootKey != "" {
+				distinctKeys[c.RootKey] = true
+			}
+		}
+		if len(distinctKeys) > 1 {
+			validSlots := map[string]bool{}
+			seenParent := map[string]bool{}
+			targetParents = nil
+			for rk := range distinctKeys {
+				if _, err := tx.LoadRootSlot(ctx, space, rk); err == nil {
+					validSlots[rk] = true
+					if !seenParent[rk] {
+						seenParent[rk] = true
+						targetParents = append(targetParents, canonical.NewRootParent(rk))
+					}
+				}
+			}
+			if len(validSlots) > 1 {
+				multiSlot = true
+				if !seenParent[parent.RootKey] {
+					targetParents = append(targetParents, parent)
+				}
+				routeFor = func(c ImportNode) canonical.ParentRef {
+					if c.RootKey != "" && validSlots[c.RootKey] {
+						return canonical.NewRootParent(c.RootKey)
+					}
+					return parent
+				}
+			} else {
+				targetParents = []canonical.ParentRef{parent}
+			}
+		}
+	}
+
 	rec := s.changesets.BeginBatch(space, changeset.KindImport, origin, true)
 
 	var res ApplyResult
@@ -362,19 +568,21 @@ func (s *Service) Apply(ctx context.Context, user canonical.UserID, space canoni
 		// Replace clears the target's children first — as journaled,
 		// tombstoned DeleteNode commands so sync clients observe the
 		// removal and the undo has a full Before Image.
-		children, err := tx.Children(ctx, space, parent)
-		if err != nil {
-			return ApplyResult{}, err
-		}
-		for _, child := range children {
-			ids, err := tx.SubtreeIDs(ctx, space, child.ID)
+		for _, tp := range targetParents {
+			children, err := tx.Children(ctx, space, tp)
 			if err != nil {
 				return ApplyResult{}, err
 			}
-			if err := rec.Apply(ctx, tx, canonical.DeleteNode{SpaceID: space, NodeID: child.ID}); err != nil {
-				return ApplyResult{}, err
+			for _, child := range children {
+				ids, err := tx.SubtreeIDs(ctx, space, child.ID)
+				if err != nil {
+					return ApplyResult{}, err
+				}
+				if err := rec.Apply(ctx, tx, canonical.DeleteNode{SpaceID: space, NodeID: child.ID}); err != nil {
+					return ApplyResult{}, err
+				}
+				res.Deleted += int64(len(ids))
 			}
-			res.Deleted += int64(len(ids))
 		}
 	}
 
@@ -402,10 +610,6 @@ func (s *Service) Apply(ctx context.Context, user canonical.UserID, space canoni
 			}
 		}
 		return byTitle, byURL, nil
-	}
-	byTitle, byURL, err := indexChildren(parent)
-	if err != nil {
-		return ApplyResult{}, err
 	}
 	var walk func(n ImportNode, parent canonical.ParentRef, byTitle, byURL map[string]canonical.NodeID) error
 	walk = func(n ImportNode, parent canonical.ParentRef, byTitle, byURL map[string]canonical.NodeID) error {
@@ -461,8 +665,36 @@ func (s *Service) Apply(ctx context.Context, user canonical.UserID, space canoni
 		}
 		return nil
 	}
-	if err := walk(*plan.Tree, parent, byTitle, byURL); err != nil {
-		return ApplyResult{}, err
+
+	if multiSlot {
+		type slotIdx struct {
+			byTitle map[string]canonical.NodeID
+			byURL   map[string]canonical.NodeID
+		}
+		indexes := map[string]*slotIdx{}
+		for _, c := range plan.Tree.Children {
+			tp := routeFor(c)
+			idx, ok := indexes[tp.RootKey]
+			if !ok {
+				bt, bu, err := indexChildren(tp)
+				if err != nil {
+					return ApplyResult{}, err
+				}
+				idx = &slotIdx{byTitle: bt, byURL: bu}
+				indexes[tp.RootKey] = idx
+			}
+			if err := walk(ImportNode{Children: []ImportNode{c}}, tp, idx.byTitle, idx.byURL); err != nil {
+				return ApplyResult{}, err
+			}
+		}
+	} else {
+		byTitle, byURL, err := indexChildren(parent)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		if err := walk(*plan.Tree, parent, byTitle, byURL); err != nil {
+			return ApplyResult{}, err
+		}
 	}
 
 	summary := fmt.Sprintf("导入合并：新增 %d 项", res.Created)

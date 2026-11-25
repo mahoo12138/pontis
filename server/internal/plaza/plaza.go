@@ -52,6 +52,7 @@ var (
 	ErrInvalidVisibility = errors.New("plaza: visibility must be private or plaza")
 	ErrTooManyTags       = errors.New("plaza: too many tags")
 	ErrTagTooLong        = errors.New("plaza: tag is too long")
+	ErrEmptySource       = errors.New("plaza: source contains no bookmarks or folders")
 )
 
 // Node is one node of the published tree.
@@ -145,10 +146,10 @@ type Store interface {
 	Get(ctx context.Context, id string) (Publication, error)
 	ListPlaza(ctx context.Context) ([]Publication, error)
 	ListByOwner(ctx context.Context, userID string) ([]Publication, error)
-	// UpdateSnapshot rewrites the current tree and appends the version row in
-	// one transaction, so a publication never exists on a version nobody
-	// recorded.
-	UpdateSnapshot(ctx context.Context, id string, tree Node, bookmarks, folders int64, version int, note string, at time.Time) error
+	// UpdateSnapshot rewrites the current tree (and source space/root when
+	// re-targeted) and appends the version row in one transaction, so a
+	// publication never exists on a version nobody recorded.
+	UpdateSnapshot(ctx context.Context, id string, spaceID, rootNodeID string, tree Node, bookmarks, folders int64, version int, note string, at time.Time) error
 	UpdateMeta(ctx context.Context, id string, p MetaParams, at time.Time) error
 	ListVersions(ctx context.Context, publicationID string) ([]Version, error)
 	Delete(ctx context.Context, id string) error
@@ -168,6 +169,9 @@ type Service struct {
 	writer     interface {
 		BeginTx(ctx context.Context) (canonical.Tx, error)
 	}
+	// SafetyBackup, when wired, captures a safety backup before a whole-space
+	// replace apply overwrites existing bookmarks in a root slot (doc 10 §10).
+	SafetyBackup func(ctx context.Context, space canonical.SpaceID) error
 }
 
 // NewService returns a plaza service.
@@ -300,24 +304,52 @@ func parseCanonicalID(s string) (string, bool) {
 	return u.String(), true
 }
 
+// UpdateSnapshotParams optionally re-targets a publication to another space or
+// root node owned by the publisher (doc 10 §7 / R45). Nil fields keep the
+// existing source. Set AllowEmpty when intentionally replacing a non-empty
+// publication with an empty tree.
+type UpdateSnapshotParams struct {
+	SpaceID    *canonical.SpaceID
+	RootNodeID *string
+	AllowEmpty bool
+}
+
 // UpdateSnapshot re-captures the source tree, bumping the version. A source
-// that no longer exists is refused: writing an empty tree would silently
-// destroy a published collection.
-func (s *Service) UpdateSnapshot(ctx context.Context, user canonical.UserID, id string) (Publication, error) {
+// that no longer exists is refused, and emptying a previously populated
+// publication is refused unless AllowEmpty is explicitly set (R45).
+func (s *Service) UpdateSnapshot(ctx context.Context, user canonical.UserID, id string, p UpdateSnapshotParams) (Publication, error) {
 	pub, err := s.owned(ctx, user, id)
 	if err != nil {
 		return Publication{}, err
 	}
-	nodes, err := s.library.ListNodes(ctx, canonical.SpaceID(pub.SpaceID))
+	targetSpace := canonical.SpaceID(pub.SpaceID)
+	targetRoot := pub.RootNodeID
+	if p.SpaceID != nil && *p.SpaceID != "" {
+		targetSpace = *p.SpaceID
+	}
+	if p.RootNodeID != nil {
+		targetRoot = *p.RootNodeID
+	}
+	sp, err := s.library.Space(ctx, targetSpace)
 	if err != nil {
 		return Publication{}, err
 	}
-	tree, bookmarks, folders := buildTree(nodes, pub.RootNodeID, pub.NodeKey)
+	if sp.OwnerUserID != user {
+		return Publication{}, ErrSpaceForbidden
+	}
+	nodes, err := s.library.ListNodes(ctx, targetSpace)
+	if err != nil {
+		return Publication{}, err
+	}
+	tree, bookmarks, folders := buildTree(nodes, targetRoot, pub.NodeKey)
 	if bookmarks < 0 {
 		return Publication{}, ErrSourceNotFound
 	}
+	if !p.AllowEmpty && (pub.BookmarkCount > 0 || pub.FolderCount > 0) && bookmarks == 0 && folders == 0 {
+		return Publication{}, ErrEmptySource
+	}
 	tree = renameRoot(tree, pub.Title)
-	if err := s.store.UpdateSnapshot(ctx, id, tree, bookmarks, folders, pub.Version+1,
+	if err := s.store.UpdateSnapshot(ctx, id, string(targetSpace), targetRoot, tree, bookmarks, folders, pub.Version+1,
 		"从空间更新快照", time.Now().UTC()); err != nil {
 		return Publication{}, err
 	}
@@ -631,6 +663,7 @@ func (s *Service) LatestImport(ctx context.Context, user canonical.UserID, id st
 type ApplyResult struct {
 	Created int64 `json:"created"`
 	Updated int64 `json:"updated"`
+	Deleted int64 `json:"deleted"`
 	Kept    int64 `json:"kept"`
 }
 
@@ -681,6 +714,18 @@ func (s *Service) apply(ctx context.Context, user canonical.UserID, id string, p
 		imported, mappings = Import{}, nil
 	}
 
+	if !dryRun && p.Strategy == "replace" && pub.RootNodeID == "" && p.Parent.Type == canonical.ParentTypeRoot && s.SafetyBackup != nil {
+		existing, err := s.library.ListNodes(ctx, p.SpaceID)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		if len(existing) > 0 {
+			if err := s.SafetyBackup(ctx, p.SpaceID); err != nil {
+				return ApplyResult{}, err
+			}
+		}
+	}
+
 	origin := canonical.Origin{Type: canonical.OriginUser, UserID: user}
 	tx, err := s.writer.BeginTx(ctx)
 	if err != nil {
@@ -696,17 +741,67 @@ func (s *Service) apply(ctx context.Context, user canonical.UserID, id string, p
 	// One ChangeSet for the whole apply (doc 15 §8): undoable as a whole.
 	rec := s.changesets.BeginBatch(p.SpaceID, changeset.KindPublication, origin, true)
 
-	// Replace: clear the target's existing children first — as journaled,
-	// tombstoned DeleteNode commands so sync clients observe the removal
-	// and the undo keeps a full Before Image.
+	// Replace: delete the target scope as journaled, tombstoned DeleteNode
+	// commands so sync clients observe the removal and undo keeps a full Before
+	// Image. For a subtree publication (pub.RootNodeID != ""), only replace the
+	// matching child belonging to this publication — never wipe unrelated
+	// siblings under p.Parent (R42).
+	var deleted int64
 	if p.Strategy == "replace" {
-		children, err := tx.Children(ctx, p.SpaceID, p.Parent)
-		if err != nil {
-			return ApplyResult{}, err
-		}
-		for _, child := range children {
-			if err := rec.Apply(ctx, tx, canonical.DeleteNode{SpaceID: p.SpaceID, NodeID: child.ID}); err != nil {
+		if pub.RootNodeID != "" {
+			var targetID canonical.NodeID
+			if mapped, ok := mappings[pub.Tree.ID]; ok {
+				if existing, err := tx.LoadNode(ctx, p.SpaceID, mapped); err == nil && ParentKey(existing.Parent) == ParentKey(p.Parent) {
+					targetID = existing.ID
+				} else if err != nil && !errors.Is(err, canonical.ErrNodeNotFound) {
+					return ApplyResult{}, err
+				}
+			}
+			if targetID == "" {
+				children, err := tx.Children(ctx, p.SpaceID, p.Parent)
+				if err != nil {
+					return ApplyResult{}, err
+				}
+				isFolder := pub.Tree.Type == string(canonical.NodeTypeFolder)
+				pubURL := ""
+				if pub.Tree.URL != nil {
+					pubURL = *pub.Tree.URL
+				}
+				for _, child := range children {
+					if isFolder && child.Type == canonical.NodeTypeFolder && child.Title == pub.Tree.Title {
+						targetID = child.ID
+						break
+					}
+					if !isFolder && child.Type == canonical.NodeTypeBookmark && child.URL == pubURL {
+						targetID = child.ID
+						break
+					}
+				}
+			}
+			if targetID != "" {
+				ids, err := tx.SubtreeIDs(ctx, p.SpaceID, targetID)
+				if err != nil {
+					return ApplyResult{}, err
+				}
+				if err := rec.Apply(ctx, tx, canonical.DeleteNode{SpaceID: p.SpaceID, NodeID: targetID}); err != nil {
+					return ApplyResult{}, err
+				}
+				deleted += int64(len(ids))
+			}
+		} else {
+			children, err := tx.Children(ctx, p.SpaceID, p.Parent)
+			if err != nil {
 				return ApplyResult{}, err
+			}
+			for _, child := range children {
+				ids, err := tx.SubtreeIDs(ctx, p.SpaceID, child.ID)
+				if err != nil {
+					return ApplyResult{}, err
+				}
+				if err := rec.Apply(ctx, tx, canonical.DeleteNode{SpaceID: p.SpaceID, NodeID: child.ID}); err != nil {
+					return ApplyResult{}, err
+				}
+				deleted += int64(len(ids))
 			}
 		}
 	}
@@ -732,7 +827,7 @@ func (s *Service) apply(ctx context.Context, user canonical.UserID, id string, p
 	} else if err := m.place(pub.Tree, p.Parent); err != nil {
 		return ApplyResult{}, err
 	}
-	res := ApplyResult{Created: m.created, Updated: m.updated, Kept: m.kept}
+	res := ApplyResult{Created: m.created, Updated: m.updated, Deleted: deleted, Kept: m.kept}
 	if dryRun {
 		// Nothing below runs: the deferred rollback is what ends the walk.
 		return res, nil
@@ -749,6 +844,9 @@ func (s *Service) apply(ctx context.Context, user canonical.UserID, id string, p
 	}
 
 	summary := fmt.Sprintf("应用发布「%s」：新增 %d 项，更新 %d 项", pub.Title, res.Created, res.Updated)
+	if res.Deleted > 0 {
+		summary = fmt.Sprintf("应用发布「%s」：删除 %d 项，新增 %d 项，更新 %d 项", pub.Title, res.Deleted, res.Created, res.Updated)
+	}
 	if _, err := rec.Finish(ctx, tx, summary); err != nil {
 		return ApplyResult{}, err
 	}

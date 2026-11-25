@@ -69,6 +69,10 @@ type Store interface {
 	// GetTransfer loads a transfer by id; returns the zero record (with
 	// an empty ID) when absent.
 	GetTransfer(ctx context.Context, id string) (TransferRecord, error)
+
+	// GetTransferTx loads a transfer by id inside the active canonical tx so
+	// ownership and idempotency checks serialize atomically with writes.
+	GetTransferTx(ctx context.Context, tx canonical.Tx, id string) (TransferRecord, error)
 }
 
 // NodeMapping maps one source node id to its fresh target node id.
@@ -134,15 +138,6 @@ func (s *Service) Transfer(ctx context.Context, owner canonical.UserID, req Requ
 	}
 	hash := hashRequest(req)
 
-	if prev, err := s.store.GetTransfer(ctx, req.TransferID); err != nil {
-		return TransferResult{}, fmt.Errorf("spacetransfer: load transfer: %w", err)
-	} else if prev.ID != "" {
-		if prev.RequestHash != hash {
-			return TransferResult{}, ErrTransferIDReused
-		}
-		return replayResult(prev), nil
-	}
-
 	tx, err := s.store.BeginTx(ctx)
 	if err != nil {
 		return TransferResult{}, fmt.Errorf("spacetransfer: begin tx: %w", err)
@@ -154,7 +149,9 @@ func (s *Service) Transfer(ctx context.Context, owner canonical.UserID, req Requ
 		}
 	}()
 
-	// Owner-scoped both spaces (doc 22 §5).
+	// Owner-scope both spaces inside the write transaction before consulting
+	// transfer records so callers cannot probe another user's transfer_id and
+	// concurrent retries serialize cleanly with the committing transaction.
 	srcSpace, err := tx.LoadSpace(ctx, req.SourceSpace)
 	if err != nil {
 		return TransferResult{}, err
@@ -165,6 +162,18 @@ func (s *Service) Transfer(ctx context.Context, owner canonical.UserID, req Requ
 	}
 	if srcSpace.OwnerUserID != owner || tgtSpace.OwnerUserID != owner {
 		return TransferResult{}, ErrNotSpaceOwner
+	}
+
+	if prev, err := s.store.GetTransferTx(ctx, tx, req.TransferID); err != nil {
+		return TransferResult{}, fmt.Errorf("spacetransfer: load transfer: %w", err)
+	} else if prev.ID != "" {
+		if prev.OwnerUserID != owner {
+			return TransferResult{}, ErrNotSpaceOwner
+		}
+		if prev.RequestHash != hash {
+			return TransferResult{}, ErrTransferIDReused
+		}
+		return replayResult(prev), nil
 	}
 
 	if err := s.validateTargetParent(ctx, tx, req.TargetSpace, req.TargetParent); err != nil {

@@ -110,6 +110,40 @@ func TestTransferEndpoints(t *testing.T) {
 		t.Fatalf("conflict = %d %v", code, body)
 	}
 
+	// Device endpoint rejects a device without an active binding on targetSpace (least privilege).
+	code, body = doJSON(t, "POST", st.ts.URL+"/api/v1/sync/transfers", deviceAuth, map[string]any{
+		"transfer_id":     "tw-unauth",
+		"source_space_id": st.spaceID,
+		"target_space_id": targetSpace,
+		"node_id":         other,
+		"target_parent":   map[string]string{"type": "root", "key": "main"},
+	})
+	if code != http.StatusForbidden || errCode(t, body) != "NOT_BINDING_OWNER" {
+		t.Fatalf("device transfer without target binding = %d %v, want 403 NOT_BINDING_OWNER", code, body)
+	}
+
+	// Bind the device to targetSpace (starts pending_initial -> must still reject with 409).
+	code, body = doJSON(t, "POST", st.ts.URL+"/api/v1/device/bindings",
+		deviceAuth, map[string]string{"space_id": targetSpace})
+	if code != http.StatusCreated {
+		t.Fatalf("bind target space = %d %v", code, body)
+	}
+	targetBindingID := body["id"].(string)
+
+	code, body = doJSON(t, "POST", st.ts.URL+"/api/v1/sync/transfers", deviceAuth, map[string]any{
+		"transfer_id":     "tw-pending",
+		"source_space_id": st.spaceID,
+		"target_space_id": targetSpace,
+		"node_id":         other,
+		"target_parent":   map[string]string{"type": "root", "key": "main"},
+	})
+	if code != http.StatusConflict || errCode(t, body) != "BINDING_NOT_ACTIVE" {
+		t.Fatalf("device transfer with pending target binding = %d %v, want 409 BINDING_NOT_ACTIVE", code, body)
+	}
+
+	// Activate target binding via initial reconciliation so the device is authorized on both spaces.
+	initializeBinding(t, st.ts, deviceAuth, targetBindingID, emptyBrowserSnapshot())
+
 	// Device endpoint moves another subtree using source_space_id.
 	code, body = doJSON(t, "POST", st.ts.URL+"/api/v1/sync/transfers", deviceAuth, map[string]any{
 		"transfer_id":     "tw-2",

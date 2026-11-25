@@ -124,7 +124,10 @@ export default function ImportModal({
         onSuccess: (res) => {
           notifications.show({
             title: `已导入「${publication.title}」`,
-            message: `新建 ${res.created} 项 · 更新 ${res.updated} 项 · 保留 ${res.kept} 项`,
+            message:
+              res.deleted > 0
+                ? `删除 ${res.deleted} 项 · 新建 ${res.created} 项 · 更新 ${res.updated} 项 · 保留 ${res.kept} 项`
+                : `新建 ${res.created} 项 · 更新 ${res.updated} 项 · 保留 ${res.kept} 项`,
             color: 'coolGray',
           });
           onClose();
@@ -202,7 +205,9 @@ export default function ImportModal({
           {previewError && <Text fz={12} c="errorRed">{previewError}</Text>}
           {preview && (
             <Text fz={12} c="dimmed">
-              预计新建 {preview.created} 项 · 更新 {preview.updated} 项 · 保留 {preview.kept} 项
+              {preview.deleted > 0
+                ? `预计删除 ${preview.deleted} 项 · 新建 ${preview.created} 项 · 更新 ${preview.updated} 项 · 保留 ${preview.kept} 项`
+                : `预计新建 ${preview.created} 项 · 更新 ${preview.updated} 项 · 保留 ${preview.kept} 项`}
             </Text>
           )}
         </Group>

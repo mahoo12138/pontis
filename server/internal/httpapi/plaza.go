@@ -180,8 +180,12 @@ type updatePublicationRequest struct {
 	Description *string   `json:"description"`
 	Tags        *[]string `json:"tags"`
 	Visibility  *string   `json:"visibility"`
-	// Snapshot signals a re-capture from the source space.
-	Snapshot bool `json:"snapshot"`
+	// Snapshot signals a re-capture from the source space. Optional SpaceID /
+	// RootNodeID let the publisher re-target a moved or replaced source (R45).
+	Snapshot   bool    `json:"snapshot"`
+	SpaceID    *string `json:"space_id"`
+	RootNodeID *string `json:"root_node_id"`
+	AllowEmpty bool    `json:"allow_empty"`
 }
 
 func (s *Server) handleUpdatePublication(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +196,16 @@ func (s *Server) handleUpdatePublication(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if req.Snapshot {
-		pub, err := s.Plaza.UpdateSnapshot(r.Context(), canonical.UserID(u.ID), id)
+		var spID *canonical.SpaceID
+		if req.SpaceID != nil {
+			v := canonical.SpaceID(*req.SpaceID)
+			spID = &v
+		}
+		pub, err := s.Plaza.UpdateSnapshot(r.Context(), canonical.UserID(u.ID), id, plaza.UpdateSnapshotParams{
+			SpaceID:    spID,
+			RootNodeID: req.RootNodeID,
+			AllowEmpty: req.AllowEmpty,
+		})
 		if err != nil {
 			s.writePlazaError(w, r, err)
 			return
@@ -313,6 +326,8 @@ func (s *Server) writePlazaError(w http.ResponseWriter, r *http.Request, err err
 		s.writeError(w, r, http.StatusBadRequest, "TITLE_REQUIRED", "title must not be empty")
 	case errors.Is(err, plaza.ErrSourceNotFound):
 		s.writeError(w, r, http.StatusNotFound, "SOURCE_NOT_FOUND", "source node not found")
+	case errors.Is(err, plaza.ErrEmptySource):
+		s.writeError(w, r, http.StatusBadRequest, "EMPTY_SOURCE", "source contains no bookmarks or folders; set allow_empty to overwrite")
 	case errors.Is(err, plaza.ErrSpaceForbidden):
 		s.writeError(w, r, http.StatusForbidden, "NOT_SPACE_OWNER", "space belongs to another user")
 	case errors.Is(err, plaza.ErrInvalidApply):

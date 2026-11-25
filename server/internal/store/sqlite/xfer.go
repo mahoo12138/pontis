@@ -56,16 +56,15 @@ func (s *Store) InsertTransferTx(ctx context.Context, tx canonical.Tx, t spacetr
 	return nil
 }
 
-// GetTransfer loads a transfer by id; returns the zero record (with an
-// empty ID) when absent.
-func (s *Store) GetTransfer(ctx context.Context, id string) (spacetransfer.TransferRecord, error) {
-	row := s.db.QueryRowContext(ctx, `
+const selectTransferSQL = `
 		SELECT owner_user_id, source_space_id, target_space_id,
 		       source_binding_id, target_binding_id, state, request_hash,
 		       mapping_json, source_change_set_id, target_change_set_id,
 		       created_at, completed_at
 		FROM cross_space_transfers
-		WHERE id = ?`, id)
+		WHERE id = ?`
+
+func scanTransferRow(id string, row *sql.Row) (spacetransfer.TransferRecord, error) {
 	var (
 		t                            spacetransfer.TransferRecord
 		owner, src, tgt              string
@@ -105,4 +104,19 @@ func (s *Store) GetTransfer(ctx context.Context, id string) (spacetransfer.Trans
 		}
 	}
 	return t, nil
+}
+
+// GetTransfer loads a transfer by id; returns the zero record (with an
+// empty ID) when absent.
+func (s *Store) GetTransfer(ctx context.Context, id string) (spacetransfer.TransferRecord, error) {
+	return scanTransferRow(id, s.db.QueryRowContext(ctx, selectTransferSQL, id))
+}
+
+// GetTransferTx loads a transfer by id inside the caller's canonical tx.
+func (s *Store) GetTransferTx(ctx context.Context, tx canonical.Tx, id string) (spacetransfer.TransferRecord, error) {
+	ct, ok := tx.(*canonTx)
+	if !ok {
+		return spacetransfer.TransferRecord{}, fmt.Errorf("get transfer tx: unexpected tx type %T", tx)
+	}
+	return scanTransferRow(id, ct.tx.QueryRowContext(ctx, selectTransferSQL, id))
 }

@@ -86,9 +86,6 @@ type CreateParams struct {
 
 // CreateNode validates and applies a user's node creation.
 func (s *Service) CreateNode(ctx context.Context, space canonical.SpaceID, user canonical.UserID, p CreateParams) (canonical.Node, error) {
-	if p.Title == "" {
-		return canonical.Node{}, canonical.ErrTitleRequired
-	}
 	if len(p.Title) > MaxTitleLength {
 		return canonical.Node{}, ErrTitleTooLong
 	}
@@ -145,9 +142,6 @@ type UpdateParams struct {
 // UpdateNode applies title and/or URL changes to one node.
 func (s *Service) UpdateNode(ctx context.Context, space canonical.SpaceID, user canonical.UserID, node canonical.NodeID, p UpdateParams) (canonical.Node, error) {
 	if p.Title != nil {
-		if *p.Title == "" {
-			return canonical.Node{}, canonical.ErrTitleRequired
-		}
 		if len(*p.Title) > MaxTitleLength {
 			return canonical.Node{}, ErrTitleTooLong
 		}
@@ -338,7 +332,7 @@ func (s *Service) Activity(ctx context.Context, space canonical.SpaceID, limit i
 	now := time.Now().UTC()
 	out := make([]ActivityEntry, 0, len(sets))
 	for _, cs := range sets {
-		undone := cs.UndoneByChangeSet != ""
+		undone := cs.UndoneByChangeSet != "" || cs.UndoneAt != ""
 		entry := ActivityEntry{
 			ID:        cs.ID,
 			Timestamp: cs.CreatedAt.Format(time.RFC3339Nano),
@@ -377,6 +371,12 @@ func (s *Service) changesetActor(ctx context.Context, cs changeset.ChangeSet) st
 		return "导入"
 	case canonical.OriginTransfer:
 		return "跨空间转移"
+	case canonical.OriginReconciliation:
+		name, _ := s.store.DeviceName(ctx, string(cs.ActorDeviceID))
+		if name == "" {
+			return "设备对账"
+		}
+		return name
 	case canonical.OriginSystem, canonical.OriginRecovery:
 		return "系统"
 	default:
@@ -394,7 +394,7 @@ func mapKindAction(kind changeset.Kind) string {
 		return "move"
 	case changeset.KindNodeDelete:
 		return "delete"
-	case changeset.KindImport:
+	case changeset.KindImport, changeset.KindReconciliation:
 		return "import"
 	case changeset.KindPublication:
 		return "publish"

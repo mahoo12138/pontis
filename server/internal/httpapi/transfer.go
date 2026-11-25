@@ -36,8 +36,10 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 }
 
 type previewImportRequest struct {
-	Format  string `json:"format"`
-	Content string `json:"content"`
+	Format   string     `json:"format"`
+	Content  string     `json:"content"`
+	Strategy string     `json:"strategy,omitempty"`
+	Parent   *parentDTO `json:"parent,omitempty"`
 }
 
 func (s *Server) handleImportPreview(w http.ResponseWriter, r *http.Request) {
@@ -46,7 +48,12 @@ func (s *Server) handleImportPreview(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	plan, err := s.Transfer.Preview(r.Context(), spaceID, transfer.Format(req.Format), req.Content)
+	opts := transfer.PreviewOptions{Strategy: req.Strategy}
+	if req.Parent != nil {
+		p := req.Parent.toDomain()
+		opts.Parent = &p
+	}
+	plan, err := s.Transfer.Preview(r.Context(), spaceID, transfer.Format(req.Format), req.Content, opts)
 	if err != nil {
 		s.writeTransferError(w, r, err)
 		return
