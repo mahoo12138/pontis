@@ -41,7 +41,7 @@ import (
 )
 
 // ProductVersion is the server product version reported by /meta.
-const ProductVersion = "0.1.0"
+const ProductVersion = "0.2.0"
 
 // APIVersion is the HTTP API version.
 const APIVersion = "v1"

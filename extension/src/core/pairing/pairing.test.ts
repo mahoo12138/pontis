@@ -65,7 +65,7 @@ function bindingWire(state: string) {
 
 const paired: Record<string, [unknown, number?]> = {
   'GET /api/v1/meta': [
-    { instance_id: 'inst-1', product_version: '0.1.0', api_version: 'v1', sync_protocol_versions: [1] },
+    { instance_id: 'inst-1', product_version: '0.2.0', api_version: 'v1', sync_protocol_versions: [1] },
   ],
   'POST /api/v1/auth/login': [
     { token: 'session-1', expires_at: 'later', user: { id: 'u1', username: 'alpha', display_name: 'A' } },

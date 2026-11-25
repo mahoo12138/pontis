@@ -16,7 +16,7 @@ const BASE = '/api/v1';
  */
 export const mockMeta: MetaResponse = {
   instance_id: 'mock',
-  product_version: '0.1.0',
+  product_version: '0.2.0',
   api_version: 'v1',
   sync_protocol_versions: [1],
 };
