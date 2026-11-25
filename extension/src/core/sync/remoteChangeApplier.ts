@@ -11,6 +11,7 @@ import { removeByType, type BrowserAdapter, type BrowserNode } from '../browser/
 import {
   collectSubtree,
   findMirrorByCanonical,
+  isUnsettledOp,
   logDiagnostic,
   type BindingRecord,
   type ExpectedMutationRecord,
@@ -296,8 +297,10 @@ export class RemoteChangeApplier {
 
   /**
    * Adopt the browser node of a local create op when the server ack
-   *回流 arrives. Exact match first (result revision), then shape match
-   * as the crash-recovery fallback. Returns true when adopted.
+   *回流 arrives. Strict identity match only (doc 04 & doc 22 B.11):
+   * client-assigned nodeId must match change.node_id. Legacy empty-nodeId
+   * rows fall back strictly to exact server-acked resultRevision — never
+   * matching by title/URL, which could steal another device's bookmark (R20).
    */
   private async tryAdoptLocalCreate(
     binding: BindingRecord,
@@ -310,12 +313,9 @@ export class RemoteChangeApplier {
       .filter((o) => o.type === 'create' && o.browserId != null)
       .toArray();
     if (ops.length === 0) return false;
-    // Identity first: a create op carries the canonical id the client named for
-    // its own node (doc 04), so the change for that id is the ack's own words.
     const op =
-      ops.find((o) => o.nodeId === change.node_id) ??
-      ops.find((o) => o.result?.resultRevision === change.revision) ??
-      ops.find((o) => o.status !== 'RESOLVED' && o.title === payload.title && (o.url ?? '') === payload.url);
+      ops.find((o) => o.nodeId !== '' && o.nodeId === change.node_id) ??
+      ops.find((o) => o.nodeId === '' && o.result?.resultRevision === change.revision);
     if (!op?.browserId) return false;
     const local = await this.db.localNodes.get([binding.id, op.browserId]);
     if (!local || local.canonicalId != null) return false;
@@ -475,6 +475,14 @@ export class RemoteChangeApplier {
       });
       return;
     }
+    // R15: Before recursively deleting a folder, rescue any unsettled local
+    // creates inside its subtree (canonicalId == null) by moving them out to
+    // the primary mount root so offline-created bookmarks are never wiped by a
+    // remote folder delete (doc 22 B.10).
+    if (live.type === 'folder') {
+      await this.rescueUnsettledLocalCreates(binding, live.id, change.revision);
+    }
+
     const exp: ExpectedMutationRecord = {
       bindingId: binding.id,
       revision: change.revision,
@@ -497,6 +505,93 @@ export class RemoteChangeApplier {
     });
   }
 
+  /**
+   * Move top-most unsettled local creates out of a folder about to be removed
+   * by a remote DELETE (R15).
+   */
+  private async rescueUnsettledLocalCreates(
+    binding: BindingRecord,
+    folderBrowserId: string,
+    revision: number,
+  ): Promise<void> {
+    const rescueParentId = this.primaryMountBrowserId(binding);
+    if (!rescueParentId || rescueParentId === folderBrowserId) return;
+    const rootKey = this.primaryMountRootKey(binding);
+
+    const pendingCreates = await this.db.pendingOps
+      .where('bindingId')
+      .equals(binding.id)
+      .filter((o) => o.type === 'create' && isUnsettledOp(o) && o.browserId != null)
+      .toArray();
+    const createByBrowser = new Map(pendingCreates.map((o) => [o.browserId!, o]));
+    if (createByBrowser.size === 0) return;
+
+    const toRescue: BrowserNode[] = [];
+    const queue = await this.adapter.getChildren(folderBrowserId);
+    while (queue.length > 0) {
+      const child = queue.shift()!;
+      const mirror = await this.db.localNodes.get([binding.id, child.id]);
+      if (mirror?.canonicalId == null && createByBrowser.has(child.id)) {
+        // Moving this top-most unsettled node moves its entire subtree out.
+        toRescue.push(child);
+        continue;
+      }
+      if (child.type === 'folder') {
+        queue.push(...(await this.adapter.getChildren(child.id)));
+      }
+    }
+    if (toRescue.length === 0) return;
+
+    for (const node of toRescue) {
+      const op = createByBrowser.get(node.id)!;
+      const exp: ExpectedMutationRecord = {
+        bindingId: binding.id,
+        revision,
+        kind: 'move',
+        canonicalId: op.nodeId || '',
+        browserId: node.id,
+        parentBrowserId: rescueParentId,
+        position: null,
+        createdAt: Date.now(),
+      };
+      await this.db.expectedMutations.add(exp);
+      await this.adapter.move(node.id, rescueParentId, null);
+      await this.db.transaction('rw', [this.db.localNodes, this.db.pendingOps, this.db.expectedMutations], async () => {
+        await this.db.expectedMutations.delete(exp.id!);
+        const m = await this.db.localNodes.get([binding.id, node.id]);
+        if (m) {
+          await this.db.localNodes.put({ ...m, parentBrowserId: rescueParentId, position: null });
+        }
+        // Only retarget QUEUED creates (never mutate an IN_FLIGHT body, doc 22 B.19;
+        // the server's decideCreate will rescue an IN_FLIGHT op into Recovered/<Device>).
+        const liveOp = await this.db.pendingOps.get(op.opId);
+        if (liveOp && liveOp.status === 'QUEUED') {
+          liveOp.parent = { type: 'root', key: rootKey };
+          liveOp.beforeId = null;
+          await this.db.pendingOps.put(liveOp);
+        }
+      });
+    }
+    await logDiagnostic(this.db, 'warn', 'applier', '删除远端目录前已抢救未同步的本地新建书签', {
+      bindingId: binding.id,
+      folderBrowserId,
+      rescuedCount: toRescue.length,
+    });
+  }
+
+  private primaryMountBrowserId(binding: BindingRecord): string | null {
+    if (binding.mount.mode === 'partial') return binding.mount.folderBrowserId ?? null;
+    const roots = binding.mount.roots ?? {};
+    return roots[binding.mount.rootKey] ?? Object.values(roots)[0] ?? null;
+  }
+
+  private primaryMountRootKey(binding: BindingRecord): string {
+    if (binding.mount.mode === 'partial') return binding.mount.rootKey;
+    const roots = binding.mount.roots ?? {};
+    if (roots[binding.mount.rootKey]) return binding.mount.rootKey;
+    return Object.keys(roots)[0] ?? binding.mount.rootKey;
+  }
+
   // --- helpers ---
 
   private async resolveParent(binding: BindingRecord, parent: ParentRefWire): Promise<ParentResolution> {
@@ -507,15 +602,65 @@ export class RemoteChangeApplier {
       }
       if (mount.mode === 'full' && mount.roots && parent.key != null) {
         const browserId = mount.roots[parent.key];
-        // A root the mount knows nothing about is outside this replica's
-        // projection, not a lost mapping.
-        return browserId ? { kind: 'mapped', browserId } : { kind: 'excluded' };
+        if (browserId) return { kind: 'mapped', browserId };
+      }
+      // R15: Project recovered:* root slots into a visible local "Recovered"
+      // folder under the mount root instead of dropping them as excluded.
+      if (parent.key?.startsWith('recovered:')) {
+        const browserId = await this.ensureRecoveryFolder(binding, parent.key);
+        if (browserId) return { kind: 'mapped', browserId };
       }
       return { kind: 'excluded' };
     }
     const ref = parent.id ?? '';
     const row = await findMirrorByCanonical(this.db, binding.id, ref);
     return row?.browserId ? { kind: 'mapped', browserId: row.browserId } : { kind: 'missing', ref };
+  }
+
+  /**
+   * Ensure a visible browser folder exists for a server `recovered:*` root slot
+   * and record it on `binding.mount.recoveryFolders` without generating a user
+   * create op (R15).
+   */
+  private async ensureRecoveryFolder(binding: BindingRecord, rootKey: string): Promise<string | null> {
+    const existingId = binding.mount.recoveryFolders?.[rootKey];
+    if (existingId && (await this.adapter.getNode(existingId))) {
+      return existingId;
+    }
+    const primaryRoot = this.primaryMountBrowserId(binding);
+    if (!primaryRoot) return null;
+
+    const exp: ExpectedMutationRecord = {
+      bindingId: binding.id,
+      revision: 0,
+      kind: 'create',
+      canonicalId: `__recovery_root__:${rootKey}`,
+      browserId: null,
+      parentBrowserId: primaryRoot,
+      position: null,
+      title: 'Recovered',
+      url: undefined,
+      createdAt: Date.now(),
+    };
+    await this.db.expectedMutations.add(exp);
+    const created = await this.adapter.create(primaryRoot, { title: 'Recovered' });
+    await this.db.transaction('rw', [this.db.bindings, this.db.expectedMutations], async () => {
+      await this.db.expectedMutations.put({ ...exp, id: exp.id, browserId: created.id });
+      const b = await this.db.bindings.get(binding.id);
+      if (!b) return;
+      b.mount = {
+        ...b.mount,
+        recoveryFolders: { ...(b.mount.recoveryFolders ?? {}), [rootKey]: created.id },
+      };
+      await this.db.bindings.put(b);
+      binding.mount = b.mount;
+    });
+    await logDiagnostic(this.db, 'warn', 'applier', '已创建本地 Recovered 目录承接并发恢复的书签', {
+      bindingId: binding.id,
+      rootKey,
+      browserId: created.id,
+    });
+    return created.id;
   }
 
   /**

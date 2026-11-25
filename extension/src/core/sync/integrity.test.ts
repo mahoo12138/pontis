@@ -125,8 +125,8 @@ describe('periodic integrity (doc 05 §14)', () => {
 
     expect(await integrityCheck(db, verifier, bindingId)).toBe('repaired');
     const mirror = await db.localNodes.get([bindingId, 'b-extra']);
-    expect(mirror?.canonicalId).toBe('srv-5');
     expect(server.journal).toHaveLength(5);
+    expect(mirror?.canonicalId).toBe(server.journal[4]!.node_id);
   });
 
   it('reports major mapping loss instead of mass-CREATEing', async () => {

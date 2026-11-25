@@ -64,6 +64,7 @@ const (
 	ReasonConcurrentMove   = "concurrent_move"
 	ReasonTargetDeleted    = "target_deleted"
 	ReasonParentDeleted    = "parent_deleted"
+	ReasonChildrenRecovered = "children_recovered"
 	ReasonAlreadyDeleted   = "already_deleted"
 	ReasonAlreadyExists    = "already_exists"
 	ReasonAlreadyInPlace   = "already_in_place"

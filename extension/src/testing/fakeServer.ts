@@ -122,7 +122,7 @@ export class FakeServerTransport implements SyncTransport, SnapshotTransport, Tr
         return {
           revision,
           type: 'create',
-          node_id: `srv-${revision}`,
+          node_id: op.node_id || `srv-${revision}`,
           payload: { type: op.node_type ?? 'bookmark', title: op.title ?? '', url: op.url ?? '', parent, position },
         };
       }

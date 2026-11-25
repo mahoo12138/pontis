@@ -23,6 +23,7 @@ export type StorageChangeHandler = (
 ) => void;
 
 export interface ChromeAlarmsApi {
+  get?(name: string): Promise<{ name: string; periodInMinutes?: number } | undefined>;
   create(name: string, alarmInfo: { periodInMinutes?: number }): void;
   onAlarm: { addListener(cb: (alarm: { name: string }) => void): void };
 }

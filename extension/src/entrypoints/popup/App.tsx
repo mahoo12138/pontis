@@ -157,6 +157,11 @@ export function App() {
                   {recoveryNote(b)}
                 </Text>
               )}
+              {!b.recovery && b.lastNotice && (
+                <Text size="xs" c={b.lastNotice.level === 'error' ? 'errorRed' : 'recoveryOrange'}>
+                  {b.lastNotice.message}
+                </Text>
+              )}
             </Box>
           );
         })}

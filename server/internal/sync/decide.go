@@ -3,8 +3,10 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"pontis/internal/canonical"
+	"pontis/internal/changeset"
 	"pontis/internal/device"
 )
 
@@ -245,19 +247,115 @@ func (s *Service) decideMove(ctx context.Context, tx Tx, space canonical.SyncSpa
 	return res, nil
 }
 
-// decideDelete handles DELETE. Deletion always wins over stale updates
-// and moves; deleting an already-deleted node is a no-op.
-func (s *Service) decideDelete(ctx context.Context, tx Tx, space canonical.SyncSpace, binding device.Binding, op Operation, origin canonical.Origin) (OperationResult, error) {
-	if _, err := tx.LoadNode(ctx, space.ID, op.NodeID); err != nil {
+// decideDelete handles DELETE. Deletion wins over stale updates and moves,
+// while concurrently created nodes inside a deleted folder (created_revision >
+// op.BaseRevision from another binding or non-causal op) are rescued into
+// Recovered/<Device> before the folder is removed so both arrival orders
+// preserve new data (R15, doc 22 B.10).
+func (s *Service) decideDelete(ctx context.Context, tx Tx, space canonical.SyncSpace, binding device.Binding, op Operation, deviceName string, origin canonical.Origin) (OperationResult, error) {
+	target, err := tx.LoadNode(ctx, space.ID, op.NodeID)
+	if err != nil {
 		if errors.Is(err, canonical.ErrNodeNotFound) {
 			return s.deletedTargetResult(ctx, tx, op, space, StatusNoop, ReasonAlreadyDeleted, ReasonInvalidTarget)
 		}
 		return OperationResult{}, err
 	}
-	return s.applyCommand(ctx, tx, space, origin, op, canonical.DeleteNode{
+
+	var rescue []canonical.Node
+	if target.Type == canonical.NodeTypeFolder {
+		rescue, err = s.findConcurrentCreatesInSubtree(ctx, tx, space, binding, op, target.ID)
+		if err != nil {
+			return OperationResult{}, err
+		}
+	}
+	if len(rescue) == 0 {
+		return s.applyCommand(ctx, tx, space, origin, op, canonical.DeleteNode{
+			SpaceID: space.ID,
+			NodeID:  op.NodeID,
+		})
+	}
+
+	key := recoveryRootKey(canonical.DeviceID(binding.DeviceID))
+	if err := tx.EnsureRootSlot(ctx, space.ID, key, recoveryRootName(deviceName)); err != nil {
+		return OperationResult{}, err
+	}
+	batch := s.changesets.BeginBatch(space.ID, changeset.KindNodeDelete, origin, true)
+	for _, r := range rescue {
+		if err := batch.Apply(ctx, tx, canonical.MoveNode{
+			SpaceID: space.ID,
+			NodeID:  r.ID,
+			Parent:  canonical.NewRootParent(key),
+		}); err != nil {
+			if reason, ok := rejectionReason(err); ok {
+				return rejectedResult(op, reason), nil
+			}
+			return OperationResult{}, err
+		}
+	}
+	if err := batch.Apply(ctx, tx, canonical.DeleteNode{
 		SpaceID: space.ID,
 		NodeID:  op.NodeID,
-	})
+	}); err != nil {
+		if reason, ok := rejectionReason(err); ok {
+			return rejectedResult(op, reason), nil
+		}
+		return OperationResult{}, err
+	}
+	summary := fmt.Sprintf("删除了「%s」（已保护 %d 项并发新建）", target.Title, len(rescue))
+	if _, err := batch.Finish(ctx, tx, summary); err != nil {
+		return OperationResult{}, err
+	}
+	head, err := tx.LoadSpace(ctx, space.ID)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	return OperationResult{
+		OpID:                op.OpID,
+		ClientSeq:           op.ClientSeq,
+		Status:              StatusRecovered,
+		Reason:              ReasonChildrenRecovered,
+		ResultRevision:      head.CurrentRevision,
+		SettleAfterRevision: head.CurrentRevision,
+	}, nil
+}
+
+// findConcurrentCreatesInSubtree returns the top-most descendants inside
+// folderID that were created after op.BaseRevision by a non-causal writer.
+// Moving a newly-created folder preserves its whole subtree intact.
+func (s *Service) findConcurrentCreatesInSubtree(
+	ctx context.Context,
+	tx Tx,
+	space canonical.SyncSpace,
+	binding device.Binding,
+	op Operation,
+	folderID canonical.NodeID,
+) ([]canonical.Node, error) {
+	var rescue []canonical.Node
+	queue := []canonical.NodeID{folderID}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		children, err := tx.Children(ctx, space.ID, canonical.NewNodeParent(cur))
+		if err != nil {
+			return nil, err
+		}
+		for _, child := range children {
+			if child.CreatedRevision > op.BaseRevision {
+				causal, err := s.sameBindingCausal(ctx, tx, space, binding.ID, child.CreatedRevision, op.ClientSeq)
+				if err != nil {
+					return nil, err
+				}
+				if !causal {
+					rescue = append(rescue, child)
+					continue
+				}
+			}
+			if child.Type == canonical.NodeTypeFolder {
+				queue = append(queue, child.ID)
+			}
+		}
+	}
+	return rescue, nil
 }
 
 // applyCommand executes a canonical command inside the open transaction

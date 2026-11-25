@@ -23,6 +23,7 @@ import {
 } from '@mantine/core';
 import { Section } from './Section';
 import { fmtDuration } from './duration';
+import { navigableUrl } from '../core/start-page/url';
 import { runtime } from './optionsRuntime';
 import { errText, type Runtime } from './runtime';
 import {
@@ -456,23 +457,29 @@ export function ActivityTab({ paired }: { paired: boolean }) {
                 </Text>
               ) : (
                 <Stack gap={4}>
-                  {suggestions.zombies.map((z) => (
-                    <Group key={z.id} gap="xs" wrap="nowrap" justify="space-between">
-                      <Text size="sm" truncate style={{ flex: 1 }}>
-                        {z.title || z.url}
-                      </Text>
-                      <Button
-                        size="xs"
-                        variant="subtle"
-                        color="coolGray"
-                        component="a"
-                        href={z.url}
-                        target="_blank"
-                      >
-                        打开
-                      </Button>
-                    </Group>
-                  ))}
+                  {suggestions.zombies.map((z) => {
+                    const safeUrl = navigableUrl(z.url);
+                    return (
+                      <Group key={z.id} gap="xs" wrap="nowrap" justify="space-between">
+                        <Text size="sm" truncate style={{ flex: 1 }}>
+                          {z.title || z.url}
+                        </Text>
+                        {safeUrl && (
+                          <Button
+                            size="xs"
+                            variant="subtle"
+                            color="coolGray"
+                            component="a"
+                            href={safeUrl.href}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            打开
+                          </Button>
+                        )}
+                      </Group>
+                    );
+                  })}
                 </Stack>
               )}
               <Text size="xs" c="dimmed" mt={4}>

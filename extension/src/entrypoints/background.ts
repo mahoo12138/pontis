@@ -101,12 +101,29 @@ export default defineBackground(() => {
     })();
   });
 
-  chrome.alarms.create('pontis-sync', { periodInMinutes: 5 });
-  chrome.alarms.create('pontis-integrity', { periodInMinutes: 24 * 60 });
+  // Create periodic alarms only when absent or reconfigured so MV3 service
+  // worker wakeups do not continuously reset the countdown timer (R18).
+  const ensureAlarm = (name: string, periodInMinutes: number) => {
+    const schedule = () => chrome.alarms.create(name, { periodInMinutes });
+    if (typeof chrome.alarms.get !== 'function') {
+      schedule();
+      return;
+    }
+    void Promise.resolve(chrome.alarms.get(name))
+      .then((existing) => {
+        if (!existing || existing.periodInMinutes !== periodInMinutes) {
+          schedule();
+        }
+      })
+      .catch(() => schedule());
+  };
+
+  ensureAlarm('pontis-sync', 5);
+  ensureAlarm('pontis-integrity', 24 * 60);
   // The dwell tracker's beat: keeps an open segment's lastBeatAt fresh while
   // the person really is on the page, and is the wake path that settles a
   // segment left open by a dead worker.
-  chrome.alarms.create('pontis-activity-hb', { periodInMinutes: 1 });
+  ensureAlarm('pontis-activity-hb', 1);
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'pontis-sync') {
       void loop.runSync('alarm');

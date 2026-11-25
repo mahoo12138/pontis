@@ -45,12 +45,6 @@ export class ReplicaVerifier {
     private coordinator: SyncCoordinator,
   ) {}
 
-
-
-
-
-
-
   // --- level-by-level upload ---
 
   /**
@@ -105,10 +99,14 @@ export class ReplicaVerifier {
 
   private async uploadPassAll(bindingId: string): Promise<number> {
     const binding = await this.db.bindings.get(bindingId);
-    if (!binding || binding.mount.mode !== 'partial' || !binding.mount.folderBrowserId) return 0;
-    const snap = await snapshotBrowserTree(this.adapter, binding.mount.folderBrowserId);
+    if (!binding) return 0;
+    const roots = this.mountEntries(binding);
+    if (roots.length === 0) return 0;
     let count = 0;
-    for (const top of snap.children) count += await this.uploadNode(bindingId, top);
+    for (const [, browserRootId] of roots) {
+      const snap = await snapshotBrowserTree(this.adapter, browserRootId);
+      for (const top of snap.children) count += await this.uploadNode(bindingId, top);
+    }
     return count;
   }
 
@@ -120,16 +118,19 @@ export class ReplicaVerifier {
    * Rescan the managed scope and compare browser ↔ mirror. Missing
    * mirrors, field drift and parent drift are repaired once via targeted ops
    * (PROCESS_DEFERRED_LOCAL_CHANGES, doc 06 §13); whatever still
-   * diverges fails verification.
+   * diverges fails verification. Supports both partial and full sync modes (R19).
    */
   async verifyAndRepair(bindingId: string): Promise<VerifyReport> {
     const binding = await this.mustGetBinding(bindingId);
-    if (binding.mount.mode === 'partial' && binding.mount.folderBrowserId) {
-      const snap = await snapshotBrowserTree(this.adapter, binding.mount.folderBrowserId);
+    const roots = this.mountEntries(binding);
+    if (roots.length > 0) {
       const mirrors = new Map(
         (await this.db.localNodes.where('bindingId').equals(bindingId).toArray()).map((m) => [m.browserId, m]),
       );
-      await this.repairLevel(bindingId, snap.children, mirrors);
+      for (const [, browserRootId] of roots) {
+        const snap = await snapshotBrowserTree(this.adapter, browserRootId);
+        await this.repairLevel(bindingId, snap.children, mirrors);
+      }
       await this.uploadPassAll(bindingId);
       await this.quiesceLoop(bindingId);
     }
@@ -194,55 +195,67 @@ export class ReplicaVerifier {
    */
   async verifyScan(bindingId: string): Promise<VerifyReport> {
     const binding = await this.mustGetBinding(bindingId);
-    const snap = await snapshotBrowserTree(this.adapter, this.mountRootId(binding));
+    const roots = this.mountEntries(binding);
+    if (roots.length === 0) {
+      throw new Error(`verify: ${binding.mount.mode} binding has no mount roots`);
+    }
+    const rootBrowserIds = new Set(roots.map(([, id]) => id));
+    const snaps: Array<{ rootKey: string; snap: BrowserSnapshotNode }> = [];
+    for (const [rootKey, browserRootId] of roots) {
+      snaps.push({ rootKey, snap: await snapshotBrowserTree(this.adapter, browserRootId) });
+    }
     const mirrors = await this.db.localNodes.where('bindingId').equals(bindingId).toArray();
     const byBrowser = new Map(mirrors.map((m) => [m.browserId, m]));
     const problems: VerifyProblem[] = [];
 
-    const queue: BrowserSnapshotNode[] = [...snap.children];
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      queue.push(...cur.children);
-      const mirror = byBrowser.get(cur.node.id);
-      if (!mirror) {
-        problems.push({ kind: 'missing_mirror', browserId: cur.node.id });
-        continue;
-      }
-      if (mirror.canonicalId == null) {
-        problems.push({ kind: 'missing_mirror', browserId: cur.node.id, detail: 'unmapped after apply' });
-        continue;
-      }
-      if (cur.node.title !== mirror.title || (cur.node.url ?? null) !== mirror.url) {
-        problems.push({ kind: 'field_mismatch', browserId: cur.node.id, canonicalId: mirror.canonicalId });
-      }
-      if (mirror.parentBrowserId && cur.node.parentId && cur.node.parentId !== mirror.parentBrowserId) {
-        problems.push({
-          kind: 'parent_mismatch',
-          browserId: cur.node.id,
-          canonicalId: mirror.canonicalId,
-          detail: `browser ${cur.node.parentId} vs mirror ${mirror.parentBrowserId}`,
-        });
+    for (const { snap } of snaps) {
+      const queue: BrowserSnapshotNode[] = [...snap.children];
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        queue.push(...cur.children);
+        const mirror = byBrowser.get(cur.node.id);
+        if (!mirror) {
+          problems.push({ kind: 'missing_mirror', browserId: cur.node.id });
+          continue;
+        }
+        if (mirror.canonicalId == null) {
+          problems.push({ kind: 'missing_mirror', browserId: cur.node.id, detail: 'unmapped after apply' });
+          continue;
+        }
+        if (cur.node.title !== mirror.title || (cur.node.url ?? null) !== mirror.url) {
+          problems.push({ kind: 'field_mismatch', browserId: cur.node.id, canonicalId: mirror.canonicalId });
+        }
+        if (mirror.parentBrowserId && cur.node.parentId && cur.node.parentId !== mirror.parentBrowserId) {
+          problems.push({
+            kind: 'parent_mismatch',
+            browserId: cur.node.id,
+            canonicalId: mirror.canonicalId,
+            detail: `browser ${cur.node.parentId} vs mirror ${mirror.parentBrowserId}`,
+          });
+        }
       }
     }
 
     for (const m of mirrors) {
       if (!m.browserId) continue;
       const node = await this.adapter.getNode(m.browserId);
-      if (!node && m.browserId !== this.mountRootId(binding)) {
+      if (!node && !rootBrowserIds.has(m.browserId)) {
         problems.push({ kind: 'orphan_mirror', browserId: m.browserId, canonicalId: m.canonicalId ?? undefined });
       }
     }
 
     // Order drift is advisory only: sibling reorder may be genuine local
     // intent that the next sync round propagates.
-    problems.push(...(await this.orderDrift(bindingId, binding, mirrors, snap)));
+    for (const { rootKey, snap } of snaps) {
+      problems.push(...(await this.orderDrift(bindingId, rootKey, mirrors, snap)));
+    }
 
     return { ok: !problems.some((p) => p.kind !== 'order_drift'), problems };
   }
 
   private async orderDrift(
     bindingId: string,
-    binding: BindingRecord,
+    rootKey: string,
     mirrors: LocalNodeRecord[],
     snap: BrowserSnapshotNode,
   ): Promise<VerifyProblem[]> {
@@ -277,10 +290,9 @@ export class ReplicaVerifier {
         }
       }
     };
-    await checkLevel(snap, { type: 'root', key: binding.mount.rootKey });
+    await checkLevel(snap, { type: 'root', key: rootKey });
     return problems;
   }
-
 
   private async replayInbox(bindingId: string): Promise<CanonicalTree> {
     const rows = await this.db.remoteChanges.where('bindingId').equals(bindingId).sortBy('revision');
@@ -292,9 +304,6 @@ export class ReplicaVerifier {
     }));
     return replayChanges(changes);
   }
-
-
-
 
   // --- outbox helpers ---
 
@@ -385,22 +394,25 @@ export class ReplicaVerifier {
   private async canonicalParentRef(bindingId: string, parentBrowserId: string | null): Promise<ParentRefWire | null> {
     if (parentBrowserId == null) return null;
     const binding = await this.mustGetBinding(bindingId);
-    if (binding.mount.mode === 'partial' && parentBrowserId === binding.mount.folderBrowserId) {
-      return { type: 'root', key: binding.mount.rootKey };
+    for (const [rootKey, browserRootId] of this.mountEntries(binding)) {
+      if (parentBrowserId === browserRootId) return { type: 'root', key: rootKey };
+    }
+    if (binding.mount.recoveryFolders) {
+      for (const [rootKey, browserRootId] of Object.entries(binding.mount.recoveryFolders)) {
+        if (parentBrowserId === browserRootId) return { type: 'root', key: rootKey };
+      }
     }
     const parent = await this.db.localNodes.get([bindingId, parentBrowserId]);
     if (parent?.canonicalId) return { type: 'node', id: parent.canonicalId };
     return null;
   }
 
-  private mountRootId(binding: BindingRecord): string {
+  /** All [rootKey, browserRootId] pairs owned by this binding (R19). */
+  private mountEntries(binding: BindingRecord): Array<[string, string]> {
     if (binding.mount.mode === 'partial') {
-      if (!binding.mount.folderBrowserId) throw new Error('verify: partial binding has no mount folder');
-      return binding.mount.folderBrowserId;
+      return binding.mount.folderBrowserId ? [[binding.mount.rootKey, binding.mount.folderBrowserId]] : [];
     }
-    const first = Object.values(binding.mount.roots ?? {})[0];
-    if (!first) throw new Error('verify: full binding has no roots');
-    return first;
+    return Object.entries(binding.mount.roots ?? {});
   }
 
   private async mustGetBinding(bindingId: string): Promise<BindingRecord> {

@@ -2,7 +2,7 @@
 // received_revision, serial apply, settle cleanup, protocol error handling.
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { acquireRunLock, PontisDB, releaseAllRunLocks, RUN_LOCK_STALE_MS, type BindingRecord } from '../store/db';
+import { acquireRunLock, PontisDB, releaseAllRunLocks, renewRunLock, RUN_LOCK_STALE_MS, type BindingRecord } from '../store/db';
 import { FakeBrowserAdapter } from '../browser/fakeAdapter';
 import { RemoteChangeApplier } from './remoteChangeApplier';
 import { SyncCoordinator, type SyncOutcome } from './syncCoordinator';
@@ -392,5 +392,50 @@ describe('SyncCoordinator', () => {
     await db.bindings.put({ ...row!, enabled: true });
     await coordinator.syncAll();
     expect(seen).toEqual([bindingId]);
+  });
+
+  it('R16: surfaces REJECTED/CONFLICT/RECOVERED notices and drops orphan mirror on rejected create', async () => {
+    adapter.seed({ id: 'f1', parentId: '0', title: 'Sync' });
+    adapter.seed({ id: 'b-bad', parentId: 'f1', title: 'Bad', url: 'https://bad.example' });
+    await seedBinding();
+    await db.localNodes.put({
+      bindingId, browserId: 'b-bad', canonicalId: null, type: 'bookmark',
+      title: 'Bad', url: 'https://bad.example', parentBrowserId: 'f1', position: null,
+    });
+    await db.pendingOps.add({
+      opId: 'op-rej', bindingId, clientSeq: 1, baseRevision: 100, status: 'QUEUED',
+      type: 'create', nodeId: 'n-bad', nodeType: 'bookmark', title: 'Bad',
+      url: 'https://bad.example', parent: { type: 'root', key: 'main' },
+      browserId: 'b-bad', createdAt: Date.now(),
+    });
+    const transport: SyncTransport = {
+      sync: async () =>
+        response({
+          operation_results: [
+            { op_id: 'op-rej', client_seq: 1, status: 'REJECTED', reason: 'invalid_payload', result_revision: 0, settle_after_revision: 100 },
+          ],
+        }),
+    };
+    const coordinator = new SyncCoordinator(db, applier, transport);
+    expect(await coordinator.syncBinding(bindingId)).toBe('synced');
+
+    // Orphan canonicalId=null mirror row must be removed so the bookmark isn't permanently stranded.
+    expect(await db.localNodes.get([bindingId, 'b-bad'])).toBeUndefined();
+    const b = await db.bindings.get(bindingId);
+    expect(b?.lastNotice?.level).toBe('error');
+    expect(b?.lastNotice?.code).toBe('invalid_payload');
+    const diags = await db.diagnostics.toArray();
+    expect(diags.some((d) => d.level === 'error' && d.message.includes('拒绝'))).toBe(true);
+  });
+
+  it('R24: renews an active run lock without overwriting a lock held by another token', async () => {
+    await seedBinding();
+    const t0 = 1_000_000;
+    expect(await acquireRunLock(db, bindingId, 'tok-a', t0)).toBe('tok-a');
+    expect(await renewRunLock(db, bindingId, 'tok-a', t0 + 60_000)).toBe(true);
+    expect((await db.runLocks.get(bindingId))?.takenAt).toBe(t0 + 60_000);
+    // A non-owner token cannot renew someone else's lock.
+    expect(await renewRunLock(db, bindingId, 'tok-b', t0 + 120_000)).toBe(false);
+    expect((await db.runLocks.get(bindingId))?.token).toBe('tok-a');
   });
 });

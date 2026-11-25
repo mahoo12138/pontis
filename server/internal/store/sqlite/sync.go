@@ -15,12 +15,27 @@ import (
 // SyncStore implements sync.Store.
 type SyncStore struct {
 	db      *sql.DB
+	ro      *sql.DB
 	devices *DeviceStore
 }
 
 // NewSyncStore wraps an opened database as a sync store.
 func NewSyncStore(db *sql.DB) *SyncStore {
 	return &SyncStore{db: db, devices: NewDeviceStore(db)}
+}
+
+// WithReadDB attaches a separate read-only WAL pool so pull-only sync rounds
+// and snapshot reads do not queue behind the single writer connection (R22).
+func (s *SyncStore) WithReadDB(ro *sql.DB) *SyncStore {
+	s.ro = ro
+	return s
+}
+
+func (s *SyncStore) readDB() *sql.DB {
+	if s.ro != nil {
+		return s.ro
+	}
+	return s.db
 }
 
 // BeginTx starts a sync round transaction.
@@ -32,12 +47,9 @@ func (s *SyncStore) BeginTx(ctx context.Context) (sync.Tx, error) {
 	return &syncTxImpl{canonTx: &canonTx{tx: sqlTx}}, nil
 }
 
-// BeginReadTx starts one consistent read snapshot. Every read a response
-// labels with a revision happens inside it: two statements of the same
-// connection can still straddle another request's commit, and the pair they
-// then describe never existed at any instant (doc 04 §15, doc 06 §8).
+// BeginReadTx starts one consistent read snapshot on the read pool (R22).
 func (s *SyncStore) BeginReadTx(ctx context.Context) (sync.ReadTx, error) {
-	sqlTx, err := s.db.BeginTx(ctx, nil)
+	sqlTx, err := s.readDB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("begin sync read tx: %w", err)
 	}
@@ -108,12 +120,12 @@ func (r *syncReadTx) LoadSnapshotNodes(ctx context.Context, space canonical.Spac
 
 // LoadBinding loads the device-space binding.
 func (s *SyncStore) LoadBinding(ctx context.Context, deviceID canonical.DeviceID, space canonical.SpaceID) (device.Binding, error) {
-	return s.devices.GetBinding(ctx, string(deviceID), space)
+	return NewDeviceStore(s.readDB()).GetBinding(ctx, string(deviceID), space)
 }
 
 // LoadSpace loads a sync space.
 func (s *SyncStore) LoadSpace(ctx context.Context, id canonical.SpaceID) (canonical.SyncSpace, error) {
-	return scanSpace(s.db.QueryRowContext(ctx, spaceColumns, string(id)))
+	return scanSpace(s.readDB().QueryRowContext(ctx, spaceColumns, string(id)))
 }
 
 // UpdateBindingSync persists the binding watermarks of one epoch.

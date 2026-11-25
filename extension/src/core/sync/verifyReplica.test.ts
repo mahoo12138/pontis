@@ -250,4 +250,34 @@ describe('verification repairs the drift a missed event hides', () => {
     expect(report.ok).toBe(true);
     expect(await db.pendingOps.count()).toBe(0);
   });
+
+  it('R19: verifies and repairs browser-only nodes and field drift across all roots in full sync mode', async () => {
+    adapter.seed({ id: 'bar', parentId: '0', title: 'Bookmarks Bar' });
+    adapter.seed({ id: 'other', parentId: '0', title: 'Other Bookmarks' });
+    adapter.seed({ id: 'b-bar', parentId: 'bar', title: 'Bar Local', url: 'https://bar.example' });
+    adapter.seed({ id: 'b-other', parentId: 'other', title: 'Other Renamed', url: 'https://other.example' });
+    await seedBinding({
+      mode: 'full',
+      appliedRevision: 1,
+      receivedRevision: 1,
+      mount: { mode: 'full', rootKey: 'main', roots: { main: 'bar', other: 'other' } },
+    });
+    server.seed({
+      type: 'create',
+      node_id: 'n-other',
+      payload: { type: 'bookmark', title: 'Other Original', url: 'https://other.example', parent: { type: 'root', key: 'other' }, position: 0 },
+    });
+    await db.localNodes.put({
+      bindingId, browserId: 'b-other', canonicalId: 'n-other', type: 'bookmark',
+      title: 'Other Original', url: 'https://other.example', parentBrowserId: 'other', position: 0,
+    });
+
+    const report = await verifier.verifyAndRepair(bindingId);
+
+    expect(report.ok).toBe(true);
+    expect(server.journal.some((c) => c.type === 'create' && (c.payload as { title?: string }).title === 'Bar Local')).toBe(true);
+    expect(server.journal.some((c) => c.type === 'update_title' && c.node_id === 'n-other')).toBe(true);
+    expect((await db.localNodes.get([bindingId, 'b-bar']))?.canonicalId).toBeTruthy();
+    expect((await db.localNodes.get([bindingId, 'b-other']))?.title).toBe('Other Renamed');
+  });
 });

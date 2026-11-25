@@ -5,6 +5,7 @@
 
 import type { BrowserAdapter, BrowserEvent, BrowserNode } from '../browser/types';
 import {
+  activeReconSession,
   collectSubtree,
   logDiagnostic,
   type BindingRecord,
@@ -16,6 +17,7 @@ import {
 } from '../store/db';
 import type { OpType, ParentRefWire } from '../protocol/types';
 import { uuidv7 } from '../util/ids';
+import { pruneExpiredStepExpectations } from './reconcileSteps';
 
 export type EventDisposition = 'expected' | 'local-op' | 'ignored';
 
@@ -58,13 +60,16 @@ export class EventProcessor {
     if (!binding || !capturesBindingEvents(binding.state)) {
       return 'ignored';
     }
+    // Prune stale reconciliation step expectations so unconsumed echoes cannot
+    // swallow future user edits forever (R37).
+    await pruneExpiredStepExpectations(this.db, binding.id);
     switch (event.kind) {
       case 'created':
         return this.handleCreated(binding, event.node);
       case 'changed':
         return this.handleChanged(binding, event.node);
       case 'moved':
-        return this.handleMoved(binding, event.node);
+        return this.handleMoved(binding, event.node, event.oldParentId);
       case 'removed':
         return this.handleRemoved(binding, event.node);
     }
@@ -94,16 +99,18 @@ export class EventProcessor {
       const exp = provisional[0]!;
       await this.db.transaction('rw', [this.db.localNodes, this.db.expectedMutations], async () => {
         await this.db.expectedMutations.delete(exp.id!);
-        await this.db.localNodes.put({
-          bindingId: binding.id,
-          browserId: node.id,
-          canonicalId: exp.canonicalId,
-          type: node.type,
-          title: node.title,
-          url: node.url,
-          parentBrowserId: node.parentId,
-          position: exp.position ?? null,
-        });
+        if (!exp.canonicalId.startsWith('__recovery_root__:')) {
+          await this.db.localNodes.put({
+            bindingId: binding.id,
+            browserId: node.id,
+            canonicalId: exp.canonicalId,
+            type: node.type,
+            title: node.title,
+            url: node.url,
+            parentBrowserId: node.parentId,
+            position: exp.position ?? null,
+          });
+        }
       });
       return 'expected';
     }
@@ -128,7 +135,10 @@ export class EventProcessor {
     if (settled.length > 0) {
       await this.db.transaction('rw', [this.db.localNodes, this.db.expectedMutations], async () => {
         await this.db.expectedMutations.bulkDelete(settled.map((e) => e.id!));
-        if (!(await this.db.localNodes.get([binding.id, node.id]))) {
+        if (
+          !settled[0]!.canonicalId.startsWith('__recovery_root__:') &&
+          !(await this.db.localNodes.get([binding.id, node.id]))
+        ) {
           await this.db.localNodes.put({
             bindingId: binding.id,
             browserId: node.id,
@@ -146,6 +156,9 @@ export class EventProcessor {
 
     const parentRef = await this.canonicalParentRef(binding, node.parentId);
     if (!parentRef) {
+      if (await this.markReconDirtyIfActive(binding, node.id)) {
+        return 'local-op';
+      }
       await logDiagnostic(this.db, 'warn', 'event-processor', '本机新建位于未映射的父目录下，已跳过', {
         bindingId: binding.id,
         node,
@@ -219,7 +232,12 @@ export class EventProcessor {
       }
     }
 
-    if (!mirror) return 'ignored';
+    if (!mirror) {
+      if (await this.markReconDirtyIfActive(binding, node.id)) {
+        return 'local-op';
+      }
+      return 'ignored';
+    }
 
     // The node has no canonical id yet, so the outbox create is the only thing
     // that carries it forward.
@@ -293,10 +311,18 @@ export class EventProcessor {
 
   // --- moved ---
 
-  private async handleMoved(binding: BindingRecord, node: BrowserNode): Promise<EventDisposition> {
+  private async handleMoved(
+    binding: BindingRecord,
+    node: BrowserNode,
+    oldParentId: string | null,
+  ): Promise<EventDisposition> {
     if (node.parentId == null) return 'ignored';
-    if (!(await this.isManagedScope(binding, node.id))) return 'ignored';
     const mirror = await this.db.localNodes.get([binding.id, node.id]);
+    const nowInScope = await this.isManagedScope(binding, node.parentId);
+    const wasInScope =
+      mirror != null || (oldParentId != null && (await this.isManagedScope(binding, oldParentId)));
+
+    if (!wasInScope && !nowInScope) return 'ignored';
 
     // Expected move (doc 05 §8): match on canonical id + target parent.
     if (mirror?.canonicalId) {
@@ -313,7 +339,111 @@ export class EventProcessor {
       }
     }
 
-    if (!mirror) return 'ignored';
+    // R17 Case 1: Dragged IN from outside this binding's scope (e.g. from an
+    // unmanaged browser folder into a partial sync mount). If the node came
+    // from another active binding, that binding owns the atomic cross-space
+    // transfer (doc 03 §7), so we must not duplicate it as a create here.
+    if (!wasInScope && nowInScope) {
+      if (await this.ownedByOtherBinding(binding.id, node.id, oldParentId)) {
+        return 'ignored';
+      }
+      const parentRef = await this.canonicalParentRef(binding, node.parentId);
+      if (!parentRef) {
+        if (await this.markReconDirtyIfActive(binding, node.id)) return 'local-op';
+        await logDiagnostic(this.db, 'warn', 'event-processor', '拖入节点目标父目录未映射，已跳过', {
+          bindingId: binding.id,
+          node,
+        });
+        return 'ignored';
+      }
+      return this.enqueueDraggedInSubtree(binding, node, parentRef);
+    }
+
+    // R17 Case 2: Dragged OUT of this binding's scope.
+    if (wasInScope && !nowInScope) {
+      if (!mirror) {
+        if (await this.markReconDirtyIfActive(binding, node.id)) return 'local-op';
+        return 'ignored';
+      }
+      if (mirror.canonicalId == null) {
+        // Unsettled local create dragged out of the synced folder: treat like a
+        // local removal from this binding's scope.
+        const queuedCreate = await this.findCreate(binding.id, node.id, 'QUEUED');
+        if (queuedCreate) {
+          await this.db.transaction('rw', [this.db.localNodes, this.db.pendingOps], async () => {
+            await this.db.pendingOps.delete(queuedCreate.opId);
+            await this.deleteMirrorSubtree(binding.id, node.id);
+          });
+          return 'ignored';
+        }
+        const sentCreate = await this.findCreate(binding.id, node.id, 'IN_FLIGHT');
+        if (sentCreate) {
+          await this.queueFollowUp(binding, sentCreate.nodeId, [{ type: 'delete' }], () =>
+            this.deleteMirrorSubtree(binding.id, node.id),
+          );
+          return 'local-op';
+        }
+        await this.deleteMirrorSubtree(binding.id, node.id);
+        return 'ignored';
+      }
+
+      // Cross-space drag (doc 03 §7): moved into another active binding's mount.
+      const cross = await this.crossBindingTarget(binding, node.parentId);
+      if (cross) {
+        await this.db.transaction('rw', [this.db.bindings, this.db.pendingOps], async () => {
+          const b = await this.db.bindings.get(binding.id);
+          if (!b) return;
+          const clientSeq = b.clientSeq + 1;
+          await this.db.pendingOps.add({
+            opId: uuidv7(),
+            bindingId: b.id,
+            clientSeq,
+            baseRevision: b.appliedRevision,
+            status: 'QUEUED',
+            type: 'transfer',
+            nodeId: mirror.canonicalId!,
+            targetSpaceId: cross.binding.spaceId,
+            targetParent: cross.parentRef,
+            browserId: node.id,
+            browserParentId: node.parentId ?? undefined,
+            createdAt: Date.now(),
+          });
+          b.clientSeq = clientSeq;
+          await this.db.bindings.put(b);
+        });
+        return 'local-op';
+      }
+
+      // Moved to an unmanaged folder outside all bindings: delete from this space
+      // while leaving the bookmark intact in its new browser folder (R17).
+      await this.db.transaction('rw', [this.db.bindings, this.db.localNodes, this.db.pendingOps], async () => {
+        const b = await this.db.bindings.get(binding.id);
+        if (!b) return;
+        const clientSeq = b.clientSeq + 1;
+        await this.db.pendingOps.add({
+          opId: uuidv7(),
+          bindingId: b.id,
+          clientSeq,
+          baseRevision: b.appliedRevision,
+          status: 'QUEUED',
+          type: 'delete',
+          nodeId: mirror.canonicalId!,
+          browserId: node.id,
+          createdAt: Date.now(),
+        });
+        await this.deleteMirrorSubtree(binding.id, node.id);
+        b.clientSeq = clientSeq;
+        await this.db.bindings.put(b);
+      });
+      return 'local-op';
+    }
+
+    if (!mirror) {
+      if (await this.markReconDirtyIfActive(binding, node.id)) {
+        return 'local-op';
+      }
+      return 'ignored';
+    }
 
     // The node has no canonical id yet; the outbox create carries it.
     if (mirror.canonicalId == null) {
@@ -341,36 +471,6 @@ export class EventProcessor {
         return 'local-op';
       }
       return 'ignored';
-    }
-
-    // Cross-space drag (doc 03 §7): the new parent lives under another
-    // active binding's mount → the server must move the subtree atomically
-    // (target CREATE fresh ids + source DELETE). No browser delete is made;
-    // mirrors are rebuilt when the transfer is acked.
-    const cross = await this.crossBindingTarget(binding, node.parentId);
-    if (cross) {
-      await this.db.transaction('rw', [this.db.bindings, this.db.pendingOps], async () => {
-        const b = await this.db.bindings.get(binding.id);
-        if (!b) return;
-        const clientSeq = b.clientSeq + 1;
-        await this.db.pendingOps.add({
-          opId: uuidv7(),
-          bindingId: b.id,
-          clientSeq,
-          baseRevision: b.appliedRevision,
-          status: 'QUEUED',
-          type: 'transfer',
-          nodeId: mirror.canonicalId!,
-          targetSpaceId: cross.binding.spaceId,
-          targetParent: cross.parentRef,
-          browserId: node.id,
-          browserParentId: node.parentId ?? undefined,
-          createdAt: Date.now(),
-        });
-        b.clientSeq = clientSeq;
-        await this.db.bindings.put(b);
-      });
-      return 'local-op';
     }
 
     const parentRef = await this.canonicalParentRef(binding, node.parentId);
@@ -407,6 +507,101 @@ export class EventProcessor {
     return 'local-op';
   }
 
+  /**
+   * Queue top-down CREATE ops and provisional mirrors for a node (and its whole
+   * folder subtree, if any) dragged from an unmanaged browser folder into this
+   * binding's scope (R17).
+   */
+  private async enqueueDraggedInSubtree(
+    binding: BindingRecord,
+    rootNode: BrowserNode,
+    rootParentRef: ParentRefWire,
+  ): Promise<EventDisposition> {
+    const rootBeforeId = rootNode.parentId
+      ? await this.nextSiblingCanonicalId(binding, rootNode.parentId, rootNode.index)
+      : null;
+
+    // Collect the entire subtree from the browser BEFORE opening the Dexie tx.
+    const entries: Array<{
+      node: BrowserNode;
+      canonicalId: string;
+      parentRef: ParentRefWire;
+      beforeId: string | null;
+    }> = [];
+    const rootCanonicalId = uuidv7();
+    entries.push({ node: rootNode, canonicalId: rootCanonicalId, parentRef: rootParentRef, beforeId: rootBeforeId });
+
+    const queue: Array<{ browserId: string; canonicalId: string }> =
+      rootNode.type === 'folder' ? [{ browserId: rootNode.id, canonicalId: rootCanonicalId }] : [];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      const children = await this.adapter.getChildren(cur.browserId);
+      for (const child of children) {
+        const childCanonicalId = uuidv7();
+        entries.push({
+          node: child,
+          canonicalId: childCanonicalId,
+          parentRef: { type: 'node', id: cur.canonicalId },
+          beforeId: null,
+        });
+        if (child.type === 'folder') {
+          queue.push({ browserId: child.id, canonicalId: childCanonicalId });
+        }
+      }
+    }
+
+    await this.db.transaction('rw', [this.db.bindings, this.db.localNodes, this.db.pendingOps], async () => {
+      const b = await this.db.bindings.get(binding.id);
+      if (!b) return;
+      for (const item of entries) {
+        b.clientSeq += 1;
+        await this.db.localNodes.put({
+          bindingId: b.id,
+          browserId: item.node.id,
+          canonicalId: null,
+          type: item.node.type,
+          title: item.node.title,
+          url: item.node.url,
+          parentBrowserId: item.node.parentId,
+          position: null,
+        });
+        await this.db.pendingOps.add({
+          opId: uuidv7(),
+          bindingId: b.id,
+          clientSeq: b.clientSeq,
+          baseRevision: b.appliedRevision,
+          status: 'QUEUED',
+          type: 'create',
+          nodeId: item.canonicalId,
+          nodeType: item.node.type,
+          title: item.node.title,
+          url: item.node.url ?? undefined,
+          parent: item.parentRef,
+          beforeId: item.beforeId,
+          browserId: item.node.id,
+          createdAt: Date.now(),
+        });
+      }
+      await this.db.bindings.put(b);
+    });
+    return 'local-op';
+  }
+
+  /** True if another active binding already owns this node or its previous parent. */
+  private async ownedByOtherBinding(
+    bindingId: string,
+    browserId: string,
+    oldParentId: string | null,
+  ): Promise<boolean> {
+    const others = await this.db.bindings.where('state').equals('active').toArray();
+    for (const other of others) {
+      if (other.id === bindingId) continue;
+      if (await this.db.localNodes.get([other.id, browserId])) return true;
+      if (oldParentId && (await this.isManagedScope(other, oldParentId))) return true;
+    }
+    return false;
+  }
+
   // --- removed ---
 
   private async handleRemoved(binding: BindingRecord, node: BrowserNode): Promise<EventDisposition> {
@@ -424,7 +619,7 @@ export class EventProcessor {
         return 'ignored';
       }
     }
-    if (!(await this.isManagedScope(binding, node.id))) return 'ignored';
+    if (!(await this.isManagedScope(binding, node.id, node.parentId))) return 'ignored';
 
     const mirror = await this.db.localNodes.get([binding.id, node.id]);
 
@@ -444,7 +639,12 @@ export class EventProcessor {
       }
     }
 
-    if (!mirror) return 'ignored';
+    if (!mirror) {
+      if (await this.markReconDirtyIfActive(binding, node.id)) {
+        return 'local-op';
+      }
+      return 'ignored';
+    }
 
     // The node has no canonical id yet; the outbox create is what carries it.
     if (mirror.canonicalId == null) {
@@ -553,10 +753,40 @@ export class EventProcessor {
   }
 
   /**
-   * Managed scope check (doc 03): full mode owns the whole profile tree;
-   * partial mode owns the mount folder subtree. Walks up via the mirror.
+   * While a reconciliation session is active (initializing / waiting_user /
+   * resyncing), nodes inside the mounted scope may not yet have mirror rows.
+   * Record their browser ids on the active session so finish() can diff and
+   * queue them once identities are assigned (R32, doc 22 B.12).
    */
-  private async isManagedScope(binding: BindingRecord, browserId: string | null): Promise<boolean> {
+  private async markReconDirtyIfActive(binding: BindingRecord, browserId: string): Promise<boolean> {
+    if (
+      binding.state !== 'initializing' &&
+      binding.state !== 'waiting_user' &&
+      binding.state !== 'resyncing'
+    ) {
+      return false;
+    }
+    const session = await activeReconSession(this.db, binding.id);
+    if (!session) return false;
+    const set = new Set(session.dirtyBrowserIds ?? []);
+    set.add(browserId);
+    session.dirtyBrowserIds = [...set];
+    session.updatedAt = Date.now();
+    await this.db.reconSessions.put(session);
+    return true;
+  }
+
+  /**
+   * Managed scope check (doc 03): full mode owns the whole profile tree;
+   * partial mode owns the mount folder subtree. Walks up via the mirror first
+   * and falls back to live browser ancestry so unmapped nodes touched during
+   * initial sync / waiting_user are still captured (R32).
+   */
+  private async isManagedScope(
+    binding: BindingRecord,
+    browserId: string | null,
+    fallbackParentId: string | null = null,
+  ): Promise<boolean> {
     if (browserId == null) return false;
     if (binding.mount.mode === 'full') return true;
     const mountId = binding.mount.folderBrowserId;
@@ -565,8 +795,20 @@ export class EventProcessor {
     for (let i = 0; i < 64 && cur != null; i++) {
       if (cur === mountId) return true;
       const row: LocalNodeRecord | undefined = await this.db.localNodes.get([binding.id, cur]);
-      if (!row) return false;
-      cur = row.parentBrowserId;
+      if (row) {
+        cur = row.parentBrowserId;
+        continue;
+      }
+      const live = await this.adapter.getNode(cur);
+      if (live) {
+        cur = live.parentId;
+        continue;
+      }
+      if (cur === browserId && fallbackParentId != null) {
+        cur = fallbackParentId;
+        continue;
+      }
+      return false;
     }
     return false;
   }
@@ -579,6 +821,11 @@ export class EventProcessor {
     }
     if (mount.mode === 'full' && mount.roots) {
       for (const [key, browserId] of Object.entries(mount.roots)) {
+        if (browserId === parentBrowserId) return { type: 'root', key };
+      }
+    }
+    if (mount.recoveryFolders) {
+      for (const [key, browserId] of Object.entries(mount.recoveryFolders)) {
         if (browserId === parentBrowserId) return { type: 'root', key };
       }
     }

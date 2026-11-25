@@ -332,4 +332,97 @@ describe('RemoteChangeApplier', () => {
     expect((await findMirrorByCanonical(db, bindingId, 'n-1'))?.position).toBe(0);
     expect((await db.bindings.get(bindingId))?.appliedRevision).toBe(101);
   });
+
+  it('R15: rescues unsettled local creates before applying a remote folder delete', async () => {
+    adapter.seed({ id: 'f1', parentId: '0', title: 'Sync' });
+    adapter.seed({ id: 'dir', parentId: 'f1', title: 'OldFolder' });
+    adapter.seed({ id: 'local-bm', parentId: 'dir', title: 'Offline New', url: 'https://offline.example' });
+    await seedBinding();
+    await db.localNodes.bulkPut([
+      {
+        bindingId, browserId: 'dir', canonicalId: 'n-dir', type: 'folder',
+        title: 'OldFolder', url: null, parentBrowserId: 'f1', position: 0,
+      },
+      {
+        bindingId, browserId: 'local-bm', canonicalId: null, type: 'bookmark',
+        title: 'Offline New', url: 'https://offline.example', parentBrowserId: 'dir', position: null,
+      },
+    ]);
+    await db.pendingOps.add({
+      opId: 'op-local', bindingId, clientSeq: 1, baseRevision: 100, status: 'QUEUED',
+      type: 'create', nodeId: 'n-local', nodeType: 'bookmark', title: 'Offline New',
+      url: 'https://offline.example', parent: { type: 'node', id: 'n-dir' },
+      browserId: 'local-bm', createdAt: Date.now(),
+    });
+
+    await applier.applyChange(bindingId, {
+      revision: 101,
+      type: 'delete',
+      node_id: 'n-dir',
+      payload: { count: 1 },
+    });
+
+    // Folder was deleted, but the unsent local bookmark survived under mount root f1.
+    expect(await adapter.getNode('dir')).toBeNull();
+    const rescued = await adapter.getNode('local-bm');
+    expect(rescued).not.toBeNull();
+    expect(rescued?.parentId).toBe('f1');
+    // Its QUEUED create op was retargeted to root:main so it uploads cleanly.
+    const op = await db.pendingOps.get('op-local');
+    expect(op?.parent).toEqual({ type: 'root', key: 'main' });
+    expect((await db.localNodes.get([bindingId, 'local-bm']))?.parentBrowserId).toBe('f1');
+  });
+
+  it('R15: projects recovered:* root slots into a visible local Recovered folder', async () => {
+    adapter.seed({ id: 'f1', parentId: '0', title: 'Sync' });
+    await seedBinding();
+
+    await applier.applyChange(bindingId, {
+      revision: 101,
+      type: 'create',
+      node_id: 'n-rec',
+      payload: {
+        type: 'bookmark',
+        title: 'Rescued Bookmark',
+        url: 'https://rescued.example',
+        parent: { type: 'root', key: 'recovered:dev-1' },
+        position: 0,
+      },
+    });
+
+    const b = await db.bindings.get(bindingId);
+    const recFolderId = b?.mount.recoveryFolders?.['recovered:dev-1'];
+    expect(recFolderId).toBeTruthy();
+    const recFolder = await adapter.getNode(recFolderId!);
+    expect(recFolder?.title).toBe('Recovered');
+    expect(recFolder?.parentId).toBe('f1');
+    const children = await adapter.getChildren(recFolderId!);
+    expect(children.map((c) => c.title)).toEqual(['Rescued Bookmark']);
+  });
+
+  it('R20: does not adopt a remote create from another device merely by title and url', async () => {
+    adapter.seed({ id: 'f1', parentId: '0', title: 'Sync' });
+    adapter.seed({ id: 'local-b', parentId: 'f1', title: 'GitHub', url: 'https://github.com' });
+    await seedBinding();
+    await db.localNodes.put({
+      bindingId, browserId: 'local-b', canonicalId: null, type: 'bookmark',
+      title: 'GitHub', url: 'https://github.com', parentBrowserId: 'f1', position: null,
+    });
+    await db.pendingOps.add({
+      opId: 'op-local', bindingId, clientSeq: 1, baseRevision: 100, status: 'QUEUED',
+      type: 'create', nodeId: 'local-uuid', nodeType: 'bookmark', title: 'GitHub',
+      url: 'https://github.com', parent: { type: 'root', key: 'main' },
+      browserId: 'local-b', createdAt: Date.now(),
+    });
+
+    // Remote create has a different canonical UUID ('remote-uuid') despite same title+URL.
+    await applier.applyChange(bindingId, createChange(101, 'remote-uuid'));
+
+    // Local bookmark stays unmapped awaiting its own upload; remote bookmark got its own node.
+    expect((await db.localNodes.get([bindingId, 'local-b']))?.canonicalId).toBeNull();
+    const remoteMirror = await findMirrorByCanonical(db, bindingId, 'remote-uuid');
+    expect(remoteMirror).toBeTruthy();
+    expect(remoteMirror?.browserId).not.toBe('local-b');
+    expect(await adapter.getChildren('f1')).toHaveLength(2);
+  });
 });

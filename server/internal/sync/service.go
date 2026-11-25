@@ -312,7 +312,7 @@ func (s *Service) processOperation(ctx context.Context, req SyncRequest, op Oper
 	case OpMove:
 		res, err = s.decideMove(ctx, tx, space, binding, op, origin)
 	case OpDelete:
-		res, err = s.decideDelete(ctx, tx, space, binding, op, origin)
+		res, err = s.decideDelete(ctx, tx, space, binding, op, req.DeviceName, origin)
 	default:
 		res = rejectedResult(op, ReasonInvalidPayload)
 	}

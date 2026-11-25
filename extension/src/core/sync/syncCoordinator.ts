@@ -11,11 +11,13 @@ import {
   collectSubtree,
   logDiagnostic,
   releaseRunLock,
+  renewRunLock,
   isSyncEnabled,
   type BindingRecord,
   type LocalNodeRecord,
   type PontisDB,
   type PendingOpRecord,
+  type SyncNotice,
 } from '../store/db';
 import { uuidv7 } from '../util/ids';
 import {
@@ -34,6 +36,8 @@ export type SyncOutcome = 'synced' | 'needs-recovery' | 'inactive' | 'busy' | 'e
 
 /** Safety valve so a stuck has_more loop can't spin forever. */
 const MAX_ROUNDS_PER_SYNC = 20;
+/** Cap operations per /sync batch to stay well under server batch limits (R21). */
+const MAX_OPS_PER_ROUND = 200;
 
 export class SyncCoordinator {
   constructor(
@@ -60,13 +64,13 @@ export class SyncCoordinator {
       return 'busy';
     }
     try {
-      return await this.rounds(bindingId);
+      return await this.rounds(bindingId, lockToken);
     } finally {
       await releaseRunLock(this.db, bindingId, lockToken);
     }
   }
 
-  private async rounds(bindingId: string): Promise<SyncOutcome> {
+  private async rounds(bindingId: string, lockToken: string): Promise<SyncOutcome> {
     const binding = await this.db.bindings.get(bindingId);
     if (!binding || !(await this.canRun(binding))) return 'inactive';
 
@@ -74,10 +78,13 @@ export class SyncCoordinator {
     await this.applier.recover(bindingId);
 
     for (let round = 0; round < MAX_ROUNDS_PER_SYNC; round++) {
+      // Renew the lease before each round so large catch-up syncs never get
+      // their run lock stolen mid-flight (R24).
+      await renewRunLock(this.db, bindingId, lockToken);
       const b = await this.db.bindings.get(bindingId);
       if (!b || !(await this.canRun(b))) return 'inactive';
 
-      const req = await this.buildRequest(b.id);
+      const { request: req, hasMoreOps } = await this.buildRequest(b.id);
       let resp: SyncResponseWire;
       try {
         resp = await this.transport.sync(b.id, req);
@@ -107,32 +114,59 @@ export class SyncCoordinator {
 
       // Rule 3 (doc 05 §16): persist results + inbox, THEN advance
       // received_revision — all in one transaction.
-      await this.db.transaction('rw', [this.db.bindings, this.db.pendingOps, this.db.remoteChanges], async () => {
-        const current = await this.db.bindings.get(b.id);
-        if (!current) return;
-        if (current.epoch !== resp.epoch) {
-          // Epoch changed behind our back: needs recovery, not replay.
-          current.state = 'needs_recovery';
-          current.recovery = { code: 'EPOCH_MISMATCH', message: 'epoch changed mid-sync' };
+      const notableResults: Array<{ op: PendingOpRecord; result: OperationResultWire }> = [];
+      await this.db.transaction(
+        'rw',
+        [this.db.bindings, this.db.pendingOps, this.db.remoteChanges, this.db.localNodes],
+        async () => {
+          const current = await this.db.bindings.get(b.id);
+          if (!current) return;
+          if (current.epoch !== resp.epoch) {
+            // Epoch changed behind our back: needs recovery, not replay.
+            current.state = 'needs_recovery';
+            current.recovery = { code: 'EPOCH_MISMATCH', message: 'epoch changed mid-sync' };
+            await this.db.bindings.put(current);
+            return;
+          }
+          let latestNotice: SyncNotice | null = null;
+          for (const r of resp.operation_results) {
+            const recorded = await this.recordResult(b.id, r);
+            if (recorded && (r.status === 'REJECTED' || r.status === 'CONFLICT' || r.status === 'RECOVERED')) {
+              notableResults.push({ op: recorded, result: r });
+              latestNotice = noticeForResult(r);
+            }
+          }
+          for (const c of resp.changes) {
+            await this.db.remoteChanges.put({
+              id: `${b.id}:${c.revision}`,
+              bindingId: b.id,
+              revision: c.revision,
+              type: c.type,
+              nodeId: c.node_id,
+              payload: c.payload,
+            });
+          }
+          current.receivedRevision = Math.max(current.receivedRevision, resp.through_revision);
+          if (latestNotice) {
+            current.lastNotice = latestNotice;
+          }
           await this.db.bindings.put(current);
-          return;
-        }
-        for (const r of resp.operation_results) {
-          await this.recordResult(b.id, r);
-        }
-        for (const c of resp.changes) {
-          await this.db.remoteChanges.put({
-            id: `${b.id}:${c.revision}`,
-            bindingId: b.id,
-            revision: c.revision,
-            type: c.type,
-            nodeId: c.node_id,
-            payload: c.payload,
-          });
-        }
-        current.receivedRevision = Math.max(current.receivedRevision, resp.through_revision);
-        await this.db.bindings.put(current);
-      });
+        },
+      );
+
+      // R16: Log non-APPLIED operation outcomes (CONFLICT / RECOVERED / REJECTED)
+      // outside the IDB transaction so users and diagnostics have full visibility.
+      for (const { op, result } of notableResults) {
+        const level = result.status === 'REJECTED' ? 'error' : 'warn';
+        await logDiagnostic(this.db, level, 'coordinator', diagnosticLabelForResult(result), {
+          bindingId: b.id,
+          opId: result.op_id,
+          opType: op.type,
+          nodeId: op.nodeId,
+          status: result.status,
+          reason: result.reason,
+        });
+      }
 
       const afterPersist = await this.db.bindings.get(b.id);
       if (afterPersist && afterPersist.state === 'needs_recovery') return 'needs-recovery';
@@ -172,7 +206,7 @@ export class SyncCoordinator {
       // says is safe (doc 04 §7, doc 22 B.7).
       await this.settlePending(b.id);
 
-      if (!resp.has_more) break;
+      if (!resp.has_more && !hasMoreOps) break;
     }
 
     // Cross-space transfers (doc 03 §7) ride their own endpoint; they are
@@ -217,7 +251,7 @@ export class SyncCoordinator {
     return session != null && (session.phase === 'apply' || session.phase === 'verify');
   }
 
-  private async buildRequest(bindingId: string): Promise<SyncRequestWire> {
+  private async buildRequest(bindingId: string): Promise<{ request: SyncRequestWire; hasMoreOps: boolean }> {
     const b = (await this.db.bindings.get(bindingId))!;
     // An operation that has already been sent keeps its payload forever: the
     // server replays its receipt for the same body and refuses a different one
@@ -235,14 +269,18 @@ export class SyncCoordinator {
     const all = [...outstanding, ...inFlight].sort((x, y) => x.clientSeq - y.clientSeq);
     // Transfer intents never appear as /sync operations.
     const syncOps = all.filter((o): o is PendingOpRecord & { type: OpType } => o.type !== 'transfer');
-    await this.markInFlight(syncOps.map((o) => o.opId));
+    const batch = syncOps.slice(0, MAX_OPS_PER_ROUND);
+    await this.markInFlight(batch.map((o) => o.opId));
     return {
-      protocol_version: SYNC_PROTOCOL_VERSION,
-      epoch: b.epoch,
-      applied_revision: b.appliedRevision,
-      received_revision: b.receivedRevision,
-      operations: syncOps.map(toWire),
-      max_changes: MAX_CHANGES_PER_ROUND,
+      request: {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        epoch: b.epoch,
+        applied_revision: b.appliedRevision,
+        received_revision: b.receivedRevision,
+        operations: batch.map(toWire),
+        max_changes: MAX_CHANGES_PER_ROUND,
+      },
+      hasMoreOps: syncOps.length > batch.length,
     };
   }
 
@@ -356,9 +394,9 @@ export class SyncCoordinator {
     });
   }
 
-  private async recordResult(bindingId: string, r: OperationResultWire): Promise<void> {
+  private async recordResult(bindingId: string, r: OperationResultWire): Promise<PendingOpRecord | undefined> {
     const pending: PendingOpRecord | undefined = await this.db.pendingOps.get(r.op_id);
-    if (!pending) return;
+    if (!pending) return undefined;
     pending.status = 'RESOLVED';
     pending.result = {
       status: r.status,
@@ -367,6 +405,17 @@ export class SyncCoordinator {
       settleAfterRevision: r.settle_after_revision,
     };
     await this.db.pendingOps.put(pending);
+
+    // R16: When a local CREATE is permanently REJECTED, drop its provisional
+    // canonicalId=null mirror row so the browser bookmark is not stranded as an
+    // unmapped orphan whose future edits are silently dropped.
+    if (pending.type === 'create' && r.status === 'REJECTED' && pending.browserId) {
+      const mirror = await this.db.localNodes.get([bindingId, pending.browserId]);
+      if (mirror && mirror.canonicalId == null) {
+        await this.db.localNodes.delete([bindingId, pending.browserId]);
+      }
+    }
+    return pending;
   }
 
   private async settlePending(bindingId: string): Promise<void> {
@@ -383,6 +432,28 @@ export class SyncCoordinator {
       }
     }
   }
+}
+
+function noticeForResult(r: OperationResultWire): SyncNotice {
+  const now = Date.now();
+  if (r.status === 'CONFLICT') {
+    return { level: 'warn', code: r.reason || 'CONFLICT', message: '检测到并发冲突，已以服务端最新状态为准', at: now };
+  }
+  if (r.status === 'RECOVERED') {
+    return { level: 'warn', code: r.reason || 'RECOVERED', message: '部分并发新建已自动保护到 Recovered 目录', at: now };
+  }
+  return {
+    level: 'error',
+    code: r.reason || 'REJECTED',
+    message: r.reason ? `部分本地变更被服务端拒绝（${r.reason}）` : '部分本地变更被服务端拒绝',
+    at: now,
+  };
+}
+
+function diagnosticLabelForResult(r: OperationResultWire): string {
+  if (r.status === 'CONFLICT') return '同步操作发生并发冲突，已保留服务端状态';
+  if (r.status === 'RECOVERED') return '同步操作触发并发数据保护（Recovered）';
+  return '同步操作被服务端拒绝';
 }
 
 function toWire(p: PendingOpRecord & { type: OpType }): OperationWire {

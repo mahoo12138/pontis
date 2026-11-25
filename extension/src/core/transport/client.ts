@@ -214,6 +214,10 @@ export class ApiClient
     return this.request<LoginResult>('/api/v1/auth/login', { method: 'POST', body: { username, password }, serverUrl });
   }
 
+  logout(sessionToken: string, serverUrl?: string): Promise<{ status: string }> {
+    return this.request<{ status: string }>('/api/v1/auth/logout', { method: 'POST', token: sessionToken, serverUrl });
+  }
+
   registerDevice(sessionToken: string, body: { name: string; client_type: string; browser: string; platform: string }, serverUrl?: string): Promise<{ device: DeviceWire; token: string }> {
     return this.request('/api/v1/devices', { method: 'POST', token: sessionToken, body, serverUrl });
   }

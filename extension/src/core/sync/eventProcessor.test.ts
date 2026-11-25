@@ -304,4 +304,40 @@ describe('EventProcessor', () => {
     }
     expect((await db.pendingOps.toArray()).filter((o) => o.status === 'QUEUED')).toHaveLength(3);
   });
+
+  it('R17: queues top-down creates when dragging an unmanaged folder subtree into a partial mount', async () => {
+    adapter.seed({ id: 'unmanaged', parentId: '0', title: 'Other' });
+    adapter.seed({ id: 'f1', parentId: '0', title: 'Sync' });
+    const folder = adapter.seed({ id: 'drag-dir', parentId: 'f1', title: 'Imported' });
+    adapter.seed({ id: 'drag-bm', parentId: 'drag-dir', title: 'Nested', url: 'https://nested.example' });
+    const binding = await seedBinding('f1');
+
+    const disp = await processor.handleEvent(binding.id, { kind: 'moved', node: folder, oldParentId: 'unmanaged' });
+
+    expect(disp).toBe('local-op');
+    const ops = (await db.pendingOps.toArray()).sort((a, b) => a.clientSeq - b.clientSeq);
+    expect(ops).toHaveLength(2);
+    expect(ops[0]).toMatchObject({ type: 'create', nodeType: 'folder', title: 'Imported', parent: { type: 'root', key: 'main' }, browserId: 'drag-dir' });
+    expect(ops[1]).toMatchObject({ type: 'create', nodeType: 'bookmark', title: 'Nested', parent: { type: 'node', id: ops[0]!.nodeId }, browserId: 'drag-bm' });
+  });
+
+  it('R17: queues a delete and drops mirror when dragging a synced node out to an unmanaged folder', async () => {
+    adapter.seed({ id: 'unmanaged', parentId: '0', title: 'Other' });
+    adapter.seed({ id: 'f1', parentId: '0', title: 'Sync' });
+    adapter.seed({ id: 'b1', parentId: 'unmanaged', title: 'Moved Out', url: 'https://out.example' });
+    const binding = await seedBinding('f1');
+    await db.localNodes.put({
+      bindingId, browserId: 'b1', canonicalId: 'n-out', type: 'bookmark',
+      title: 'Moved Out', url: 'https://out.example', parentBrowserId: 'f1', position: 0,
+    });
+
+    const moved = { id: 'b1', parentId: 'unmanaged', title: 'Moved Out', url: 'https://out.example', type: 'bookmark' as const, index: 0 };
+    const disp = await processor.handleEvent(binding.id, { kind: 'moved', node: moved, oldParentId: 'f1' });
+
+    expect(disp).toBe('local-op');
+    const ops = await db.pendingOps.toArray();
+    expect(ops).toHaveLength(1);
+    expect(ops[0]).toMatchObject({ type: 'delete', nodeId: 'n-out' });
+    expect(await db.localNodes.get([bindingId, 'b1'])).toBeUndefined();
+  });
 });

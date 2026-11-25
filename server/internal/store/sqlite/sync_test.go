@@ -524,3 +524,110 @@ func TestSyncUrlUpdateOnFolderRejected(t *testing.T) {
 		t.Fatalf("url on folder = %+v, want REJECTED not_bookmark", res)
 	}
 }
+
+// R15: Deleting a folder concurrently with another device creating a bookmark
+// inside that folder must protect the newly created bookmark regardless of
+// arrival order (Create-then-Delete AND Delete-then-Create), and repeated
+// recoveries on the same device must not fail on EnsureRootSlot.
+func TestSyncDeleteFolderRescuesConcurrentCreatesInBothOrders(t *testing.T) {
+	svc, db, devA := setupSyncTest(t)
+	ctx := context.Background()
+	devSvc := device.NewService(NewDeviceStore(db))
+	devBRec, _, err := devSvc.RegisterDevice(ctx, "u1", "Chrome B", "extension", "chrome", "macos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bB, err := devSvc.BindSpace(ctx, devBRec.ID, canonical.SpaceID("s1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE device_space_bindings SET state = 'active', initialized_at = '2026-01-01T00:00:00Z' WHERE id = ?`, bB.ID); err != nil {
+		t.Fatal(err)
+	}
+	devB := canonical.DeviceID(devBRec.ID)
+
+	main := canonical.NewRootParent("main")
+	seedSystem(t, db,
+		canonical.CreateNode{SpaceID: "s1", NodeID: "dir1", Type: canonical.NodeTypeFolder, Title: "Projects", Parent: main},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "old-bm", Type: canonical.NodeTypeBookmark, Title: "Old", URL: "https://old.example", Parent: canonical.NewNodeParent("dir1")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "dir2", Type: canonical.NodeTypeFolder, Title: "Reading", Parent: main},
+	)
+	// Head is now revision 3. Both devices saw revision 3 before going offline.
+
+	// Order 1 (Create arrives first, Delete arrives second):
+	// Device B creates "NewInDir1" inside dir1 at base=3 -> revision 4.
+	respCreate := mustSync(t, svc, syncReq(string(devB), 1, 3, 3,
+		sync.Operation{
+			OpID: "op-b1", ClientSeq: 1, BaseRevision: 3, Type: sync.OpCreate,
+			NodeID: "new-bm-1", NodeType: canonical.NodeTypeBookmark,
+			Title: "NewInDir1", URL: "https://new1.example", Parent: canonical.NewNodeParent("dir1"),
+		},
+	))
+	if respCreate.OperationResults[0].Status != sync.StatusApplied {
+		t.Fatalf("create in dir1 = %+v, want APPLIED", respCreate.OperationResults[0])
+	}
+
+	// Device A (offline at base=3) deletes dir1. Must rescue new-bm-1 into recovered:<devA>
+	// while deleting dir1 and old-bm!
+	respDel := mustSync(t, svc, syncReq(devA, 1, 3, 3,
+		sync.Operation{
+			OpID: "op-a1", ClientSeq: 1, BaseRevision: 3, Type: sync.OpDelete, NodeID: "dir1",
+		},
+	))
+	resDel := respDel.OperationResults[0]
+	if resDel.Status != sync.StatusRecovered || resDel.Reason != sync.ReasonChildrenRecovered {
+		t.Fatalf("concurrent delete result = %+v, want RECOVERED/children_recovered", resDel)
+	}
+
+	// Verify dir1 & old-bm are gone, while new-bm-1 survived under recovered:<devA>.
+	tx, err := NewStore(db).BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.LoadNode(ctx, "s1", "dir1"); !errors.Is(err, canonical.ErrNodeNotFound) {
+		t.Fatalf("dir1 should be deleted, got err=%v", err)
+	}
+	if _, err := tx.LoadNode(ctx, "s1", "old-bm"); !errors.Is(err, canonical.ErrNodeNotFound) {
+		t.Fatalf("old-bm should be deleted, got err=%v", err)
+	}
+	rescued1, err := tx.LoadNode(ctx, "s1", "new-bm-1")
+	if err != nil {
+		t.Fatalf("new-bm-1 was lost on concurrent folder delete: %v", err)
+	}
+	wantRoot := "recovered:" + string(devA)
+	if rescued1.Parent.Type != canonical.ParentTypeRoot || rescued1.Parent.RootKey != wantRoot {
+		t.Fatalf("rescued1 parent = %+v, want root %q", rescued1.Parent, wantRoot)
+	}
+	_ = tx.Rollback(ctx)
+
+	// Trigger a SECOND recovery on the same device A (dir2) to verify EnsureRootSlot
+	// is idempotent when recovered:<devA> already exists!
+	mustSync(t, svc, syncReq(string(devB), 1, 4, 4,
+		sync.Operation{
+			OpID: "op-b2", ClientSeq: 2, BaseRevision: 3, Type: sync.OpCreate,
+			NodeID: "new-bm-2", NodeType: canonical.NodeTypeBookmark,
+			Title: "NewInDir2", URL: "https://new2.example", Parent: canonical.NewNodeParent("dir2"),
+		},
+	))
+	respDel2 := mustSync(t, svc, syncReq(devA, 1, resDel.ResultRevision, resDel.ResultRevision,
+		sync.Operation{
+			OpID: "op-a2", ClientSeq: 2, BaseRevision: 3, Type: sync.OpDelete, NodeID: "dir2",
+		},
+	))
+	if respDel2.OperationResults[0].Status != sync.StatusRecovered {
+		t.Fatalf("second concurrent delete result = %+v, want RECOVERED", respDel2.OperationResults[0])
+	}
+	tx2, err := NewStore(db).BeginTx(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx2.Rollback(ctx) }()
+	rescued2, err := tx2.LoadNode(ctx, "s1", "new-bm-2")
+	if err != nil {
+		t.Fatalf("new-bm-2 was lost on second concurrent folder delete: %v", err)
+	}
+	if rescued2.Parent.RootKey != wantRoot {
+		t.Fatalf("rescued2 parent = %+v, want root %q", rescued2.Parent, wantRoot)
+	}
+}

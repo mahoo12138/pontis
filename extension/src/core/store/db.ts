@@ -38,6 +38,16 @@ export interface BindingMount {
   rootKey: string;
   /** Full mode: canonical root key → browser root id. */
   roots?: Record<string, string>;
+  /** Recovery root slots (recovered:*) → local browser folder id (R15). */
+  recoveryFolders?: Record<string, string>;
+}
+
+/** User-visible non-fatal sync notice (CONFLICT / REJECTED / RECOVERED, R16). */
+export interface SyncNotice {
+  level: 'warn' | 'error';
+  code: string;
+  message: string;
+  at: number;
 }
 
 export interface BindingRecord {
@@ -56,6 +66,8 @@ export interface BindingRecord {
   mount: BindingMount;
   lastSyncAt: number | null;
   recovery: { code: string; message: string } | null;
+  /** Latest non-fatal conflict, recovery, or rejection surfaced to the user (R16). */
+  lastNotice?: SyncNotice | null;
   createdAt: number;
   /**
    * The user's switch. Absent means enabled, because rows written before the
@@ -200,6 +212,13 @@ export interface ReconProgress {
   applied: number;
 }
 
+export interface SnapshotNodeSummary {
+  type: NodeType;
+  title: string;
+  url: string | null;
+  parentBrowserId: string | null;
+}
+
 export interface ReconSessionRecord {
   id: string;
   bindingId: string;
@@ -230,6 +249,14 @@ export interface ReconSessionRecord {
   issues?: ReconciliationIssueWire[];
   /** Client snapshot local_ref → browser node id, used by the step applier. */
   localRefs?: Record<string, string>;
+  /** Browser node state at client snapshot time, used to detect mid-reconcile edits (R32). */
+  snapshotNodes?: Record<string, SnapshotNodeSummary>;
+  /** Browser node ids touched while the session was active and unmapped (R32). */
+  dirtyBrowserIds?: string[];
+  /** Canonical ids assigned to browser nodes the user deleted during reconciliation (R32). */
+  locallyDeleted?: string[];
+  /** Frozen server snapshot revision (baseline for non-initial sessions, R34). */
+  targetRevision?: number;
   /** Revision the server committed its plan at (the new baseline). */
   commitRevision?: number;
   error?: string;
@@ -469,6 +496,27 @@ export async function releaseRunLock(db: PontisDB, bindingId: string, token: str
     const current = await db.runLocks.get(bindingId);
     if (current?.token === token) await db.runLocks.delete(bindingId);
   });
+}
+
+/**
+ * Extend the run lock lease while a long sync or reconciliation is still
+ * actively making progress (R24). Returns false if another holder already took
+ * over the lock.
+ */
+export async function renewRunLock(
+  db: PontisDB,
+  bindingId: string,
+  token: string,
+  now = Date.now(),
+): Promise<boolean> {
+  let renewed = false;
+  await db.transaction('rw', [db.runLocks], async () => {
+    const current = await db.runLocks.get(bindingId);
+    if (current?.token !== token) return;
+    await db.runLocks.put({ bindingId, token, takenAt: now });
+    renewed = true;
+  });
+  return renewed;
 }
 
 /**
