@@ -94,10 +94,41 @@ func (s *Server) handleEnqueueJob(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	job, err := s.Jobs.Enqueue(r.Context(), jobs.Type(req.Type), canonical.UserID(admin.ID), req.SpaceID, "")
+	def, known := jobs.DefinitionOf(jobs.Type(req.Type))
+	if !known {
+		s.writeError(w, r, http.StatusBadRequest, "INVALID_JOB_TYPE", jobs.ErrUnknownType.Error())
+		return
+	}
+	var owner canonical.UserID
+	if req.SpaceID != "" {
+		sp, err := s.Library.Space(r.Context(), canonical.SpaceID(req.SpaceID))
+		if err != nil {
+			if errors.Is(err, canonical.ErrSpaceNotFound) {
+				s.writeError(w, r, http.StatusNotFound, "SPACE_NOT_FOUND", "unknown space")
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
+			return
+		}
+		// Attribute space-scoped jobs to the space owner so the owner can see
+		// and cancel work running on their space instead of hiding it under admin.
+		owner = sp.OwnerUserID
+	} else if def.UserVisible {
+		s.writeError(w, r, http.StatusBadRequest, "SPACE_REQUIRED", "space_id is required for this job type")
+		return
+	}
+	job, err := s.Jobs.Enqueue(r.Context(), jobs.Type(req.Type), owner, req.SpaceID, "")
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_JOB_TYPE", err.Error())
 		return
+	}
+	if s.Logger != nil {
+		s.Logger.Info("admin enqueued job",
+			"admin_user_id", admin.ID,
+			"job_id", job.ID,
+			"type", string(job.Type),
+			"space_id", job.SpaceID,
+			"owner_user_id", job.OwnerUserID)
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": job.ID, "type": string(job.Type), "status": string(job.Status)})
 }

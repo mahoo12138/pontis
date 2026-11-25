@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,6 +111,7 @@ type Job struct {
 	ProgressTot *int64
 	Attempt     int
 	MaxAttempts int
+	Priority    int
 	CancelRequested bool
 	// ScheduleID / ScheduledFor tie one occurrence to its plan schedule;
 	// the (schedule_id, scheduled_for) unique index makes the scheduler
@@ -137,15 +139,24 @@ type ReportFunc func(phase string, current, total *int64) error
 // Store is the persistence contract.
 type Store interface {
 	Enqueue(ctx context.Context, j Job) error
-	// Claim atomically moves one due job to running with a lease.
-	Claim(ctx context.Context, workerID string, leaseUntil time.Time) (Job, error)
-	// UpdateProgress rewrites phase/progress while running.
-	UpdateProgress(ctx context.Context, id, phase string, current, total *int64) error
-	// Finish marks the terminal state.
-	Finish(ctx context.Context, id string, status Status, jobErr string, at time.Time) error
-	// ScheduleRetry puts a job back to retry_wait with backoff.
-	ScheduleRetry(ctx context.Context, id string, attempt int, nextRunAt time.Time, jobErr string) error
-	// RequestCancel flags cooperative cancellation.
+	// FindActiveByTypeAndSpace returns an already queued/running/retry_wait
+	// job of the same type on the same space so repeated triggers coalesce
+	// instead of stacking duplicate runs (R50).
+	FindActiveByTypeAndSpace(ctx context.Context, t Type, spaceID string) (Job, bool, error)
+	// Claim atomically moves one due job to running with a lease, respecting
+	// optional per-type running concurrency caps and excluding cancelled jobs.
+	Claim(ctx context.Context, workerID string, leaseUntil time.Time, typeLimits map[Type]int) (Job, error)
+	// RenewLease extends a running job's lease only if workerID still owns it.
+	// Returns false when the lease was reclaimed or the job is no longer running.
+	RenewLease(ctx context.Context, id, workerID string, leaseUntil time.Time) (bool, error)
+	// UpdateProgress rewrites phase/progress while running (fenced by workerID when non-empty).
+	UpdateProgress(ctx context.Context, id, workerID, phase string, current, total *int64) error
+	// Finish marks the terminal state (fenced by workerID when non-empty).
+	Finish(ctx context.Context, id, workerID string, status Status, jobErr string, at time.Time) error
+	// ScheduleRetry puts a job back to retry_wait with backoff (fenced by workerID when non-empty).
+	ScheduleRetry(ctx context.Context, id, workerID string, attempt int, nextRunAt time.Time, jobErr string) error
+	// RequestCancel immediately cancels queued/retry_wait jobs via CAS and
+	// flags running jobs for cooperative cancellation (R49).
 	RequestCancel(ctx context.Context, id string, at time.Time) error
 	// Get loads one job.
 	Get(ctx context.Context, id string) (Job, error)
@@ -153,7 +164,8 @@ type Store interface {
 	List(ctx context.Context, limit int) ([]Job, error)
 	// ListByOwner returns one user's recent jobs (user task view).
 	ListByOwner(ctx context.Context, owner string, limit int) ([]Job, error)
-	// RecoverExpiredLeases requeues jobs whose worker died.
+	// RecoverExpiredLeases increments attempts and requeues (or fails poison
+	// pills reaching max_attempts) jobs whose worker lease expired.
 	RecoverExpiredLeases(ctx context.Context, at time.Time) error
 	// EnqueueOccurrence inserts a scheduled occurrence. created=false means
 	// the (schedule_id, scheduled_for) dedupe index absorbed a replay
@@ -170,6 +182,15 @@ type Service struct {
 	handlers map[Type]Handler
 	workers  int
 
+	// LeaseDuration and RenewInterval govern lease heartbeats (R47). Zero
+	// values fall back to 10m and 2m (or LeaseDuration/3 when shortened).
+	LeaseDuration time.Duration
+	RenewInterval time.Duration
+
+	// TypeLimits caps concurrent running jobs per task type so heavy user
+	// tasks (like link checks) never starve system maintenance (R50).
+	TypeLimits map[Type]int
+
 	mu      sync.Mutex
 	started bool
 	cancel  context.CancelFunc
@@ -181,7 +202,40 @@ func NewService(store Store, workers int) *Service {
 	if workers < 1 {
 		workers = 2
 	}
-	return &Service{store: store, handlers: map[Type]Handler{}, workers: workers}
+	return &Service{
+		store:      store,
+		handlers:   map[Type]Handler{},
+		workers:    workers,
+		TypeLimits: map[Type]int{TypeLinkCheck: 1},
+	}
+}
+
+func (s *Service) leaseDuration() time.Duration {
+	if s.LeaseDuration > 0 {
+		return s.LeaseDuration
+	}
+	return 10 * time.Minute
+}
+
+func (s *Service) renewInterval() time.Duration {
+	if s.RenewInterval > 0 {
+		return s.RenewInterval
+	}
+	if s.LeaseDuration > 0 {
+		iv := s.LeaseDuration / 3
+		if iv < 10*time.Millisecond {
+			return 10 * time.Millisecond
+		}
+		return iv
+	}
+	return 2 * time.Minute
+}
+
+func priorityFor(def Definition) int {
+	if !def.UserVisible {
+		return 10 // system maintenance runs ahead of background user tasks
+	}
+	return 0
 }
 
 // Register installs a handler for a job type. Only registry types may be
@@ -194,13 +248,23 @@ func (s *Service) Register(t Type, h Handler) error {
 	return nil
 }
 
-// Enqueue creates a job that is due immediately.
+// Enqueue creates a job that is due immediately. For space-scoped tasks, if an
+// active (queued/running/retry_wait) job of the same type already exists on
+// that space, it returns the existing job instead of stacking duplicates (R50).
 func (s *Service) Enqueue(ctx context.Context, t Type, owner canonical.UserID, spaceID string, payload string) (Job, error) {
-	if _, ok := DefinitionOf(t); !ok {
+	def, ok := DefinitionOf(t)
+	if !ok {
 		return Job{}, ErrUnknownType
 	}
 	if _, ok := s.handlers[t]; !ok {
 		return Job{}, fmt.Errorf("jobs: no handler for %s", t)
+	}
+	if spaceID != "" {
+		if existing, found, err := s.store.FindActiveByTypeAndSpace(ctx, t, spaceID); err != nil {
+			return Job{}, err
+		} else if found {
+			return existing, nil
+		}
 	}
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -215,6 +279,7 @@ func (s *Service) Enqueue(ctx context.Context, t Type, owner canonical.UserID, s
 		SpaceID:     spaceID,
 		Payload:     payload,
 		MaxAttempts: 3,
+		Priority:    priorityFor(def),
 		ScheduledAt: now,
 	}
 	if err := s.store.Enqueue(ctx, j); err != nil {
@@ -228,11 +293,19 @@ func (s *Service) Enqueue(ctx context.Context, t Type, owner canonical.UserID, s
 // scheduler may crash after enqueue but before advancing next_run_at, and
 // the next tick dedupes instead of doubling the occurrence (doc 13 §8).
 func (s *Service) EnqueueForSchedule(ctx context.Context, t Type, owner canonical.UserID, spaceID, scheduleID string, scheduledFor time.Time) (bool, error) {
-	if _, ok := DefinitionOf(t); !ok {
+	def, ok := DefinitionOf(t)
+	if !ok {
 		return false, ErrUnknownType
 	}
 	if _, ok := s.handlers[t]; !ok {
 		return false, fmt.Errorf("jobs: no handler for %s", t)
+	}
+	if spaceID != "" {
+		if _, found, err := s.store.FindActiveByTypeAndSpace(ctx, t, spaceID); err != nil {
+			return false, err
+		} else if found {
+			return false, nil
+		}
 	}
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -246,6 +319,7 @@ func (s *Service) EnqueueForSchedule(ctx context.Context, t Type, owner canonica
 		OwnerUserID:  string(owner),
 		SpaceID:      spaceID,
 		MaxAttempts:  3,
+		Priority:     priorityFor(def),
 		ScheduleID:   scheduleID,
 		ScheduledFor: &scheduledFor,
 		ScheduledAt:  now,
@@ -301,7 +375,7 @@ func (s *Service) workerLoop(ctx context.Context, workerID string) {
 		// Recover leases from dead workers opportunistically.
 		_ = s.store.RecoverExpiredLeases(ctx, time.Now().UTC())
 
-		job, err := s.store.Claim(ctx, workerID, time.Now().UTC().Add(10*time.Minute))
+		job, err := s.store.Claim(ctx, workerID, time.Now().UTC().Add(s.leaseDuration()), s.TypeLimits)
 		switch {
 		case err == nil:
 			s.run(ctx, workerID, job)
@@ -323,25 +397,36 @@ func (s *Service) workerLoop(ctx context.Context, workerID string) {
 func (s *Service) run(ctx context.Context, workerID string, job Job) {
 	handler, ok := s.handlers[job.Type]
 	if !ok {
-		_ = s.store.Finish(ctx, job.ID, StatusFailed, "no handler registered", time.Now().UTC())
+		_ = s.store.Finish(ctx, job.ID, workerID, StatusFailed, "no handler registered", time.Now().UTC())
 		return
 	}
-	// Cancellation-aware context: a watcher polls the cancel flag and
-	// releases cooperative handlers (doc 13 §12).
+	// Cancellation & lease-renewal watcher (doc 13 §9/§12, R47): polls
+	// cooperative cancellation and periodically extends the lease. If the lease
+	// is lost (reclaimed by another worker), runCtx is cancelled immediately.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan struct{})
 	defer close(done)
+	var leaseLost atomic.Bool
 	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
+		cancelTicker := time.NewTicker(200 * time.Millisecond)
+		defer cancelTicker.Stop()
+		renewTicker := time.NewTicker(s.renewInterval())
+		defer renewTicker.Stop()
 		for {
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
+			case <-cancelTicker.C:
 				latest, err := s.store.Get(context.Background(), job.ID)
 				if err == nil && latest.CancelRequested {
+					cancel()
+					return
+				}
+			case <-renewTicker.C:
+				ok, err := s.store.RenewLease(context.Background(), job.ID, workerID, time.Now().UTC().Add(s.leaseDuration()))
+				if err == nil && !ok {
+					leaseLost.Store(true)
 					cancel()
 					return
 				}
@@ -350,9 +435,15 @@ func (s *Service) run(ctx context.Context, workerID string, job Job) {
 	}()
 
 	report := func(phase string, current, total *int64) error {
-		return s.store.UpdateProgress(runCtx, job.ID, phase, current, total)
+		return s.store.UpdateProgress(runCtx, job.ID, workerID, phase, current, total)
 	}
 	err := handler(runCtx, job, report)
+
+	// If another worker already reclaimed the lease, do not overwrite its state
+	// (the SQL writes below are also fenced by worker_id AND status='running').
+	if leaseLost.Load() {
+		return
+	}
 
 	// The terminal write must survive the reason the handler stopped: if the
 	// service is shutting down, its context is already cancelled, and losing
@@ -363,20 +454,20 @@ func (s *Service) run(ctx context.Context, workerID string, job Job) {
 	// Re-read cancel flag: handlers may finish despite a cancel request.
 	latest, gerr := s.store.Get(context.Background(), job.ID)
 	if gerr == nil && latest.CancelRequested {
-		_ = s.store.Finish(settleCtx, job.ID, StatusCancelled, "", time.Now().UTC())
+		_ = s.store.Finish(settleCtx, job.ID, workerID, StatusCancelled, "", time.Now().UTC())
 		return
 	}
 
 	now := time.Now().UTC()
 	switch {
 	case err == nil:
-		_ = s.store.Finish(settleCtx, job.ID, StatusSucceeded, "", now)
+		_ = s.store.Finish(settleCtx, job.ID, workerID, StatusSucceeded, "", now)
 	case errors.Is(err, FatalError):
-		_ = s.store.Finish(settleCtx, job.ID, StatusFailed, err.Error(), now)
+		_ = s.store.Finish(settleCtx, job.ID, workerID, StatusFailed, err.Error(), now)
 	default:
 		attempt := job.Attempt + 1
 		if attempt >= job.MaxAttempts {
-			_ = s.store.Finish(settleCtx, job.ID, StatusFailed, err.Error(), now)
+			_ = s.store.Finish(settleCtx, job.ID, workerID, StatusFailed, err.Error(), now)
 			return
 		}
 		// Bounded exponential backoff, capped at 15 minutes.
@@ -388,13 +479,15 @@ func (s *Service) run(ctx context.Context, workerID string, job Job) {
 				break
 			}
 		}
-		if _, retryable := err.(Retryable); !retryable && !isRetryableKind(err) {
-			_ = s.store.Finish(settleCtx, job.ID, StatusFailed, err.Error(), now)
+		// Server shutdown / context interruption is always retryable so a
+		// rolling upgrade does not turn interrupted maintenance into a failure.
+		interrupted := ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+		if _, retryable := err.(Retryable); !retryable && !isRetryableKind(err) && !interrupted {
+			_ = s.store.Finish(settleCtx, job.ID, workerID, StatusFailed, err.Error(), now)
 			return
 		}
-		_ = s.store.ScheduleRetry(settleCtx, job.ID, attempt, now.Add(backoff), err.Error())
+		_ = s.store.ScheduleRetry(settleCtx, job.ID, workerID, attempt, now.Add(backoff), err.Error())
 	}
-	_ = workerID
 }
 
 // isRetryableKind keeps the default policy: transport-ish failures retry,

@@ -205,44 +205,57 @@ func (s *Service) CheckRun(ctx context.Context, job jobs.Job, report jobs.Report
 		return resumable(ctx, err)
 	}
 
-	results := make(chan LinkResult, len(pending))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, checkConcurrency)
-	for _, it := range pending {
-		if ctx.Err() != nil {
-			break
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(it LinkItem) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
-			defer cancel()
-			out := s.checker(checkCtx, it.URL)
-			if errors.Is(checkCtx.Err(), context.Canceled) {
-				// The job was cancelled or reclaimed mid-flight. This item
-				// has no answer, and storing an invented one would mark it
-				// checked forever instead of resuming it.
+	// Stream results into SQLite as each check completes (R48): start the
+	// bounded dispatcher in its own goroutine so the main goroutine persists
+	// checkpoints and reports progress incrementally instead of waiting until
+	// the entire queue finishes.
+	results := make(chan LinkResult, checkConcurrency*2)
+	go func() {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, checkConcurrency)
+		for _, it := range pending {
+			select {
+			case <-ctx.Done():
+				wg.Wait()
+				close(results)
 				return
+			case sem <- struct{}{}:
 			}
-			results <- LinkResult{
-				NodeID:      it.NodeID,
-				Title:       it.Title,
-				CheckedURL:  it.URL,
-				StatusClass: out.StatusClass,
-				HTTPStatus:  out.HTTPStatus,
-				ErrorType:   out.ErrorType,
-				LatencyMS:   out.LatencyMS,
-				FinalURL:    out.FinalURL,
-				CheckedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+			if ctx.Err() != nil {
+				<-sem
+				break
 			}
-		}(it)
-	}
-	go func() { wg.Wait(); close(results) }()
+			wg.Add(1)
+			go func(it LinkItem) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
+				defer cancel()
+				out := s.checker(checkCtx, it.URL)
+				if errors.Is(checkCtx.Err(), context.Canceled) {
+					// The job was cancelled or reclaimed mid-flight. This item
+					// has no answer, and storing an invented one would mark it
+					// checked forever instead of resuming it.
+					return
+				}
+				results <- LinkResult{
+					NodeID:      it.NodeID,
+					Title:       it.Title,
+					CheckedURL:  it.URL,
+					StatusClass: out.StatusClass,
+					HTTPStatus:  out.HTTPStatus,
+					ErrorType:   out.ErrorType,
+					LatencyMS:   out.LatencyMS,
+					FinalURL:    out.FinalURL,
+					CheckedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+				}
+			}(it)
+		}
+		wg.Wait()
+		close(results)
+	}()
 
-	// One writer: the goroutines above share no state with the run, so there
-	// is no second lock for a reader to disagree with.
+	// One writer: consume results incrementally as they arrive.
 	done := checked
 	for res := range results {
 		// Write without the job's context: a cancellation must not throw away
@@ -574,8 +587,8 @@ func normalizeURL(raw string) (key string, reasons []string) {
 // directly, and each redirect hop is validated again.
 func httpChecker(ob Outbound) LinkChecker {
 	const (
-		maxRedirects  = 5
-		maxResponseKB = 4 << 10
+		maxRedirects     = 5
+		maxResponseBytes = 4 << 10
 	)
 	dialValidated := ob.Dial
 	if dialValidated == nil {
@@ -638,7 +651,7 @@ func httpChecker(ob Outbound) LinkChecker {
 				return 0, "", err
 			}
 			defer resp.Body.Close()
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseKB))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
 			return resp.StatusCode, resp.Request.URL.String(), nil
 		}
 		status, final, err := try("HEAD")

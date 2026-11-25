@@ -100,6 +100,8 @@ var deniedByDefault = mustParseNets(
 	"2002::/16",       // 6to4: embeds an IPv4 address that To4() will not unwrap
 	"2001::/32",       // Teredo: embeds an obfuscated IPv4 address
 	"2001:db8::/32",   // documentation
+	"64:ff9b::/96",    // NAT64 well-known prefix (embeds IPv4)
+	"240.0.0.0/4",     // reserved for future use
 )
 
 func mustParseNets(entries ...string) []*net.IPNet {

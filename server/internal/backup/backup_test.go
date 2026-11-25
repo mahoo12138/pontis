@@ -61,6 +61,14 @@ func (f *fakeTrees) SnapshotTree(_ context.Context, space canonical.SpaceID) (
 	return sp, f.nodes[space], f.slots[space], nil
 }
 
+func (f *fakeTrees) ListSpaceIDs(_ context.Context) ([]string, error) {
+	out := make([]string, 0, len(f.spaces))
+	for id := range f.spaces {
+		out = append(out, string(id))
+	}
+	return out, nil
+}
+
 type fakeStore struct {
 	rows          map[string]Backup
 	insertErr     error
@@ -457,5 +465,60 @@ func TestHumanFilename(t *testing.T) {
 	}
 	if !strings.HasSuffix(long, "-scheduled.json") {
 		t.Fatalf("filename lost its suffix: %q", long)
+	}
+}
+
+// Backup P3: Delete rejects protected backups (ErrProtected); PurgeExpiredSafety
+// preserves the last remaining backup of a space (doc 22 G.6); CreateForJob is
+// idempotent across retries.
+func TestBackupProtectionLastBackupAndIdempotentJobKey(t *testing.T) {
+	trees := newFakeTrees()
+	trees.add("space-1", "Personal", "Payload")
+	store := newFakeStore()
+	svc, _ := newService(t, store, trees)
+	ctx := context.Background()
+
+	// CreateForJob derives id/storage_key from jobID and replays idempotently.
+	j1, err := svc.CreateForJob(ctx, "space-1", KindScheduled, "job-abc")
+	if err != nil {
+		t.Fatalf("CreateForJob 1: %v", err)
+	}
+	j2, err := svc.CreateForJob(ctx, "space-1", KindScheduled, "job-abc")
+	if err != nil {
+		t.Fatalf("CreateForJob 2: %v", err)
+	}
+	if j1.ID != "job-abc" || j1.StorageKey != "job-abc.json" || j2.ID != j1.ID || len(store.rows) != 1 {
+		t.Fatalf("CreateForJob not idempotent: %+v vs %+v (rows=%d)", j1, j2, len(store.rows))
+	}
+
+	// Protected backup refuses deletion until unprotected.
+	if err := svc.SetProtected(ctx, "space-1", j1.ID, true); err != nil {
+		t.Fatalf("protect: %v", err)
+	}
+	if err := svc.Delete(ctx, "space-1", j1.ID); !errors.Is(err, ErrProtected) {
+		t.Fatalf("delete protected err = %v, want ErrProtected", err)
+	}
+	if err := svc.SetProtected(ctx, "space-1", j1.ID, false); err != nil {
+		t.Fatalf("unprotect: %v", err)
+	}
+	if err := svc.Delete(ctx, "space-1", j1.ID); err != nil {
+		t.Fatalf("delete after unprotect: %v", err)
+	}
+
+	// Last remaining backup of a space is never purged by PurgeExpiredSafety (doc 22 G.6).
+	sole, err := svc.Create(ctx, "space-1", KindSafety)
+	if err != nil {
+		t.Fatalf("create sole safety: %v", err)
+	}
+	b := store.rows[sole.ID]
+	b.CreatedAt = time.Now().UTC().Add(-60 * 24 * time.Hour)
+	store.rows[sole.ID] = b
+
+	removed, err := svc.PurgeExpiredSafety(ctx, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("purge sole safety: %v", err)
+	}
+	if removed != 0 || len(store.rows) != 1 {
+		t.Fatalf("PurgeExpiredSafety deleted the last backup: removed=%d rows=%d", removed, len(store.rows))
 	}
 }

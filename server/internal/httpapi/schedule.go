@@ -283,6 +283,8 @@ func (s *Server) writeScheduleError(w http.ResponseWriter, r *http.Request, err 
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_TIME", "time_of_day must be HH:MM")
 	case errors.Is(err, schedule.ErrBadTimezone):
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_TIMEZONE", "unknown timezone")
+	case errors.Is(err, schedule.ErrTooManySchedules):
+		s.writeError(w, r, http.StatusConflict, "TOO_MANY_SCHEDULES", "schedule limit reached")
 	case errors.Is(err, schedule.ErrNoEnqueuer):
 		s.writeError(w, r, http.StatusServiceUnavailable, "SCHEDULER_UNAVAILABLE", "scheduler is not running")
 	default:

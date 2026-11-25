@@ -8,6 +8,10 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
+
+	"pontis/internal/canonical"
+	"pontis/internal/jobs"
 )
 
 // fakeNetwork is the controlled resolver and dialer these tests run on: a
@@ -127,6 +131,8 @@ func TestLinkCheckRefusesInternalAndMalformedTargets(t *testing.T) {
 		{"link-local metadata", "http://169.254.169.254/latest/meta-data/"},
 		{"rfc1918", "http://192.168.1.10/admin"},
 		{"cgnat metadata", "http://100.100.100.200/"},
+		{"nat64 loopback", "http://[64:ff9b::127.0.0.1]/ok"},
+		{"reserved 240/4", "http://240.0.0.1/ok"},
 		{"name resolving private", "http://private.test/ok"},
 		{"mixed dns answer", "http://mixed.test/ok"},
 		{"credentials in url", "http://admin:hunter2@alpha.test/ok"},
@@ -232,4 +238,90 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+type streamingTreeSource struct{ nodes []canonical.Node }
+
+func (s streamingTreeSource) Space(context.Context, canonical.SpaceID) (canonical.SyncSpace, error) {
+	return canonical.SyncSpace{ID: "sp-1"}, nil
+}
+func (s streamingTreeSource) ListNodes(context.Context, canonical.SpaceID) ([]canonical.Node, error) {
+	return s.nodes, nil
+}
+
+type streamingRunStore struct {
+	mu       sync.Mutex
+	items    []LinkItem
+	recorded chan string
+}
+
+func (r *streamingRunStore) SeedRun(_ context.Context, _ string, _ canonical.SpaceID, items []LinkItem, _ time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items = items
+	return nil
+}
+func (r *streamingRunStore) PendingItems(context.Context, string) ([]LinkItem, error) {
+	return r.items, nil
+}
+func (r *streamingRunStore) CountItems(context.Context, string) (int, int, error) {
+	return len(r.items), 0, nil
+}
+func (r *streamingRunStore) RecordResult(_ context.Context, _ string, nodeID string, _ LinkResult) error {
+	r.recorded <- nodeID
+	return nil
+}
+func (r *streamingRunStore) FinishRun(context.Context, string, time.Time) error { return nil }
+func (r *streamingRunStore) LatestRun(context.Context, canonical.SpaceID) (LinkRun, bool, error) {
+	return LinkRun{}, false, nil
+}
+func (r *streamingRunStore) RunItemURLs(context.Context, string) (map[string]string, error) {
+	return nil, nil
+}
+
+// R48: CheckRun persists results incrementally while later items are still
+// queued/blocked, instead of buffering everything until dispatch finishes.
+func TestCheckRunPersistsResultsIncrementallyWhileInFlight(t *testing.T) {
+	nodes := make([]canonical.Node, 0, checkConcurrency+2)
+	for i := 0; i < checkConcurrency+2; i++ {
+		nodes = append(nodes, canonical.Node{
+			ID: canonical.NodeID(fmt.Sprintf("n-%d", i)), Type: canonical.NodeTypeBookmark,
+			Title: fmt.Sprintf("B%d", i), URL: fmt.Sprintf("https://example.test/%d", i),
+		})
+	}
+	releaseSlow := make(chan struct{})
+	runs := &streamingRunStore{recorded: make(chan string, len(nodes))}
+	svc := NewServiceWithChecker(streamingTreeSource{nodes: nodes}, runs, func(ctx context.Context, rawURL string) LinkOutcome {
+		if rawURL == "https://example.test/0" {
+			return LinkOutcome{StatusClass: "ok_2xx", HTTPStatus: 200}
+		}
+		select {
+		case <-releaseSlow:
+		case <-ctx.Done():
+		}
+		return LinkOutcome{StatusClass: "ok_2xx", HTTPStatus: 200}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.CheckRun(context.Background(), jobs.Job{ID: "j-stream", SpaceID: "sp-1"},
+			func(string, *int64, *int64) error { return nil })
+	}()
+
+	// Item 0 MUST be persisted via RecordResult even while the remaining 9 slow
+	// items (more than checkConcurrency=8) are still blocked in flight!
+	select {
+	case id := <-runs.recorded:
+		if id != "n-0" {
+			t.Fatalf("first persisted item = %q, want n-0", id)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseSlow)
+		t.Fatal("CheckRun buffered results instead of streaming persistence while in flight")
+	}
+
+	close(releaseSlow)
+	if err := <-done; err != nil {
+		t.Fatalf("CheckRun error: %v", err)
+	}
 }

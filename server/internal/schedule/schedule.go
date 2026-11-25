@@ -36,8 +36,15 @@ var (
 	ErrBadWeekday    = errors.New("schedule: weekday out of range")
 	ErrBadDayOfMonth = errors.New("schedule: day_of_month out of range")
 	ErrBadTimezone   = errors.New("schedule: unknown timezone")
-	ErrNoEnqueuer    = errors.New("schedule: enqueuer not configured")
-	ErrNoSpace       = errors.New("schedule: space is required for user tasks")
+	ErrNoEnqueuer       = errors.New("schedule: enqueuer not configured")
+	ErrNoSpace          = errors.New("schedule: space is required for user tasks")
+	ErrTooManySchedules = errors.New("schedule: schedule limit reached")
+)
+
+// Quota caps preventing any single user from flooding the scheduler (R50).
+const (
+	MaxSchedulesPerUser  = 20
+	MaxSchedulesPerSpace = 5
 )
 
 // Schedule is one plan task. OwnerUserID empty = system schedule.
@@ -67,7 +74,7 @@ type Store interface {
 	ListDue(ctx context.Context, now time.Time) ([]Schedule, error)
 	Update(ctx context.Context, s Schedule) error
 	Delete(ctx context.Context, id string) error
-	AdvanceNextRun(ctx context.Context, id string, next, lastRun time.Time) error
+	AdvanceNextRun(ctx context.Context, id string, expectedNext, next, lastRun time.Time) error
 	FindByType(ctx context.Context, owner string, t jobs.Type) (Schedule, bool, error)
 }
 
@@ -159,6 +166,24 @@ func (s *Service) Create(ctx context.Context, owner canonical.UserID, p CreatePa
 	if owner != "" && p.SpaceID == "" {
 		return Schedule{}, ErrNoSpace
 	}
+	if owner != "" {
+		existing, err := s.store.ListByOwner(ctx, string(owner))
+		if err != nil {
+			return Schedule{}, err
+		}
+		if len(existing) >= MaxSchedulesPerUser {
+			return Schedule{}, ErrTooManySchedules
+		}
+		perSpace := 0
+		for _, ex := range existing {
+			if ex.SpaceID == p.SpaceID {
+				perSpace++
+			}
+		}
+		if perSpace >= MaxSchedulesPerSpace {
+			return Schedule{}, ErrTooManySchedules
+		}
+	}
 	weekday, dayOfMonth := derefInt(p.Weekday), derefInt(p.DayOfMonth)
 	sched := Schedule{
 		OwnerUserID: string(owner),
@@ -203,7 +228,20 @@ func (s *Service) Update(ctx context.Context, owner canonical.UserID, id string,
 		}
 		sched.Type = p.Type
 	}
-	if p.SpaceID != "" {
+	if p.SpaceID != "" && p.SpaceID != sched.SpaceID {
+		existing, err := s.store.ListByOwner(ctx, string(owner))
+		if err != nil {
+			return Schedule{}, err
+		}
+		perSpace := 0
+		for _, ex := range existing {
+			if ex.ID != sched.ID && ex.SpaceID == p.SpaceID {
+				perSpace++
+			}
+		}
+		if perSpace >= MaxSchedulesPerSpace {
+			return Schedule{}, ErrTooManySchedules
+		}
 		sched.SpaceID = p.SpaceID
 	}
 	if p.Kind != "" {
@@ -329,11 +367,21 @@ func (s *Service) Tick(ctx context.Context, now time.Time) error {
 			ctx, sched.Type, canonical.UserID(sched.OwnerUserID),
 			sched.SpaceID, sched.ID, occurrence)
 		if jerr != nil {
+			// Permanent configuration/schema errors must back off rather than
+			// spinning every 30s tick (R46); transient errors leave next_run_at
+			// intact for immediate retry.
+			if isPermanentEnqueueErr(jerr) {
+				backoff := now.Add(time.Hour)
+				s.logWarn("schedule enqueue permanently rejected; backing off 1h",
+					"schedule_id", sched.ID, "type", string(sched.Type), "err", jerr)
+				_ = s.store.AdvanceNextRun(ctx, sched.ID, occurrence, backoff, occurrence)
+				continue
+			}
 			s.logWarn("schedule enqueue failed; will retry next tick",
 				"schedule_id", sched.ID, "type", string(sched.Type), "err", jerr)
 			continue
 		}
-		if err := s.store.AdvanceNextRun(ctx, sched.ID, next, occurrence); err != nil {
+		if err := s.store.AdvanceNextRun(ctx, sched.ID, occurrence, next, occurrence); err != nil {
 			s.logWarn("schedule advance failed", "schedule_id", sched.ID, "err", err)
 			continue
 		}
@@ -342,6 +390,14 @@ func (s *Service) Tick(ctx context.Context, now time.Time) error {
 			"scheduled_for", occurrence.Format(time.RFC3339), "deduped", !created)
 	}
 	return nil
+}
+
+func isPermanentEnqueueErr(err error) bool {
+	if errors.Is(err, jobs.ErrUnknownType) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no handler") || strings.Contains(msg, "CHECK constraint failed")
 }
 
 func (s *Service) owned(ctx context.Context, owner canonical.UserID, id string) (Schedule, error) {

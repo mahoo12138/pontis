@@ -88,11 +88,14 @@ func (f *fakeStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeStore) AdvanceNextRun(_ context.Context, id string, next, _ time.Time) error {
+func (f *fakeStore) AdvanceNextRun(_ context.Context, id string, expectedNext, next, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if id == f.failAdvID {
 		return errors.New("store unavailable")
+	}
+	if cur, ok := f.nextRun[id]; !ok || !cur.Equal(expectedNext) {
+		return nil
 	}
 	f.nextRun[id] = next
 	f.advance = append(f.advance, id)
@@ -357,5 +360,48 @@ func TestRunNowCarriesSpace(t *testing.T) {
 	plain := NewService(store, nil)
 	if _, err := plain.RunNow(context.Background(), "u1", created.ID); !errors.Is(err, ErrNoEnqueuer) {
 		t.Fatalf("nil enqueuer err = %v", err)
+	}
+}
+
+// R50: per-space and per-user schedule quotas bound scheduler load.
+func TestScheduleQuotaLimits(t *testing.T) {
+	store := newFakeStore()
+	svc := NewService(store, newFakeEnqueuer())
+
+	for i := 0; i < MaxSchedulesPerSpace; i++ {
+		if _, err := svc.Create(context.Background(), "u1", dailyParams()); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+	if _, err := svc.Create(context.Background(), "u1", dailyParams()); !errors.Is(err, ErrTooManySchedules) {
+		t.Fatalf("exceeding per-space limit err = %v, want ErrTooManySchedules", err)
+	}
+}
+
+type permanentFailEnqueuer struct{}
+
+func (permanentFailEnqueuer) Enqueue(context.Context, jobs.Type, canonical.UserID, string, string) (jobs.Job, error) {
+	return jobs.Job{}, jobs.ErrUnknownType
+}
+func (permanentFailEnqueuer) EnqueueForSchedule(context.Context, jobs.Type, canonical.UserID, string, string, time.Time) (bool, error) {
+	return false, jobs.ErrUnknownType
+}
+
+// R46: permanent enqueue rejection backs off next_run_at instead of spinning every tick.
+func TestTickPermanentEnqueueErrorBacksOff(t *testing.T) {
+	store := newFakeStore()
+	svc := NewService(store, permanentFailEnqueuer{})
+	now := time.Now().UTC()
+	due := Schedule{
+		ID: "s-perm", OwnerUserID: "", Type: jobs.TypeActivityGC, Enabled: true,
+		Kind: KindDaily, TimeOfDay: "04:30", Timezone: "UTC",
+		NextRunAt: now.Add(-time.Minute),
+	}
+	_ = store.Insert(context.Background(), due)
+	if err := svc.Tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if !store.nextRun["s-perm"].After(now) {
+		t.Fatalf("permanent failure did not back off next_run_at: %v", store.nextRun["s-perm"])
 	}
 }

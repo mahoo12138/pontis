@@ -106,16 +106,36 @@ func TestScheduleStoreCRUDAndDue(t *testing.T) {
 		t.Fatalf("due after disable = %+v err = %v", due, err)
 	}
 
-	// AdvanceNextRun persists both the next occurrence and last_run_at.
+	// AdvanceNextRun persists both the next occurrence and last_run_at via CAS.
 	next := time.Date(2026, 8, 31, 3, 0, 0, 0, time.UTC)
 	occurrence := time.Date(2026, 8, 30, 3, 0, 0, 0, time.UTC)
-	if err := store.AdvanceNextRun(ctx, "sched-1", next, occurrence); err != nil {
+	// Wrong expectedNext does not clobber the schedule.
+	if err := store.AdvanceNextRun(ctx, "sched-1", occurrence.Add(-time.Hour), next, occurrence); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = store.Get(ctx, "sched-1")
+	if !got.NextRunAt.Equal(occurrence) {
+		t.Fatalf("CAS mismatch overwrote next_run_at: %+v", got)
+	}
+	// Matching expectedNext advances cleanly.
+	if err := store.AdvanceNextRun(ctx, "sched-1", occurrence, next, occurrence); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = store.Get(ctx, "sched-1")
 	if !got.NextRunAt.Equal(next) || got.LastRunAt == nil || !got.LastRunAt.Equal(occurrence) {
 		t.Fatalf("after advance: %+v", got)
 	}
+
+	// Schedule P3: ListDue skips schedules belonging to disabled user accounts.
+	seedExec(t, db, `UPDATE users SET status = 'disabled' WHERE id = 'user-1'`)
+	dueDisabled, err := store.ListDue(ctx, next.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dueDisabled) != 0 {
+		t.Fatalf("disabled user's schedule still due: %+v", dueDisabled)
+	}
+	seedExec(t, db, `UPDATE users SET status = 'active' WHERE id = 'user-1'`)
 
 	// Delete removes the row.
 	if err := store.Delete(ctx, "sched-1"); err != nil {

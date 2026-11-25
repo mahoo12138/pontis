@@ -138,6 +138,8 @@ func (s *Server) writeBackupError(w http.ResponseWriter, r *http.Request, err er
 	switch {
 	case errors.Is(err, backup.ErrNotFound):
 		s.writeError(w, r, http.StatusNotFound, "BACKUP_NOT_FOUND", "unknown backup")
+	case errors.Is(err, backup.ErrProtected):
+		s.writeError(w, r, http.StatusConflict, "BACKUP_PROTECTED", "protected backup must be unprotected before deletion")
 	case errors.Is(err, backup.ErrSpaceMismatch):
 		s.writeError(w, r, http.StatusForbidden, "BACKUP_SPACE_MISMATCH", "backup belongs to another space")
 	case errors.Is(err, backup.ErrInvalidPayload):

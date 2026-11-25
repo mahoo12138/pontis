@@ -69,20 +69,29 @@ func newTestServerWithDB(t *testing.T) (*Server, *httptest.Server, *sql.DB) {
 	jobSvc := jobs.NewService(sqlite.NewJobStore(db), 1)
 	changesetSvc := changeset.NewService(sqlite.NewChangeSetStore(db))
 
+	safetyBackup := func(ctx context.Context, sp canonical.SpaceID) error {
+		_, err := backupSvc.Create(ctx, sp, backup.KindSafety)
+		return err
+	}
+	transferSvc := transfer.NewService(sqlite.NewLibraryStore(db), sqlite.NewStore(db), changesetSvc)
+	transferSvc.SafetyBackup = safetyBackup
+	plazaSvc := plaza.NewService(sqlite.NewPublicationStore(db), library.NewService(sqlite.NewLibraryStore(db), sqlite.NewStore(db), changesetSvc), changesetSvc, sqlite.NewStore(db))
+	plazaSvc.SafetyBackup = safetyBackup
+
 	srv := &Server{
 		Auth:          auth.NewService(sqlite.NewAuthStore(db), 24*time.Hour),
 		Activity:      activity.NewService(sqlite.NewActivityStore(db)),
 		Devices:       device.NewService(sqlite.NewDeviceStore(db)),
 		Spaces:        space.NewService(sqlite.NewSpaceStore(db)),
 		Sync:          sync.NewService(sqlite.NewSyncStore(db), changesetSvc),
-		Reconcile:     reconcile.NewService(sqlite.NewReconcileStore(db)),
+		Reconcile:     reconcile.NewService(sqlite.NewReconcileStore(db), changesetSvc),
 		SpaceTransfer: spacetransfer.NewService(sqlite.NewStore(db), changesetSvc),
 		Library:       library.NewService(sqlite.NewLibraryStore(db), sqlite.NewStore(db), changesetSvc),
 		Changesets:    changesetSvc,
 		Tokens:        token.NewService(sqlite.NewTokenStore(db)),
 		Organizer:     organizer.NewService(sqlite.NewLibraryStore(db), sqlite.NewLinkCheckStore(db), organizer.Outbound{}),
-		Transfer:      transfer.NewService(sqlite.NewLibraryStore(db), sqlite.NewStore(db), changesetSvc),
-		Plaza:         plaza.NewService(sqlite.NewPublicationStore(db), library.NewService(sqlite.NewLibraryStore(db), sqlite.NewStore(db), changesetSvc), changesetSvc, sqlite.NewStore(db)),
+		Transfer:      transferSvc,
+		Plaza:         plazaSvc,
 		Backups:       backupSvc,
 		Accounts:      sqlite.NewAccountStore(db),
 		Jobs:          jobSvc,

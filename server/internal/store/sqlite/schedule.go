@@ -91,11 +91,18 @@ func (s *ScheduleStore) ListByOwner(ctx context.Context, owner string) ([]schedu
 	return out, rows.Err()
 }
 
-// ListDue returns enabled schedules whose next_run_at has passed.
+// ListDue returns enabled schedules whose next_run_at has passed, excluding
+// schedules owned by disabled user accounts (Schedule P3).
 func (s *ScheduleStore) ListDue(ctx context.Context, now time.Time) ([]schedule.Schedule, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+scheduleColumns+` FROM schedules
-		WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at`, formatTime(now))
+		SELECT s.id, COALESCE(s.owner_user_id, ''), COALESCE(s.space_id, ''), s.type, s.enabled,
+		       s.schedule_type, s.schedule_expr, s.timezone, s.next_run_at, s.last_run_at,
+		       s.created_at, s.updated_at
+		FROM schedules s
+		LEFT JOIN users u ON u.id = s.owner_user_id
+		WHERE s.enabled = 1 AND s.next_run_at <= ?
+		  AND (s.owner_user_id IS NULL OR u.status = 'active')
+		ORDER BY s.next_run_at`, formatTime(now))
 	if err != nil {
 		return nil, err
 	}
@@ -129,11 +136,14 @@ func (s *ScheduleStore) Delete(ctx context.Context, id string) error {
 	return err
 }
 
-// AdvanceNextRun persists the next occurrence and the last handled one.
-func (s *ScheduleStore) AdvanceNextRun(ctx context.Context, id string, next, lastRun time.Time) error {
+// AdvanceNextRun persists the next occurrence and the last handled one using
+// CAS on (id, next_run_at, enabled=1) so a concurrent user edit or pause is
+// never overwritten by the scheduler tick (Schedule P3).
+func (s *ScheduleStore) AdvanceNextRun(ctx context.Context, id string, expectedNext, next, lastRun time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE schedules SET next_run_at = ?, last_run_at = ?, updated_at = ?
-		WHERE id = ?`, formatTime(next), formatTime(lastRun), formatTime(time.Now().UTC()), id)
+		WHERE id = ? AND next_run_at = ? AND enabled = 1`,
+		formatTime(next), formatTime(lastRun), formatTime(time.Now().UTC()), id, formatTime(expectedNext))
 	return err
 }
 

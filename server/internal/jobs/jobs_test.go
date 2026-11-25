@@ -141,3 +141,72 @@ func TestCancelIsCooperative(t *testing.T) {
 		return list[0].Status == jobs.StatusCancelled
 	})
 }
+
+// R47: a long-running job renews its lease automatically so a second worker
+// never reclaims and double-executes it past the initial lease window.
+func TestLongRunningJobRenewsLeaseWithoutDoubleRun(t *testing.T) {
+	svc, _ := newTestService(t, 2)
+	svc.LeaseDuration = 250 * time.Millisecond
+	svc.RenewInterval = 70 * time.Millisecond
+
+	runs := 0
+	svc.Register(jobs.TypeBackupCreate, func(ctx context.Context, job jobs.Job, report jobs.ReportFunc) error {
+		runs++
+		select {
+		case <-time.After(650 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	ctx := context.Background()
+	if _, err := svc.Enqueue(ctx, jobs.TypeBackupCreate, "", "s-lease", ""); err != nil {
+		t.Fatal(err)
+	}
+	svc.Start(ctx)
+	defer svc.Stop()
+
+	waitFor(t, 5*time.Second, func() bool {
+		list, _ := svc.List(ctx, 10)
+		return len(list) == 1 && list[0].Status == jobs.StatusSucceeded
+	})
+	if runs != 1 {
+		t.Fatalf("long job ran %d times, want 1 (lease should have renewed)", runs)
+	}
+}
+
+// R49 & R50: cancelling a queued job stops it from ever running, and repeated
+// enqueues for the same (type, space_id) coalesce to the existing active job.
+func TestQueuedCancelNeverRunsAndActiveSpaceJobsDedupe(t *testing.T) {
+	svc, _ := newTestService(t, 1)
+	ran := 0
+	svc.Register(jobs.TypeLinkCheck, func(ctx context.Context, job jobs.Job, report jobs.ReportFunc) error {
+		ran++
+		return nil
+	})
+
+	ctx := context.Background()
+	j1, err := svc.Enqueue(ctx, jobs.TypeLinkCheck, "", "space-dup", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2, err := svc.Enqueue(ctx, jobs.TypeLinkCheck, "", "space-dup", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j1.ID != j2.ID {
+		t.Fatalf("active space jobs did not dedupe: %s vs %s", j1.ID, j2.ID)
+	}
+
+	if err := svc.Cancel(ctx, j1.ID); err != nil {
+		t.Fatal(err)
+	}
+	svc.Start(ctx)
+	defer svc.Stop()
+	time.Sleep(300 * time.Millisecond)
+
+	if ran != 0 {
+		t.Fatalf("cancelled queued job still executed %d times", ran)
+	}
+}

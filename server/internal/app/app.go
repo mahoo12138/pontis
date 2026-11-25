@@ -62,6 +62,11 @@ func Run(ctx context.Context, cfg config.Config) error {
 	if err := sqlite.Migrate(ctx, db); err != nil {
 		return err
 	}
+	readDB, err := sqlite.OpenReadPool(cfg.DatabasePath)
+	if err != nil {
+		return err
+	}
+	defer readDB.Close()
 	logger.Info("database ready", "path", cfg.DatabasePath)
 
 	instanceID, err := sqlite.InstanceID(ctx, db)
@@ -71,7 +76,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 
 	accountStore := sqlite.NewAccountStore(db)
 	deviceStore := sqlite.NewDeviceStore(db)
-	libraryStore := sqlite.NewLibraryStore(db)
+	libraryStore := sqlite.NewLibraryStore(db).WithReadDB(readDB)
+	syncStore := sqlite.NewSyncStore(db).WithReadDB(readDB)
 	canonicalStore := sqlite.NewStore(db)
 	changesetSvc := changeset.NewService(sqlite.NewChangeSetStore(db))
 	backupStore := sqlite.NewBackupStore(db)
@@ -150,6 +156,15 @@ func Run(ctx context.Context, cfg config.Config) error {
 		logger.Info("oidc single sign-on enabled", "issuer", cfg.OIDC.IssuerURL)
 	}
 
+	safetyBackup := func(ctx context.Context, sp canonical.SpaceID) error {
+		_, err := backupSvc.Create(ctx, sp, backup.KindSafety)
+		return err
+	}
+	transferSvc := transfer.NewService(libraryStore, canonicalStore, changesetSvc)
+	transferSvc.SafetyBackup = safetyBackup
+	plazaSvc := plaza.NewService(sqlite.NewPublicationStore(db), library.NewService(libraryStore, canonicalStore, changesetSvc), changesetSvc, canonicalStore)
+	plazaSvc.SafetyBackup = safetyBackup
+
 	api := &httpapi.Server{
 		// Paths the API does not claim are served from the Web dist embedded
 		// in this binary (doc 21 §12: one artifact, no Node on the target).
@@ -161,15 +176,15 @@ func Run(ctx context.Context, cfg config.Config) error {
 		Activity:      activitySvc,
 		Devices:       device.NewService(deviceStore),
 		Spaces:        space.NewService(sqlite.NewSpaceStore(db)),
-		Sync:          sync.NewService(sqlite.NewSyncStore(db), changesetSvc),
-		Reconcile:     reconcile.NewService(sqlite.NewReconcileStore(db)),
+		Sync:          sync.NewService(syncStore, changesetSvc),
+		Reconcile:     reconcile.NewService(sqlite.NewReconcileStore(db), changesetSvc),
 		Library:       library.NewService(libraryStore, canonicalStore, changesetSvc),
 		Changesets:    changesetSvc,
 		Tokens:        token.NewService(tokenStore),
 		Organizer:     organizerSvc,
-		Transfer:      transfer.NewService(libraryStore, canonicalStore, changesetSvc),
+		Transfer:      transferSvc,
 		SpaceTransfer: spacetransfer.NewService(canonicalStore, changesetSvc),
-		Plaza:         plaza.NewService(sqlite.NewPublicationStore(db), library.NewService(libraryStore, canonicalStore, changesetSvc), changesetSvc, canonicalStore),
+		Plaza:         plazaSvc,
 		Backups:       backupSvc,
 		Jobs:          jobSvc,
 		Schedules:     scheduleSvc,
@@ -220,6 +235,9 @@ func Run(ctx context.Context, cfg config.Config) error {
 		Addr:              cfg.Listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)

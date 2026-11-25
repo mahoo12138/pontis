@@ -50,10 +50,10 @@ func TestJobOccurrenceDedupeAndPurge(t *testing.T) {
 	}
 
 	// Purge removes only finished rows past the cutoff.
-	if err := store.Finish(ctx, "job-1", jobs.StatusSucceeded, "", scheduledFor.Add(-91*24*time.Hour)); err != nil {
+	if err := store.Finish(ctx, "job-1", "", jobs.StatusSucceeded, "", scheduledFor.Add(-91*24*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Finish(ctx, "job-3", jobs.StatusSucceeded, "", scheduledFor); err != nil {
+	if err := store.Finish(ctx, "job-3", "", jobs.StatusSucceeded, "", scheduledFor); err != nil {
 		t.Fatal(err)
 	}
 	n, err := store.PurgeFinishedBefore(ctx, scheduledFor.Add(-90*24*time.Hour))
@@ -84,7 +84,7 @@ func TestJobRetryReenqueuesFailedJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Finish(ctx, job.ID, jobs.StatusFailed, "boom", time.Now().UTC()); err != nil {
+	if err := store.Finish(ctx, job.ID, "", jobs.StatusFailed, "boom", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	retried, err := svc.Retry(ctx, job.ID)
@@ -121,7 +121,7 @@ func TestClaimHandsOneJobToOneWorker(t *testing.T) {
 	}
 
 	lease := time.Now().UTC().Add(10 * time.Minute)
-	first, err := store.Claim(ctx, "worker-a", lease)
+	first, err := store.Claim(ctx, "worker-a", lease, nil)
 	if err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestClaimHandsOneJobToOneWorker(t *testing.T) {
 
 	// The second worker's guard loses: it must hear "nothing for me", not a
 	// store failure, and it must not steal the row.
-	if _, err := store.Claim(ctx, "worker-b", lease); !errors.Is(err, jobs.ErrNotFound) {
+	if _, err := store.Claim(ctx, "worker-b", lease, nil); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("contended claim = %v, want ErrNotFound", err)
 	}
 	held, _ := jobLease(t, db, "solo")
@@ -162,10 +162,10 @@ func TestRecoverExpiredLeasesReturnsOnlyExpiredWork(t *testing.T) {
 		}
 	}
 	now := time.Now().UTC()
-	if _, err := store.Claim(ctx, "worker-a", now.Add(-1*time.Minute)); err != nil {
+	if _, err := store.Claim(ctx, "worker-a", now.Add(-1*time.Minute), nil); err != nil {
 		t.Fatalf("claim dead: %v", err)
 	}
-	if _, err := store.Claim(ctx, "worker-b", now.Add(10*time.Minute)); err != nil {
+	if _, err := store.Claim(ctx, "worker-b", now.Add(10*time.Minute), nil); err != nil {
 		t.Fatalf("claim alive: %v", err)
 	}
 
@@ -183,7 +183,7 @@ func TestRecoverExpiredLeasesReturnsOnlyExpiredWork(t *testing.T) {
 	}
 
 	// The recovered job is claimable again, which is the point of the sweep.
-	if _, err := store.Claim(ctx, "worker-c", now.Add(10*time.Minute)); err != nil {
+	if _, err := store.Claim(ctx, "worker-c", now.Add(10*time.Minute), nil); err != nil {
 		t.Fatalf("claiming the recovered job: %v", err)
 	}
 }
@@ -222,11 +222,11 @@ func TestClaimIgnoresWorkThatIsNotDueYet(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	if err := store.ScheduleRetry(ctx, "later", 1, time.Now().UTC().Add(30*time.Minute), "transient"); err != nil {
+	if err := store.ScheduleRetry(ctx, "later", "", 1, time.Now().UTC().Add(30*time.Minute), "transient"); err != nil {
 		t.Fatalf("schedule retry: %v", err)
 	}
 
-	if _, err := store.Claim(ctx, "worker-a", time.Now().UTC().Add(10*time.Minute)); !errors.Is(err, jobs.ErrNotFound) {
+	if _, err := store.Claim(ctx, "worker-a", time.Now().UTC().Add(10*time.Minute), nil); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("claim of work not due = %v, want ErrNotFound", err)
 	}
 	got, err := store.Get(ctx, "later")
@@ -235,5 +235,125 @@ func TestClaimIgnoresWorkThatIsNotDueYet(t *testing.T) {
 	}
 	if got.Status != jobs.StatusRetryWait {
 		t.Fatalf("job status = %s, want it still waiting", got.Status)
+	}
+}
+
+// R46: every registered type in jobs.Definitions (including activity.gc) must
+// enqueue cleanly through real SQLite.
+func TestAllRegistryJobTypesEnqueueThroughSQLite(t *testing.T) {
+	db := openTestDB(t)
+	seedUserAndSpace(t, db)
+	ctx := context.Background()
+	store := NewJobStore(db)
+	now := time.Now().UTC()
+
+	for i, def := range jobs.Definitions {
+		id := "reg-" + string(def.Type)
+		if err := store.Enqueue(ctx, jobs.Job{
+			ID: id, Type: def.Type, Status: jobs.StatusQueued,
+			MaxAttempts: 3, ScheduledAt: now.Add(time.Duration(i) * time.Millisecond),
+		}); err != nil {
+			t.Fatalf("enqueue registry type %q failed: %v", def.Type, err)
+		}
+		got, err := store.Get(ctx, id)
+		if err != nil || got.Type != def.Type {
+			t.Fatalf("get %q = %+v err=%v", def.Type, got, err)
+		}
+	}
+}
+
+// R47, R49, R50, Jobs P3: worker fencing, immediate CAS cancel on queued/retry,
+// per-type concurrency caps, and poison-pill attempt bounding.
+func TestJobFencingCancelTypeCapsAndPoisonPill(t *testing.T) {
+	db := openTestDB(t)
+	seedUserAndSpace(t, db)
+	ctx := context.Background()
+	store := NewJobStore(db)
+	now := time.Now().UTC()
+
+	// R49: cancelling queued or retry_wait immediately sets status='cancelled' and Claim skips it.
+	if err := store.Enqueue(ctx, jobs.Job{
+		ID: "queued-cancel", Type: jobs.TypeBackupCreate, Status: jobs.StatusQueued,
+		OwnerUserID: "user-1", SpaceID: "space-1", MaxAttempts: 3, ScheduledAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestCancel(ctx, "queued-cancel", now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "queued-cancel")
+	if err != nil || got.Status != jobs.StatusCancelled || got.FinishedAt == nil {
+		t.Fatalf("queued cancel = %+v err=%v, want immediate cancelled", got, err)
+	}
+	if _, err := store.Claim(ctx, "w1", now.Add(time.Minute), nil); !errors.Is(err, jobs.ErrNotFound) {
+		t.Fatalf("claim picked up cancelled job: %v", err)
+	}
+
+	// R50: per-type limit caps organizer.link_check at 1 while letting journal.gc claim.
+	if err := store.Enqueue(ctx, jobs.Job{ID: "lc-1", Type: jobs.TypeLinkCheck, MaxAttempts: 3, ScheduledAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Enqueue(ctx, jobs.Job{ID: "lc-2", Type: jobs.TypeLinkCheck, MaxAttempts: 3, ScheduledAt: now.Add(time.Millisecond)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Enqueue(ctx, jobs.Job{ID: "gc-1", Type: jobs.TypeJournalGC, MaxAttempts: 3, Priority: 0, ScheduledAt: now.Add(2 * time.Millisecond)}); err != nil {
+		t.Fatal(err)
+	}
+	limits := map[jobs.Type]int{jobs.TypeLinkCheck: 1}
+	j1, err := store.Claim(ctx, "w1", now.Add(time.Minute), limits)
+	if err != nil || j1.ID != "lc-1" {
+		t.Fatalf("first claim = %+v err=%v", j1, err)
+	}
+	j2, err := store.Claim(ctx, "w2", now.Add(time.Minute), limits)
+	if err != nil || j2.ID != "gc-1" {
+		t.Fatalf("second claim with link_check cap = %+v err=%v, want gc-1", j2, err)
+	}
+
+	// R47: RenewLease succeeds for current holder and fails for stale worker;
+	// stale worker Finish/UpdateProgress are ignored.
+	ok, err := store.RenewLease(ctx, "lc-1", "w1", now.Add(5*time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("owner renew = %v %v", ok, err)
+	}
+	ok, err = store.RenewLease(ctx, "lc-1", "w-stale", now.Add(5*time.Minute))
+	if err != nil || ok {
+		t.Fatalf("stale renew = %v %v, want false", ok, err)
+	}
+	if err := store.Finish(ctx, "lc-1", "w-stale", jobs.StatusFailed, "stale clobber", now); err != nil {
+		t.Fatal(err)
+	}
+	stillRunning, _ := store.Get(ctx, "lc-1")
+	if stillRunning.Status != jobs.StatusRunning {
+		t.Fatalf("stale worker overwrote running job: %+v", stillRunning)
+	}
+
+	// Poison pill: RecoverExpiredLeases increments attempt and marks failed at max_attempts.
+	if err := store.Enqueue(ctx, jobs.Job{ID: "poison", Type: jobs.TypeMailSend, MaxAttempts: 2, ScheduledAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	// Finish lc-1, lc-2, gc-1 so poison is claimed cleanly.
+	_ = store.Finish(ctx, "lc-1", "w1", jobs.StatusSucceeded, "", now)
+	_ = store.Finish(ctx, "gc-1", "w2", jobs.StatusSucceeded, "", now)
+	_ = store.RequestCancel(ctx, "lc-2", now)
+
+	if _, err := store.Claim(ctx, "w-crash-1", now.Add(-time.Second), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverExpiredLeases(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	after1, _ := store.Get(ctx, "poison")
+	if after1.Status != jobs.StatusQueued || after1.Attempt != 1 {
+		t.Fatalf("after 1st lease expiry = %+v, want queued attempt=1", after1)
+	}
+	if _, err := store.Claim(ctx, "w-crash-2", now.Add(-time.Second), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverExpiredLeases(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	after2, _ := store.Get(ctx, "poison")
+	if after2.Status != jobs.StatusFailed || after2.Attempt != 2 {
+		t.Fatalf("after 2nd lease expiry (max_attempts=2) = %+v, want failed attempt=2", after2)
 	}
 }

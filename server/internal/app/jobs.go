@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -33,7 +34,10 @@ func buildJobService(
 	tokens *sqlite.TokenStore,
 ) (*jobs.Service, error) {
 	store := sqlite.NewJobStore(db)
-	svc := jobs.NewService(store, 2)
+	reconcileStore := sqlite.NewReconcileStore(db)
+	// 3 workers with organizer.link_check capped at 1 leaves 2 workers free for
+	// scheduled backups and system maintenance (R50).
+	svc := jobs.NewService(store, 3)
 
 	// session.cleanup: drop expired web sessions, reset tokens and API tokens
 	// that can no longer work, and prune finished job history past the 90-day
@@ -62,8 +66,8 @@ func buildJobService(
 		return nil
 	})
 
-	// backup.create: capture one space's tree. Space comes from the job
-	// row (user schedule/run-now) or payload-free system triggers.
+	// backup.create: capture one space's tree. Storage key is derived from
+	// job.ID so at-least-once retries stay idempotent (doc 13 §10).
 	svc.Register(jobs.TypeBackupCreate, func(ctx context.Context, job jobs.Job, report jobs.ReportFunc) error {
 		if job.SpaceID == "" {
 			return fmt.Errorf("%w: job has no space", jobs.FatalError)
@@ -71,8 +75,11 @@ func buildJobService(
 		if err := report("捕获空间快照", nil, nil); err != nil {
 			return err
 		}
-		b, err := backups.Create(ctx, canonical.SpaceID(job.SpaceID), backup.KindScheduled)
+		b, err := backups.CreateForJob(ctx, canonical.SpaceID(job.SpaceID), backup.KindScheduled, job.ID)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return jobs.Retryable{Err: err}
+			}
 			return fmt.Errorf("%w: %v", jobs.FatalError, err)
 		}
 		return report("备份完成: "+b.Filename, nil, nil)
@@ -111,16 +118,21 @@ func buildJobService(
 		return report("receipts 随 journal floor 一并清理", nil, nil)
 	})
 
-	// artifact.cleanup: purge expired safety backups and reset tokens.
+	// artifact.cleanup: purge expired safety backups and reconciliation
+	// artifacts/snapshots (R36).
 	svc.Register(jobs.TypeArtifactCleanup, func(ctx context.Context, job jobs.Job, report jobs.ReportFunc) error {
-		if err := report("清理 30 天前的安全备份", nil, nil); err != nil {
+		if err := report("清理过期安全备份与对账工件", nil, nil); err != nil {
 			return err
 		}
 		n, err := backups.PurgeExpiredSafety(ctx, 30*24*time.Hour)
 		if err != nil {
 			return err
 		}
-		return report(fmt.Sprintf("artifact 清理完成,移除 %d 份安全备份", n), nil, nil)
+		artRemoved, err := reconcileStore.PurgeExpiredArtifacts(ctx, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		return report(fmt.Sprintf("artifact 清理完成,移除 %d 份安全备份与 %d 条对账工件", n, artRemoved), nil, nil)
 	})
 
 	// backup.retention: keep the newest 10 scheduled backups per space.

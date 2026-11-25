@@ -100,7 +100,25 @@ func applyMigration(ctx context.Context, db *sql.DB, f migrationFile) error {
 		return fmt.Errorf("read migration %s: %w", f.name, err)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	// Follow SQLite's safe table-rebuild protocol: disable foreign keys outside
+	// the transaction on a dedicated connection, run the migration, verify
+	// PRAGMA foreign_key_check inside the transaction, then re-enable foreign
+	// keys. Without this, rebuilding a referenced table (like jobs <- link_check_runs)
+	// fails or cascades deletes on populated databases.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys for %s: %w", f.name, err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA foreign_keys = ON`)
+	}()
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -108,6 +126,21 @@ func applyMigration(ctx context.Context, db *sql.DB, f migrationFile) error {
 
 	if _, err := tx.ExecContext(ctx, string(content)); err != nil {
 		return fmt.Errorf("apply migration %s: %w", f.name, err)
+	}
+	fkRows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("foreign key check %s: %w", f.name, err)
+	}
+	if fkRows.Next() {
+		var tbl, parent string
+		var rowid, fkid any
+		_ = fkRows.Scan(&tbl, &rowid, &parent, &fkid)
+		fkRows.Close()
+		return fmt.Errorf("migration %s violated foreign key on %s -> %s", f.name, tbl, parent)
+	}
+	fkRows.Close()
+	if err := fkRows.Err(); err != nil {
+		return fmt.Errorf("foreign key check %s: %w", f.name, err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,

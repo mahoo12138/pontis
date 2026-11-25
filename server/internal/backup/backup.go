@@ -220,8 +220,23 @@ func NewService(store Store, trees TreeSource, dir string) (*Service, error) {
 	return &Service{store: store, trees: trees, files: dirFiles{dir: dir}}, nil
 }
 
-// Create captures the space's current tree.
+// Create captures the space's current tree under a fresh backup id.
 func (s *Service) Create(ctx context.Context, spaceID canonical.SpaceID, kind Kind) (Backup, error) {
+	return s.createWithID(ctx, spaceID, kind, "")
+}
+
+// CreateForJob captures a backup whose id and storage key are derived from
+// jobID so at-least-once job retries never create duplicate backups (doc 13 §10).
+func (s *Service) CreateForJob(ctx context.Context, spaceID canonical.SpaceID, kind Kind, jobID string) (Backup, error) {
+	if jobID != "" {
+		if existing, err := s.store.Get(ctx, jobID); err == nil && existing.SpaceID == string(spaceID) {
+			return existing, nil
+		}
+	}
+	return s.createWithID(ctx, spaceID, kind, jobID)
+}
+
+func (s *Service) createWithID(ctx context.Context, spaceID canonical.SpaceID, kind Kind, fixedID string) (Backup, error) {
 	sp, nodes, slots, err := s.trees.SnapshotTree(ctx, spaceID)
 	if err != nil {
 		return Backup{}, err
@@ -261,18 +276,22 @@ func (s *Service) Create(ctx context.Context, spaceID canonical.SpaceID, kind Ki
 		}
 	}
 
-	id, err := uuid.NewV7()
-	if err != nil {
-		return Backup{}, err
+	backupID := fixedID
+	if backupID == "" {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return Backup{}, err
+		}
+		backupID = id.String()
 	}
 	now := time.Now().UTC()
 	stamp := now.Format("20060102-150405")
 	b := Backup{
-		ID:            id.String(),
+		ID:            backupID,
 		SpaceID:       string(spaceID),
 		Kind:          kind,
 		Filename:      humanFilename(sp.Name, stamp, kind),
-		StorageKey:    id.String() + ".json",
+		StorageKey:    backupID + ".json",
 		NodeCount:     int64(len(nodes)),
 		BookmarkCount: bookmarks,
 		CreatedAt:     now,
@@ -283,13 +302,18 @@ func (s *Service) Create(ctx context.Context, spaceID canonical.SpaceID, kind Ki
 		return Backup{}, err
 	}
 	b.SizeBytes = int64(len(raw))
-	// The payload is published under this backup's own UUID, so a second
+	// The payload is published under this backup's own key, so a second
 	// space with the same name (or a second click in the same second)
 	// creates a new file instead of overwriting the first one.
 	if err := s.files.Publish(b.StorageKey, raw); err != nil {
 		return Backup{}, err
 	}
 	if err := s.store.Insert(ctx, b); err != nil {
+		if fixedID != "" {
+			if existing, gerr := s.store.Get(ctx, fixedID); gerr == nil && existing.SpaceID == string(spaceID) {
+				return existing, nil
+			}
+		}
 		_ = s.files.Remove(b.StorageKey)
 		return Backup{}, err
 	}
@@ -337,6 +361,9 @@ func (s *Service) Delete(ctx context.Context, spaceID canonical.SpaceID, id stri
 	}
 	if b.SpaceID != string(spaceID) {
 		return ErrSpaceMismatch
+	}
+	if b.Protected {
+		return ErrProtected
 	}
 	// File first, catalog second: when the filesystem refuses (permission,
 	// EBUSY), the row survives and the delete stays retryable instead of
@@ -459,12 +486,18 @@ func (s *Service) PurgeExpiredSafety(ctx context.Context, window time.Duration) 
 		if err != nil {
 			return removed, err
 		}
+		remaining := len(backups)
 		for _, b := range backups {
+			// Never purge the last remaining backup of a space (doc 22 G.6).
+			if remaining <= 1 {
+				break
+			}
 			if b.Kind == KindSafety && !b.Protected && b.CreatedAt.Before(cutoff) {
 				if err := s.Delete(ctx, canonical.SpaceID(sid), b.ID); err != nil {
 					return removed, err
 				}
 				removed++
+				remaining--
 			}
 		}
 	}

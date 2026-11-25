@@ -437,18 +437,28 @@ func TestOverlappingRoundsOfOneBindingApplyOneIntentOnce(t *testing.T) {
 
 	probe := newProbe(t, w)
 	committedElsewhere := false
+	sideDone := make(chan struct{})
 	probe.after("Tx.LoadSpace", func() {
 		if committedElsewhere {
 			return // the interleaving only has to happen once
 		}
 		committedElsewhere = true
-		commitRound(t, w, a, op)
+		// Run the second process concurrently: under _txlock=immediate the
+		// first transaction already holds SQLite's RESERVED write lock, so the
+		// second process serializes cleanly via busy_timeout instead of
+		// self-deadlocking on the same goroutine, and then replays idempotently.
+		go func() {
+			defer close(sideDone)
+			commitRound(t, w, a, op)
+		}()
+		time.Sleep(25 * time.Millisecond)
 	})
 
 	_, err := w.Sync.Sync(context.Background(), req)
 	if !committedElsewhere {
 		t.Fatal("the other round never landed inside the transaction; the overlap was not staged")
 	}
+	<-sideDone
 
 	// The loser of a write race is allowed to fail; what it is not allowed to do
 	// is report success for an intent that is already settled, having decided

@@ -14,20 +14,19 @@ import (
 
 // Open opens (creating if needed) the SQLite database at dbPath with the
 // baseline pragmas from the design docs: WAL journal, foreign keys on,
-// busy timeout and synchronous FULL.
-//
-// A single connection is used to serialize writers and avoid SQLITE_BUSY
-// under the correctness-first V1 policy.
+// busy timeout, synchronous FULL, and IMMEDIATE write transactions so
+// writers serialize cleanly without read-to-write upgrade deadlocks (R22).
 func Open(dbPath string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
 	dsn := "file:" + filepath.ToSlash(dbPath) +
-		"?_pragma=foreign_keys(1)" +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=synchronous(FULL)"
+		"&_pragma=synchronous(FULL)" +
+		"&_txlock=immediate"
 
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
@@ -42,6 +41,32 @@ func Open(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 	return db, nil
+}
+
+// OpenReadPool opens a separate read-only WAL connection pool against an
+// already-initialized SQLite database file so concurrent readers (snapshots,
+// explorer queries, sync pulls) proceed without queuing behind the single
+// writer connection (R22).
+func OpenReadPool(dbPath string) (*sql.DB, error) {
+	dsn := "file:" + filepath.ToSlash(dbPath) +
+		"?mode=ro" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=query_only(1)" +
+		"&_pragma=foreign_keys(1)"
+
+	ro, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite read pool: %w", err)
+	}
+	ro.SetMaxOpenConns(4)
+	ro.SetMaxIdleConns(4)
+	ro.SetConnMaxLifetime(0)
+
+	if err := ro.Ping(); err != nil {
+		ro.Close()
+		return nil, fmt.Errorf("ping sqlite read pool: %w", err)
+	}
+	return ro, nil
 }
 
 // now returns the canonical timestamp format used across the schema

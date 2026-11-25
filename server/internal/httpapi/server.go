@@ -6,10 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
+	"mime"
 	"net/http"
 	"strings"
+	gosync "sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -89,6 +93,11 @@ type Server struct {
 	// InstanceID identifies this server installation across URL changes.
 	InstanceID string
 
+	// AuthRateLimit caps bursts on public auth & pairing endpoints (R21).
+	// Nil lazily initializes the default in-memory token bucket limiter.
+	AuthRateLimit *RateLimiter
+	rateLimitOnce gosync.Once
+
 	Logger *slog.Logger
 }
 
@@ -125,13 +134,28 @@ func currentDevice(r *http.Request) (device.Device, bool) {
 // Router builds the chi router with all routes.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(securityHeadersMiddleware)
+	r.Use(bodyLimitMiddleware)
 
 	r.Get("/api/v1/meta", s.handleMeta)
 
-	// Auth (web session).
-	r.Post("/api/v1/auth/setup", s.handleSetup)
-	r.Post("/api/v1/auth/login", s.handleLogin)
-	r.Post("/api/v1/auth/reset", s.handleResetPassword)
+	// Auth (public browser forms — same-origin enforced to block login/setup CSRF).
+	r.Group(func(r chi.Router) {
+		r.Use(s.requirePublicOrigin(false))
+		r.Post("/api/v1/auth/setup", s.handleSetup)
+		r.With(s.rateLimitPublicAuth).Post("/api/v1/auth/reset", s.handleResetPassword)
+		r.With(s.rateLimitPublicAuth).Post("/api/v1/auth/register", s.handleRegister)
+	})
+
+	// Auth/pairing endpoints also called by the browser extension with
+	// Origin: chrome-extension://... or moz-extension://...
+	r.Group(func(r chi.Router) {
+		r.Use(s.requirePublicOrigin(true), s.rateLimitPublicAuth)
+		r.Post("/api/v1/auth/login", s.handleLogin)
+		// Pairing redemption is public like the login it stands in for: the
+		// redeemer holds no credential yet, just a code shown on a screen.
+		r.Post("/api/v1/devices/pair", s.handlePairWithCode)
+	})
 
 	// OIDC single sign-on. Browser navigations, not API calls: start
 	// redirects to the provider, callback returns with the code and leaves
@@ -142,7 +166,6 @@ func (s *Server) Router() http.Handler {
 	// Public surface for a visitor with no session yet: the login page reads
 	// /system/status to decide between the init and register entry points.
 	r.Get("/api/v1/system/status", s.handleSystemStatus)
-	r.Post("/api/v1/auth/register", s.handleRegister)
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireSession)
 		r.Post("/api/v1/auth/logout", s.handleLogout)
@@ -163,13 +186,19 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/v1/schedules/{scheduleID}/run-now", s.handleRunScheduleNow)
 	})
 
-	// Admin: user management (admin session).
+	// Admin routes: enforced centrally by middleware so a new admin handler
+	// can never omit the role check (R23).
 	r.Group(func(r chi.Router) {
-		r.Use(s.requireSession)
+		r.Use(s.requireSession, s.requireAdminMiddleware)
 		r.Get("/api/v1/admin/users", s.handleListAdminUsers)
 		r.Post("/api/v1/admin/users", s.handleCreateAdminUser)
 		r.Patch("/api/v1/admin/users/{userID}", s.handleUpdateAdminUser)
 		r.Post("/api/v1/admin/users/{userID}/reset-link", s.handleCreateResetLink)
+		r.Patch("/api/v1/settings", s.handleUpdateSettings)
+		r.Get("/api/v1/admin/jobs", s.handleListJobs)
+		r.Post("/api/v1/admin/jobs", s.handleEnqueueJob)
+		r.Post("/api/v1/admin/jobs/{jobID}/cancel", s.handleCancelJob)
+		r.Post("/api/v1/admin/jobs/{jobID}/retry", s.handleRetryJob)
 	})
 
 	// Account management (web session).
@@ -183,11 +212,6 @@ func (s *Server) Router() http.Handler {
 		r.Post("/api/v1/devices/{deviceID}/revoke", s.handleRevokeDevice)
 		r.Delete("/api/v1/devices/{deviceID}", s.handleDeleteDevice)
 		r.Get("/api/v1/settings", s.handleGetSettings)
-		r.Patch("/api/v1/settings", s.handleUpdateSettings)
-		r.Get("/api/v1/admin/jobs", s.handleListJobs)
-		r.Post("/api/v1/admin/jobs", s.handleEnqueueJob)
-		r.Post("/api/v1/admin/jobs/{jobID}/cancel", s.handleCancelJob)
-		r.Post("/api/v1/admin/jobs/{jobID}/retry", s.handleRetryJob)
 		r.Get("/api/v1/tokens", s.handleListTokens)
 		r.Post("/api/v1/tokens", s.handleCreateToken)
 		r.Delete("/api/v1/tokens/{tokenID}", s.handleRevokeToken)
@@ -282,10 +306,6 @@ func (s *Server) Router() http.Handler {
 		// SSO-provisioned account, which has no password).
 		r.Post("/api/v1/devices/pairing-codes", s.handleCreatePairingCode)
 	})
-
-	// Pairing redemption is public like the login it stands in for: the
-	// redeemer holds no credential yet, just a code shown on a screen.
-	r.Post("/api/v1/devices/pair", s.handlePairWithCode)
 
 	// Browsing statistics the extension uploads (core/activity). Ingest is
 	// device-credential territory and writes only the uploader's own rows;
@@ -398,14 +418,38 @@ func requestID(r *http.Request) string {
 // --- shared helpers ---
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	ct := r.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil || mediaType != "application/json" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		_ = json.NewEncoder(w).Encode(errorEnvelope{Error: errorBody{
+			Code:      "UNSUPPORTED_MEDIA_TYPE",
+			Message:   "Content-Type must be application/json",
+			RequestID: requestID(r),
+		}})
+		return false
+	}
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(errorEnvelope{Error: errorBody{
+				Code:      "PAYLOAD_TOO_LARGE",
+				Message:   "request body exceeds limit",
+				RequestID: requestID(r),
+			}})
+			return false
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(errorEnvelope{Error: errorBody{
-			Code:    "INVALID_JSON",
-			Message: err.Error(),
+			Code:      "INVALID_JSON",
+			Message:   err.Error(),
+			RequestID: requestID(r),
 		}})
 		return false
 	}
@@ -453,7 +497,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	user, err := s.Auth.CreateUser(r.Context(), auth.CreateUserParams{
+	user, err := s.Auth.SetupAdmin(r.Context(), auth.CreateUserParams{
 		Username:    req.Username,
 		Password:    req.Password,
 		DisplayName: req.DisplayName,
@@ -510,11 +554,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	user, err := s.Auth.CreateUser(r.Context(), auth.CreateUserParams{
-		Username:    req.Username,
-		Password:    req.Password,
-		DisplayName: req.DisplayName,
-		Email:       req.Email,
+	user, err := s.Auth.CreateMemberUser(r.Context(), auth.CreateUserParams{
+		Username:      req.Username,
+		Password:      req.Password,
+		DisplayName:   req.DisplayName,
+		Email:         req.Email,
+		EmailVerified: false,
 	})
 	if err != nil {
 		s.mapAuthError(w, r, err)
@@ -553,6 +598,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if !decodeJSON(w, r, &req) {
 		return
+	}
+	if req.Username != "" {
+		if ok, retryAfter := s.authLimiter().AllowAccount(req.Username); !ok {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Ceil(retryAfter.Seconds()))))
+			s.writeError(w, r, http.StatusTooManyRequests, "RATE_LIMITED", "too many login attempts for this account")
+			return
+		}
 	}
 
 	// Session token also serves extension pairing (doc 08 §3); clients
@@ -604,6 +656,12 @@ func (s *Server) mapAuthError(w http.ResponseWriter, r *http.Request, err error)
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_USERNAME", "username must be 3-32 chars of [A-Za-z0-9._-]")
 	case errors.Is(err, auth.ErrInvalidPassword):
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_PASSWORD", "password must be at least 8 characters")
+	case errors.Is(err, auth.ErrInvalidEmail):
+		s.writeError(w, r, http.StatusBadRequest, "INVALID_EMAIL", "invalid email address")
+	case errors.Is(err, auth.ErrAlreadyInitialized):
+		s.writeError(w, r, http.StatusConflict, "ALREADY_INITIALIZED", "instance already has an admin")
+	case errors.Is(err, auth.ErrNotInitialized):
+		s.writeError(w, r, http.StatusConflict, "NOT_INITIALIZED", "instance has no admin account yet")
 	case errors.Is(err, auth.ErrUserExists):
 		s.writeError(w, r, http.StatusConflict, "USERNAME_TAKEN", "username already in use")
 	case errors.Is(err, auth.ErrEmailTaken):
@@ -620,6 +678,7 @@ type userResponse struct {
 	Username    string `json:"username"`
 	DisplayName string `json:"display_name"`
 	Email       string `json:"email"`
+	HasPassword bool   `json:"has_password"`
 	Role        string `json:"role"`
 	Status      string `json:"status"`
 	Locale      string `json:"locale"`
@@ -632,6 +691,7 @@ func fromUser(u auth.User) userResponse {
 		Username:    u.Username,
 		DisplayName: u.DisplayName,
 		Email:       u.Email,
+		HasPassword: u.PasswordHash != "",
 		Role:        string(u.Role),
 		Status:      string(u.Status),
 		Locale:      u.Locale,
@@ -646,6 +706,47 @@ type loginResponse struct {
 }
 
 // --- middleware ---
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "same-origin")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requirePublicOrigin blocks cross-site browser POSTs (e.g. text/plain form
+// login CSRF) on unauthenticated state-changing endpoints. When allowExtension
+// is true, browser extension origins are accepted so the extension can pair.
+func (s *Server) requirePublicOrigin(allowExtension bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !isSafeMethod(r.Method) && !s.Deploy.sameOrigin(r) {
+				if !(allowExtension && isExtensionOrigin(r)) {
+					s.writeError(w, r, http.StatusForbidden, "ORIGIN_MISMATCH",
+						"this request did not come from the instance's own origin")
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requireAdminMiddleware enforces admin role at the router level for all admin
+// endpoints.
+func (s *Server) requireAdminMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := requireAdmin(s, w, r); !ok {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // requireSession resolves a web session from the cookie or a Bearer token.
 func (s *Server) requireSession(next http.Handler) http.Handler {

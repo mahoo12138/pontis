@@ -392,6 +392,10 @@ type syncResponseDTO struct {
 	Changes              []changeDTO          `json:"changes"`
 }
 
+// maxSyncOperationsPerBatch bounds one /sync round so a single client cannot
+// hold the SQLite writer transaction indefinitely (R21).
+const maxSyncOperationsPerBatch = 200
+
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	dev, _ := currentDevice(r)
 	bindingID := chi.URLParam(r, "bindingID")
@@ -409,6 +413,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	var dto syncRequestDTO
 	if !decodeJSON(w, r, &dto) {
+		return
+	}
+	if len(dto.Operations) > maxSyncOperationsPerBatch {
+		s.writeError(w, r, http.StatusBadRequest, "TOO_MANY_OPERATIONS", "at most 200 operations per sync request")
 		return
 	}
 
