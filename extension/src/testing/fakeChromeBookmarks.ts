@@ -143,13 +143,24 @@ export function createFakeChromeApi(): FakeChrome {
       guardContents('move', dest);
       const oldParent = node.parentId!;
       const sameParent = oldParent === destination.parentId;
-      const remaining = childrenOf(oldParent).filter((n) => n.id !== id);
+      const oldSiblings = childrenOf(oldParent);
+      const oldIndex = oldSiblings.findIndex((n) => n.id === id);
+      const remaining = oldSiblings.filter((n) => n.id !== id);
       if (!sameParent) remaining.forEach((n, i) => (n.index = i));
       const siblings = sameParent ? remaining : childrenOf(destination.parentId);
-      const at =
-        destination.index == null
-          ? siblings.length
-          : Math.max(0, Math.min(destination.index, siblings.length));
+      let at: number;
+      if (destination.index == null) {
+        at = siblings.length;
+      } else {
+        // Real Chrome bookmarks.move interprets destination.index before removal
+        // for same-parent moves: any target index > oldIndex shifts down by 1
+        // once the item leaves its old slot (so index === oldIndex + 1 is a no-op).
+        let target = destination.index;
+        if (sameParent && target > oldIndex) {
+          target -= 1;
+        }
+        at = Math.max(0, Math.min(target, siblings.length));
+      }
       siblings.splice(at, 0, node);
       siblings.forEach((n, i) => {
         n.index = i;

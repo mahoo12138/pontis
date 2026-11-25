@@ -236,12 +236,18 @@ func TestValidationErrors(t *testing.T) {
 		t.Errorf("parent not folder: err = %v, want ErrParentNotFolder", err)
 	}
 
-	// Empty title.
-	err = e.Execute(context.Background(), store, sysOrigin, canonical.CreateNode{
-		SpaceID: space, NodeID: folder, Type: canonical.NodeTypeFolder, Title: "", Parent: main,
+	// Empty title is valid user data (icon-only bookmarks and untitled folders).
+	emptyBM := canonical.NodeID("empty-bm")
+	mustExec(t, e, store, canonical.CreateNode{
+		SpaceID: space, NodeID: emptyBM, Type: canonical.NodeTypeBookmark, Title: "", URL: "https://icon-only.example", Parent: main,
 	})
-	if !errors.Is(err, canonical.ErrTitleRequired) {
-		t.Errorf("empty title: err = %v, want ErrTitleRequired", err)
+	if got := loadNode(t, store, space, emptyBM); got.Title != "" {
+		t.Errorf("empty-title bookmark = %q, want empty string", got.Title)
+	}
+	mustExec(t, e, store, canonical.UpdateNodeTitle{SpaceID: space, NodeID: emptyBM, Title: "Named"})
+	mustExec(t, e, store, canonical.UpdateNodeTitle{SpaceID: space, NodeID: emptyBM, Title: ""})
+	if got := loadNode(t, store, space, emptyBM); got.Title != "" {
+		t.Errorf("cleared title = %q, want empty string", got.Title)
 	}
 
 	// Bookmark without URL.

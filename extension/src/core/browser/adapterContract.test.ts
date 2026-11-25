@@ -150,6 +150,33 @@ for (const impl of impls) {
       expect((await adapter.getChildren(rootId)).map((n) => n.id)).toContain(b.id);
     });
 
+    it('places same-parent forward moves accurately (adjacent, middle, end, append)', async () => {
+      const { adapter, rootId } = impl.build();
+      const a = await adapter.create(rootId, { title: 'A', url: 'https://a.test' });
+      const b = await adapter.create(rootId, { title: 'B', url: 'https://b.test' });
+      const c = await adapter.create(rootId, { title: 'C', url: 'https://c.test' });
+
+      // Move A directly after B (post-removal index 1). On raw Chrome without
+      // adjustment this was a silent no-op.
+      await adapter.move(a.id, rootId, 1);
+      expect((await adapter.getChildren(rootId)).map((n) => n.title)).toEqual(['B', 'A', 'C']);
+
+      // Move B to the end (post-removal index 2). On raw Chrome without
+      // adjustment this landed before C.
+      await adapter.move(b.id, rootId, 2);
+      expect((await adapter.getChildren(rootId)).map((n) => n.title)).toEqual(['A', 'C', 'B']);
+
+      // Move A to the end via explicit null (append).
+      await adapter.move(a.id, rootId, null);
+      expect((await adapter.getChildren(rootId)).map((n) => n.title)).toEqual(['C', 'B', 'A']);
+
+      // Move C forward across one item to index 1, then move A backward to 0.
+      await adapter.move(c.id, rootId, 1);
+      expect((await adapter.getChildren(rootId)).map((n) => n.title)).toEqual(['B', 'C', 'A']);
+      await adapter.move(a.id, rootId, 0);
+      expect((await adapter.getChildren(rootId)).map((n) => n.title)).toEqual(['A', 'B', 'C']);
+    });
+
     it('creates at an explicit index and appends when omitted', async () => {
       const { adapter, rootId } = impl.build();
       const a = await adapter.create(rootId, { title: 'A', url: 'https://a.test' });
@@ -290,6 +317,23 @@ for (const impl of impls) {
     });
   });
 }
+
+describe('fakeChromeBookmarks same-parent move quirk', () => {
+  it('models real Chrome pre-removal index semantics on raw bookmarks.move', async () => {
+    const chrome = createFakeChromeApi();
+    chrome.seedNode({ id: '0', title: '' });
+    chrome.seedNode({ id: '1', parentId: '0', title: 'Bookmarks Bar', folderType: 'bookmarks-bar' });
+    const a = await chrome.create({ parentId: '1', title: 'A', url: 'https://a.test' });
+    await chrome.create({ parentId: '1', title: 'B', url: 'https://b.test' });
+    await chrome.create({ parentId: '1', title: 'C', url: 'https://c.test' });
+
+    // In real Chrome, moving index 0 to index 1 is a no-op, and index 2 puts A at 1.
+    await chrome.move(a.id, { parentId: '1', index: 1 });
+    expect((await chrome.getChildren('1')).map((n) => n.title)).toEqual(['A', 'B', 'C']);
+    await chrome.move(a.id, { parentId: '1', index: 2 });
+    expect((await chrome.getChildren('1')).map((n) => n.title)).toEqual(['B', 'A', 'C']);
+  });
+});
 
 describe('removeByType', () => {
   it('picks the subtree verb for folders', async () => {

@@ -294,7 +294,9 @@ export default function BookmarkExplorer({
                     onCancel={() => onStartRename(null)}
                   />
                 ) : (
-                  <span className={`${explorerRowTitle} ${explorerRowTitleFolder}`}>{node.title}</span>
+                  <span className={`${explorerRowTitle} ${explorerRowTitleFolder}`}>
+                    {node.title || '（未命名文件夹）'}
+                  </span>
                 )}
                 <span style={{ width: '200px', flexShrink: 0 }} />
                 <span className={explorerRowTime}>{childCount} 项</span>
@@ -314,7 +316,9 @@ export default function BookmarkExplorer({
                     onCancel={() => onStartRename(null)}
                   />
                 ) : (
-                  <span className={explorerRowTitle}>{node.title}</span>
+                  <span className={explorerRowTitle}>
+                    {node.title || extractHost(node.url ?? '') || node.url || '（无标题）'}
+                  </span>
                 )}
                 <span className={explorerRowMeta}>{extractHost(node.url ?? '')}</span>
                 <span className={explorerRowTime}>{formatShortTime(node.updated_at)}</span>

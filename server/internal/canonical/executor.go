@@ -124,9 +124,6 @@ func (e *Executor) apply(ctx context.Context, tx Tx, cmd Command, origin Origin)
 }
 
 func (e *Executor) create(ctx context.Context, tx Tx, c CreateNode, origin Origin) error {
-	if c.Title == "" {
-		return ErrTitleRequired
-	}
 	if err := checkTypeURL(c.Type, c.URL); err != nil {
 		return err
 	}
@@ -202,9 +199,6 @@ func (e *Executor) updateTitle(ctx context.Context, tx Tx, c UpdateNodeTitle, or
 	}
 	if _, err := tx.LoadNode(ctx, c.SpaceID, c.NodeID); err != nil {
 		return err
-	}
-	if c.Title == "" {
-		return ErrTitleRequired
 	}
 	rev, err := tx.AllocateRevision(ctx, c.SpaceID)
 	if err != nil {

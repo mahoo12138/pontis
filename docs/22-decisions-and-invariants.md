@@ -85,6 +85,24 @@
 
 将来若因别的原因升级，顺序是 7→8（低风险、React 18 下可做）→ React 19 → 8→9。
 
+### 空标题书签与文件夹（2026-11-25，R14）
+
+**决策：空标题（`""`）是合法的用户数据，Canonical Executor 与同步协议原样保留，不拒绝也不静默改写；Web 界面在展示层按 host / URL 或占位文案兜底。**
+
+浏览器书签栏中“仅显示图标”的空标题书签非常常见，未命名文件夹亦受浏览器支持。此前 Canonical Executor 拒绝 `Title == ""`，导致含空标题书签的 Profile 在首次对账 commit 阶段 500、增量改名为空被静默丢弃。允许空标题后，浏览器快照、增量同步、HTML 导入导出与 Web 端保持双向无损一致。
+
+### 映射丢失恢复（Mapping-Lost Recovery）中的仅本地节点（2026-11-25，R30）
+
+**决策：Recovery 会话服务端不修改 Canonical Tree，也不为浏览器独有节点分配伪造的 `canonical_id`；步骤执行完成后，客户端将仍未建立映射的本地节点作为普通 `CREATE` 操作入队，通过后续增量 `/sync` 上传并获得正式规范身份。**
+
+此前服务端 `StrategyPreserve` 为 `SourceOnly` 节点预分配随机 UUID 并发出 `assign_identity`，却在 `Commit` 时故意跳过写入 Canonical Tree，导致浏览器独有书签被贴上服务端不存在的伪 ID，后续任何修改或移动都会触发 `NODE_NOT_FOUND` 且永远无法上传。明确将 `StrategyPreserve` 的 `SourceOnly` 节点标记为 `LocalOnly`（不下发 `assign_identity`，且不作为 `before_id` 锚点），由客户端在 `finish()` 后统一走标准 `CREATE` 管线上传，同时保留尚未采纳的已有出箱 `CREATE`，避免重复创建与数据丢失。
+
+### 删除目录与同子树并发新建的对称保护（2026-11-25，R15）
+
+**决策：删除目录与并发新建无论哪一方先到达服务端，新数据都不得静默丢失；服务端 `decideDelete` 在删除目录前将 `created_revision > op.BaseRevision` 且非同绑定因果前驱的新建子节点移入 `recovered:<device>` 根槽，客户端 `applyDelete` 在递归删除前抢救未上传的本地新建节点，同时客户端必须将 `recovered:*` 根槽投影为挂载目录下的可见 `Recovered` 文件夹。**
+
+此前仅在“先删后建”时触发 `decideCreate` 恢复，若“先建后删”则 `decideDelete` 直接递归删除整个目录，违背不变量 B.10；客户端此前也将 `recovered:*` 当作 `excluded` 静默丢弃，导致被服务端抢救的数据在浏览器不可见。双向对称抢救与可见投影后，任意同步时序下离线新建书签均可完整保留并被用户看到。
+
 ## B. Sync Invariants
 
 1. Canonical State + Revision + Journal + Receipt 必须原子提交。

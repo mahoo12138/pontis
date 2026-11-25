@@ -98,7 +98,25 @@ export function createChromiumAdapter(api: ChromeBookmarksApi): BrowserAdapter {
       await api.update(id, changes);
     },
     move: async (id, parentId, index) => {
-      await api.move(id, { parentId, index: index ?? undefined });
+      let destIndex: number | undefined;
+      if (index != null) {
+        const current = await getNode(id);
+        if (current && current.parentId === parentId) {
+          // Chrome's bookmarks.move interprets destination.index BEFORE removing
+          // the moved item when staying inside the same parent. Core callers
+          // pass the post-removal final index, so forward moves shift by +1.
+          const rawSiblings = await api.getChildren(parentId);
+          const maxPost = Math.max(0, rawSiblings.length - 1);
+          const postIndex = Math.max(0, Math.min(index, maxPost));
+          destIndex = postIndex > current.index ? postIndex + 1 : postIndex;
+        } else {
+          destIndex = Math.max(0, index);
+        }
+      }
+      await api.move(id, {
+        parentId,
+        ...(destIndex == null ? {} : { index: destIndex }),
+      });
     },
     removeBookmark: async (id) => {
       await api.remove(id);

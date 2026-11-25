@@ -52,7 +52,9 @@ export default function Inspector({ node, onClose, onCopyUrl }: InspectorProps) 
         </ActionIcon>
       </div>
 
-      <Field label="名称">{node.title}</Field>
+      <Field label="名称">
+        {node.title || (isFolder ? '（未命名文件夹）' : extractHost(node.url ?? '') || node.url || '（无标题）')}
+      </Field>
 
       {!isFolder && node.url && (
         <>
