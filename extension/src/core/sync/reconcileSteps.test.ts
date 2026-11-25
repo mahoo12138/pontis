@@ -226,3 +226,58 @@ describe('identity steps', () => {
     expect((await db.localNodes.toArray()).map((r) => [r.browserId, r.canonicalId])).toEqual([['f1', 'root']]);
   });
 });
+
+describe('crash resume & placement invariants (R37)', () => {
+  it('R37: adopts an unmapped orphan browser node matching a provisional create expectation on resume', async () => {
+    // Simulate a crash right after adapter.create() succeeded and BEFORE localNodes was written.
+    const orphan = adapter.seed({ id: 'b-orphan', parentId: 'f1', title: 'ServerBook', url: 'https://srv.example' });
+    await db.expectedMutations.add({
+      bindingId,
+      revision: 0,
+      kind: 'create',
+      canonicalId: 'n-srv',
+      browserId: null,
+      parentBrowserId: 'f1',
+      position: null,
+      title: 'ServerBook',
+      url: 'https://srv.example',
+      createdAt: Date.now(),
+    });
+
+    await applyReconcileSteps(db, adapter, scope, [
+      {
+        kind: 'create',
+        canonical_id: 'n-srv',
+        type: 'bookmark',
+        title: 'ServerBook',
+        url: 'https://srv.example',
+        parent: ROOT,
+      },
+    ]);
+
+    // Must adopt the existing orphan rather than creating a duplicate bookmark.
+    const matches = (await adapter.getChildren('f1')).filter((c) => c.title === 'ServerBook');
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.id).toBe(orphan.id);
+    expect((await db.localNodes.get([bindingId, orphan.id]))?.canonicalId).toBe('n-srv');
+    expect(await db.expectedMutations.count()).toBe(0);
+  });
+
+  it('places a moved sibling directly BEFORE before_id even when currently after it', async () => {
+    await mirror({ browserId: 'b1', canonicalId: 'n1', title: 'Home' });
+    await mirror({ browserId: 'b2', canonicalId: 'n2', title: 'Docs' });
+
+    // Current order: [b1 (n1), b2 (n2), f3]. Move b2 BEFORE n1 -> [b2, b1, f3].
+    await applyReconcileSteps(db, adapter, scope, [
+      { kind: 'move', local_ref: 'l_3', parent: ROOT, before_id: 'n1' },
+    ]);
+    expect((await adapter.getChildren('f1')).map((c) => c.id)).toEqual(['b2', 'b1', 'f3']);
+
+    // Replaying the same move step must now recognize b2 is already placed before n1.
+    const callsAfterFirst = adapter.calls.length;
+    await applyReconcileSteps(db, adapter, scope, [
+      { kind: 'move', local_ref: 'l_3', parent: ROOT, before_id: 'n1' },
+    ]);
+    expect(adapter.calls.length).toBe(callsAfterFirst);
+  });
+});

@@ -322,12 +322,18 @@ func (s *DeviceStore) ListBindingsByDevice(ctx context.Context, deviceID string)
 }
 
 // RevokeBinding resets one binding to pending_initial with both watermarks at
-// zero: the next initial reconciliation starts from scratch. The space, its
-// journal and max_client_seq stay as they are — the sequence is a per-binding
-// monotonic counter, and recycling it would let a new operation look like an
-// old, already-receipted one.
+// zero and atomically closes any open reconciliation session on that binding
+// (R35, R36). The space, its journal and max_client_seq stay as they are — the
+// sequence is a per-binding monotonic counter, and recycling it would let a
+// new operation look like an old, already-receipted one.
 func (s *DeviceStore) RevokeBinding(ctx context.Context, bindingID string, at time.Time) error {
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
 		UPDATE device_space_bindings
 		SET state = 'pending_initial', applied_revision = 0, received_revision = 0,
 		    last_sync_at = NULL, updated_at = ?
@@ -342,7 +348,10 @@ func (s *DeviceStore) RevokeBinding(ctx context.Context, bindingID string, at ti
 	if n == 0 {
 		return device.ErrBindingNotFound
 	}
-	return nil
+	if err := failOpenSessionsTx(ctx, tx, bindingID, at); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateBindingSync advances the binding watermarks of one epoch.

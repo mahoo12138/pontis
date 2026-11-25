@@ -47,20 +47,31 @@ func DeriveClientSteps(client *Tree, desired *DesiredTree, policy Policy, resolv
 
 	steps := make([]Step, 0, len(desired.Nodes))
 
-	// assign_identity for every desired node the browser already holds
-	// under a local ref. Fresh server-side nodes arrive via create steps.
+	// assign_identity for every desired canonical node the browser already
+	// holds under a client local_ref. Resolve through `resolver` (so full
+	// resync resolves via client canonical_id → local_ref rather than server
+	// UUIDs), skip local-only preserved nodes that have no canonical identity
+	// on the server (R29, R30), and skip nodes whose mapping is already known.
 	for _, container := range desired.Containers() {
 		for _, id := range desired.Children(container) {
 			d := desired.Nodes[id]
-			if d.SourceRef == "" {
+			if d.LocalOnly {
 				continue
 			}
-			if cn, exists := idx.byRef[d.SourceRef]; exists && cn.CanonicalID == d.ID {
+			localRef := resolver.currentRef(d)
+			if localRef == "" {
+				continue
+			}
+			cn, exists := idx.byRef[localRef]
+			if !exists {
+				continue
+			}
+			if cn.CanonicalID == d.ID {
 				continue // mapping already known to the client
 			}
 			steps = append(steps, Step{
 				Kind:        StepAssignIdentity,
-				LocalRef:    d.SourceRef,
+				LocalRef:    localRef,
 				CanonicalID: d.ID,
 			})
 		}
@@ -75,8 +86,8 @@ func DeriveClientSteps(client *Tree, desired *DesiredTree, policy Policy, resolv
 
 	// Coalesce the split field updates of one node into a single step.
 	// canonicalByRef helps the client resolve a step's node: a local ref
-	// that carries a known canonical id, a source-linked desired node, or
-	// a node this very plan created (identified by its canonical id).
+	// that carries a known canonical id, a mapped desired node, or a node
+	// this very plan created (identified by its canonical id).
 	canonicalByRef := map[string]string{}
 	for _, node := range client.Nodes {
 		if node.CanonicalID != "" {
@@ -84,8 +95,13 @@ func DeriveClientSteps(client *Tree, desired *DesiredTree, policy Policy, resolv
 		}
 	}
 	for _, d := range desired.Nodes {
-		if d.SourceRef != "" {
-			canonicalByRef[d.SourceRef] = d.ID
+		if d.LocalOnly {
+			continue
+		}
+		if localRef := resolver.currentRef(d); localRef != "" {
+			if _, exists := idx.byRef[localRef]; exists {
+				canonicalByRef[localRef] = d.ID
+			}
 		}
 	}
 	canonicalFor := func(ref string) string {

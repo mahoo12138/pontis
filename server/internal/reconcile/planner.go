@@ -20,7 +20,8 @@ type canonicalIdentity struct {
 	byCID map[string]string
 }
 
-// newCanonicalIdentity indexes the current tree by canonical identity.
+// newCanonicalIdentity indexes the current tree by canonical identity, falling
+// back to node.Ref for canonical server trees where ref == canonical id.
 func newCanonicalIdentity(current *Tree) canonicalIdentity {
 	byCID := map[string]string{}
 	for _, node := range current.Nodes {
@@ -32,6 +33,20 @@ func newCanonicalIdentity(current *Tree) canonicalIdentity {
 			cid = node.Ref
 		}
 		byCID[cid] = node.Ref
+	}
+	return canonicalIdentity{byCID: byCID}
+}
+
+// newClientCanonicalIdentity indexes a client snapshot strictly by declared
+// CanonicalID so unmapped browser-local refs (l_1, l_2, ...) can never collide
+// with canonical node ids.
+func newClientCanonicalIdentity(current *Tree) canonicalIdentity {
+	byCID := map[string]string{}
+	for _, node := range current.Nodes {
+		if node.Type == NodeRoot || node.CanonicalID == "" {
+			continue
+		}
+		byCID[node.CanonicalID] = node.Ref
 	}
 	return canonicalIdentity{byCID: byCID}
 }
@@ -143,6 +158,9 @@ func BuildPlan(current *Tree, desired *DesiredTree, policy Policy, resolver iden
 			anchor := ""
 			for j := i + 1; j < len(order); j++ {
 				succ := order[j]
+				if desired.Nodes[succ].LocalOnly {
+					continue
+				}
 				if created[succ] || memberHere[succ] {
 					anchor = succ
 					break
@@ -165,6 +183,9 @@ func BuildPlan(current *Tree, desired *DesiredTree, policy Policy, resolver iden
 
 	// --- updates ---
 	for id, d := range desired.Nodes {
+		if d.LocalOnly {
+			continue
+		}
 		cur, ok := desiredToCur[id]
 		if !ok {
 			continue
@@ -298,15 +319,21 @@ func BuildPlan(current *Tree, desired *DesiredTree, policy Policy, resolver iden
 			}
 		}
 		for _, id := range movers {
+			d := desired.Nodes[id]
+			if d.LocalOnly {
+				continue
+			}
 			before := ""
-			if i := desiredIndex[id]; i+1 < len(order) {
-				before = order[i+1]
+			for k := desiredIndex[id] + 1; k < len(order); k++ {
+				if !desired.Nodes[order[k]].LocalOnly {
+					before = order[k]
+					break
+				}
 			}
 			nodeID := desiredToCur[id]
 			if nodeID == "" {
 				nodeID = id // freshly created in this plan
 			}
-			d := desired.Nodes[id]
 			p.Operations = append(p.Operations, Primitive{
 				Kind:      KindMove,
 				NodeID:    nodeID,

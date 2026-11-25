@@ -68,6 +68,11 @@ type DesiredNode struct {
 	Title     string
 	URL       string
 	SourceRef string // source tree linkage; empty for kept target-only nodes
+	// LocalOnly marks a browser-only node preserved during a non-mutating
+	// recovery (StrategyPreserve). It stays in the desired tree so the client
+	// planner never deletes it from the browser, but carries no server-side
+	// canonical identity and receives no assign_identity step (R30).
+	LocalOnly bool
 }
 
 // DesiredTree is the post-reconciliation state of the target space. Root
@@ -85,46 +90,74 @@ func (d *DesiredTree) Children(container string) []string { return d.Order[conta
 type IDGenerator func() (string, error)
 
 // applyDecisions folds user decisions into the match result so that a
-// decided ambiguous node follows the same path as a matched one. Only
-// decisions offered by an ambiguity are accepted; the caller validated
-// choice semantics at the service boundary.
+// decided ambiguous node follows the same path as a matched one. An explicit
+// empty choice ("") or "duplicate" resolves the ambiguity as the safe default
+// (unmatched / duplicate create) and removes it from Ambiguous. When a folder
+// ambiguity is resolved to a target folder, its children are recursively
+// matched so its contents are not duplicated (R31, R33).
 func applyDecisions(m *MatchResult, decisions Decisions) error {
 	if len(decisions) == 0 || len(m.Ambiguous) == 0 {
 		return nil
 	}
-	kept := m.Ambiguous[:0]
-	for _, a := range m.Ambiguous {
-		choice, ok := decisions[a.SourceRef]
-		if !ok || choice == "" {
-			kept = append(kept, a)
-			continue
-		}
-		valid := false
-		for _, c := range a.Candidates {
-			if c == choice {
-				valid = true
-				break
+	srcIdx, err := m.Source.index()
+	if err != nil {
+		return err
+	}
+	tgtIdx, err := m.Target.index()
+	if err != nil {
+		return err
+	}
+
+	// Loop until a pass resolves no further ambiguities (resolving a folder
+	// may surface child ambiguities that the caller also answered).
+	for {
+		pending := m.Ambiguous
+		m.Ambiguous = nil
+		kept := make([]Ambiguity, 0, len(pending))
+		progressed := false
+
+		for _, a := range pending {
+			choice, ok := decisions[a.SourceRef]
+			if !ok {
+				kept = append(kept, a)
+				continue
+			}
+			progressed = true
+			if choice == "" || choice == "duplicate" {
+				// Explicit safe default: treat as source-only (duplicate create).
+				continue
+			}
+			valid := false
+			for _, c := range a.Candidates {
+				if c == choice {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				return ErrDecisionInvalid
+			}
+			// Target must not already be claimed by another source node.
+			if claim, taken := m.ByTarget[choice]; taken && claim != a.SourceRef {
+				return ErrDecisionInvalid
+			}
+			m.link(a.SourceRef, choice)
+			// Match children of a newly paired folder so its contents merge
+			// instead of being duplicated (R33).
+			if sn := srcIdx.byRef[a.SourceRef]; sn.Type == NodeFolder {
+				m.matchChildren(srcIdx, tgtIdx, a.SourceRef, choice)
 			}
 		}
-		if !valid {
-			return ErrDecisionInvalid
-		}
-		// Target must not already be claimed by another source node.
-		if claim, taken := m.ByTarget[choice]; taken && claim != a.SourceRef {
-			return ErrDecisionInvalid
-		}
-		m.BySource[a.SourceRef] = choice
-		m.ByTarget[choice] = a.SourceRef
-		m.Pairs = append(m.Pairs, Pair{SourceRef: a.SourceRef, TargetRef: choice})
-		// Remove from the target-only set: it is matched now.
-		for i, t := range m.TargetOnly {
-			if t == choice {
-				m.TargetOnly = append(m.TargetOnly[:i], m.TargetOnly[i+1:]...)
-				break
-			}
+
+		// Any new child ambiguities added by matchChildren sit in m.Ambiguous.
+		newlyFound := m.Ambiguous
+		m.Ambiguous = append(kept, newlyFound...)
+		if !progressed || len(newlyFound) == 0 {
+			break
 		}
 	}
-	m.Ambiguous = kept
+
+	m.classify(srcIdx, tgtIdx)
 	return nil
 }
 
@@ -278,6 +311,10 @@ func BuildDesired(m *MatchResult, policy Policy, decisions Decisions, newID IDGe
 			Title:     sn.Title,
 			URL:       sn.URL,
 			SourceRef: sn.Ref,
+			// In StrategyPreserve (mapping-lost recovery), the server commits
+			// no canonical creates; unmatched browser nodes stay local-only so
+			// the client neither deletes them nor assigns them phantom UUIDs.
+			LocalOnly: policy.Strategy == StrategyPreserve,
 		}
 		d.Order[container] = append(d.Order[container], id)
 		for _, sc := range srcIdx.children[sn.Ref] {

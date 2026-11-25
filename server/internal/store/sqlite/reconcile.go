@@ -111,52 +111,137 @@ func (s *ReconcileStore) GetActiveSession(ctx context.Context, bindingID string)
 	return sess, true, nil
 }
 
-// UpdateSessionSnapshot records the client snapshot artifact.
+// UpdateSessionSnapshot records the client snapshot artifact. Conditional on
+// the session still being open in phase 'collecting' (R35).
 func (s *ReconcileStore) UpdateSessionSnapshot(ctx context.Context, id, phase string, clientArtifactID string, sourceEpoch, sourceRevision int64, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE reconciliations SET phase = ?, client_snapshot_artifact_id = ?,
 		       source_epoch = ?, source_revision = ?, updated_at = ?
-		WHERE id = ?`, phase, clientArtifactID, sourceEpoch, sourceRevision, formatTime(at), id)
-	return err
+		WHERE id = ? AND server_committed = 0 AND state IN ('running', 'waiting_user') AND phase = 'collecting'`,
+		phase, clientArtifactID, sourceEpoch, sourceRevision, formatTime(at), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return reconcile.ErrInvalidSessionState
+	}
+	return nil
 }
 
-// UpdateSessionPlan records the computed plan and steps artifacts.
+// UpdateSessionPlan records the computed plan and steps artifacts. Conditional
+// on the session still being open and uncommitted so a concurrent commit or
+// unbind cannot be overwritten by a late replan/decide (R35).
 func (s *ReconcileStore) UpdateSessionPlan(ctx context.Context, id, state, phase, planArtifactID, stepsArtifactID, planHash string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE reconciliations SET state = ?, phase = ?, plan_artifact_id = ?,
 		       steps_artifact_id = ?, plan_hash = ?, updated_at = ?
-		WHERE id = ?`, state, phase, planArtifactID, stepsArtifactID, planHash, formatTime(at), id)
-	return err
+		WHERE id = ? AND server_committed = 0 AND state IN ('running', 'waiting_user')`,
+		state, phase, planArtifactID, stepsArtifactID, planHash, formatTime(at), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return reconcile.ErrInvalidSessionState
+	}
+	return nil
 }
 
-// FailOpenSessions closes every session a binding still has open. A device
-// that unbound lost the replica its session was building, so the session can
-// no longer be resumed by anything.
-func (s *ReconcileStore) FailOpenSessions(ctx context.Context, bindingID string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE reconciliations SET state = ?, phase = '', completed_at = ?, updated_at = ?
+// failOpenSessionsTx marks every open reconciliation of bindingID failed and
+// purges its frozen snapshots and artifacts inside an existing transaction
+// (R35, R36).
+func failOpenSessionsTx(ctx context.Context, tx *sql.Tx, bindingID string, at time.Time) error {
+	rows, err := tx.QueryContext(ctx, sessionColumns+`
+		WHERE binding_id = ? AND state IN (?, ?)`,
+		bindingID, string(reconcile.StateRunning), string(reconcile.StateWaitingUser))
+	if err != nil {
+		return err
+	}
+	var open []reconcile.Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		open = append(open, sess)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE reconciliations
+		SET state = ?, phase = '',
+		    client_snapshot_artifact_id = NULL,
+		    server_snapshot_artifact_id = NULL,
+		    plan_artifact_id = NULL,
+		    steps_artifact_id = NULL,
+		    completed_at = ?, updated_at = ?
 		WHERE binding_id = ? AND state IN (?, ?)`,
 		string(reconcile.StateFailed), formatTime(at), formatTime(at), bindingID,
-		string(reconcile.StateRunning), string(reconcile.StateWaitingUser))
-	return err
+		string(reconcile.StateRunning), string(reconcile.StateWaitingUser)); err != nil {
+		return err
+	}
+	for _, sess := range open {
+		if err := purgeSessionArtifactsTx(ctx, tx, sess); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// MarkSessionCommitted flips server_committed inside the commit
-// transaction.
+// FailOpenSessions closes every session a binding still has open and releases
+// its stored artifacts. A device that unbound lost the replica its session was
+// building, so the session can no longer be resumed by anything.
+func (s *ReconcileStore) FailOpenSessions(ctx context.Context, bindingID string, at time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := failOpenSessionsTx(ctx, tx, bindingID, at); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// MarkSessionCommitted flips server_committed inside the commit transaction
+// and clears waiting_user so a concurrent decide cannot slip past commit (R35).
 func (t *reconcileTx) MarkSessionCommitted(ctx context.Context, id string, commitRevision int64, at time.Time) error {
-	_, err := t.tx.ExecContext(ctx, `
-		UPDATE reconciliations SET server_committed = 1, commit_revision = ?,
+	res, err := t.tx.ExecContext(ctx, `
+		UPDATE reconciliations SET state = ?, server_committed = 1, commit_revision = ?,
 		       phase = ?, updated_at = ?
-		WHERE id = ?`, commitRevision, reconcile.PhaseCommitted, formatTime(at), id)
-	return err
+		WHERE id = ? AND server_committed = 0 AND state IN ('running', 'waiting_user') AND phase = 'planned'`,
+		string(reconcile.StateRunning), commitRevision, reconcile.PhaseCommitted, formatTime(at), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return reconcile.ErrInvalidSessionState
+	}
+	return nil
 }
 
-// CompleteSession closes the session inside the completion transaction.
+// CompleteSession closes the session inside the completion transaction and
+// clears its artifact references so Purging them leaves no dangling IDs (R35, R36).
 func (t *reconcileTx) CompleteSession(ctx context.Context, id string, at time.Time) error {
-	_, err := t.tx.ExecContext(ctx, `
-		UPDATE reconciliations SET state = ?, phase = '', completed_at = ?, updated_at = ?
-		WHERE id = ?`, string(reconcile.StateCompleted), formatTime(at), formatTime(at), id)
-	return err
+	res, err := t.tx.ExecContext(ctx, `
+		UPDATE reconciliations
+		SET state = ?, phase = '',
+		    client_snapshot_artifact_id = NULL,
+		    server_snapshot_artifact_id = NULL,
+		    plan_artifact_id = NULL,
+		    steps_artifact_id = NULL,
+		    completed_at = ?, updated_at = ?
+		WHERE id = ? AND server_committed = 1 AND state IN ('running', 'waiting_user')`,
+		string(reconcile.StateCompleted), formatTime(at), formatTime(at), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return reconcile.ErrSessionSuperseded
+	}
+	return nil
 }
 
 // --- artifacts ---
@@ -217,6 +302,106 @@ func (s *ReconcileStore) GetArtifact(ctx context.Context, id string) (reconcile.
 	return scanArtifact(s.db.QueryRowContext(ctx, `
 		SELECT id, binding_id, kind, epoch, revision, storage_key, content, checksum, size_bytes, expires_at, created_at
 		FROM sync_artifacts WHERE id = ?`, id))
+}
+
+// DeleteArtifact removes one artifact row.
+func (s *ReconcileStore) DeleteArtifact(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sync_artifacts WHERE id = ?`, id)
+	return err
+}
+
+func (t *reconcileTx) DeleteArtifact(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := t.tx.ExecContext(ctx, `DELETE FROM sync_artifacts WHERE id = ?`, id)
+	return err
+}
+
+func (t *reconcileTx) DeleteServerSnapshot(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := t.tx.ExecContext(ctx, `DELETE FROM server_snapshots WHERE id = ?`, id)
+	return err
+}
+
+func purgeSessionArtifactsTx(ctx context.Context, tx *sql.Tx, sess reconcile.Session) error {
+	if sess.ServerSnapshotArtifact != "" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM server_snapshots WHERE id = ?`, sess.ServerSnapshotArtifact); err != nil {
+			return err
+		}
+	}
+	for _, artID := range []string{
+		sess.ClientSnapshotArtifact,
+		sess.ServerSnapshotArtifact,
+		sess.PlanArtifact,
+		sess.StepsArtifact,
+	} {
+		if artID == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sync_artifacts WHERE id = ?`, artID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *reconcileTx) PurgeSessionArtifacts(ctx context.Context, sess reconcile.Session) error {
+	return purgeSessionArtifactsTx(ctx, t.tx, sess)
+}
+
+// PurgeExpiredArtifacts deletes expired server snapshots (cascading their node
+// rows) and expired or orphaned sync artifacts that no open reconciliation
+// still references (R36).
+func (s *ReconcileStore) PurgeExpiredArtifacts(ctx context.Context, now time.Time) (int64, error) {
+	cutoff := formatTime(now)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var total int64
+	res, err := tx.ExecContext(ctx, `
+		DELETE FROM server_snapshots
+		WHERE (expires_at IS NOT NULL AND expires_at < ?)
+		  AND id NOT IN (
+			SELECT server_snapshot_artifact_id FROM reconciliations
+			WHERE server_snapshot_artifact_id IS NOT NULL AND state IN ('running', 'waiting_user')
+		  )`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		total += n
+	}
+
+	res, err = tx.ExecContext(ctx, `
+		DELETE FROM sync_artifacts
+		WHERE (
+			(expires_at IS NOT NULL AND expires_at < ?)
+			OR (
+				id NOT IN (SELECT client_snapshot_artifact_id FROM reconciliations WHERE client_snapshot_artifact_id IS NOT NULL AND state IN ('running', 'waiting_user'))
+				AND id NOT IN (SELECT server_snapshot_artifact_id FROM reconciliations WHERE server_snapshot_artifact_id IS NOT NULL AND state IN ('running', 'waiting_user'))
+				AND id NOT IN (SELECT plan_artifact_id FROM reconciliations WHERE plan_artifact_id IS NOT NULL AND state IN ('running', 'waiting_user'))
+				AND id NOT IN (SELECT steps_artifact_id FROM reconciliations WHERE steps_artifact_id IS NOT NULL AND state IN ('running', 'waiting_user'))
+			)
+		)`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		total += n
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func scanArtifact(row interface{ Scan(dest ...any) error }) (reconcile.Artifact, error) {
@@ -356,14 +541,73 @@ func (s *ReconcileStore) ReplaceIssues(ctx context.Context, sessionID string, is
 	return nil
 }
 
-// ListIssues returns the session's issues.
-func (s *ReconcileStore) ListIssues(ctx context.Context, sessionID string) ([]reconcile.Issue, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, reconciliation_id, type, payload, default_choice, selected_choice, created_at
-		FROM reconciliation_issues WHERE reconciliation_id = ? ORDER BY created_at, id`, sessionID)
+// SyncIssues replaces only the unresolved issues of a session while keeping
+// previously answered issues intact so multi-round Decide calls retain prior
+// answers (R31). Any open issue whose source_ref was already open keeps its
+// existing issue ID so partially-submitted forms remain valid.
+func (s *ReconcileStore) SyncIssues(ctx context.Context, sessionID string, openIssues []reconcile.Issue) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	existingIDs := map[string]string{} // source_ref -> existing open issue id
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, payload FROM reconciliation_issues
+		WHERE reconciliation_id = ? AND selected_choice IS NULL`, sessionID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, payloadStr string
+		if err := rows.Scan(&id, &payloadStr); err != nil {
+			rows.Close()
+			return err
+		}
+		var p reconcile.IssuePayloadJSON
+		if json.Unmarshal([]byte(payloadStr), &p) == nil && p.SourceRef != "" {
+			existingIDs[p.SourceRef] = id
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM reconciliation_issues
+		WHERE reconciliation_id = ? AND selected_choice IS NULL`, sessionID); err != nil {
+		return err
+	}
+	for _, issue := range openIssues {
+		if prevID, ok := existingIDs[issue.Payload.SourceRef]; ok {
+			issue.ID = prevID
+		}
+		payload, err := json.Marshal(issue.Payload)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO reconciliation_issues (id, reconciliation_id, type, payload, default_choice, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			issue.ID, issue.ReconciliationID, issue.Type, string(payload), issue.DefaultChoice, formatTime(issue.CreatedAt)); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (s *ReconcileStore) scanIssueRows(rows *sql.Rows) ([]reconcile.Issue, error) {
 	defer rows.Close()
 	var issues []reconcile.Issue
 	for rows.Next() {
@@ -385,6 +629,33 @@ func (s *ReconcileStore) ListIssues(ctx context.Context, sessionID string) ([]re
 		issues = append(issues, issue)
 	}
 	return issues, rows.Err()
+}
+
+// ListIssues returns the session's open (unresolved) issues.
+func (s *ReconcileStore) ListIssues(ctx context.Context, sessionID string) ([]reconcile.Issue, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, reconciliation_id, type, payload, default_choice, selected_choice, created_at
+		FROM reconciliation_issues
+		WHERE reconciliation_id = ? AND selected_choice IS NULL
+		ORDER BY created_at, id`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanIssueRows(rows)
+}
+
+// ListAllIssues returns every issue row of the session, including resolved
+// ones, so re-plans preserve earlier user choices (R31).
+func (s *ReconcileStore) ListAllIssues(ctx context.Context, sessionID string) ([]reconcile.Issue, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, reconciliation_id, type, payload, default_choice, selected_choice, created_at
+		FROM reconciliation_issues
+		WHERE reconciliation_id = ?
+		ORDER BY created_at, id`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanIssueRows(rows)
 }
 
 // ResolveIssue records the user's choice for one issue.
@@ -465,12 +736,44 @@ func (t *reconcileTx) ListRootSlots(ctx context.Context, space canonical.SpaceID
 	return slots, rows.Err()
 }
 
+// ListAllNodes loads every node in the space in one query ordered by position
+// and id so snapshot freezing runs in O(N) without N+1 queries.
+func (t *reconcileTx) ListAllNodes(ctx context.Context, space canonical.SpaceID) ([]canonical.Node, error) {
+	rows, err := t.tx.QueryContext(ctx, nodeColumns+` FROM nodes WHERE space_id = ? ORDER BY position, id`, string(space))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var nodes []canonical.Node
+	for rows.Next() {
+		n, err := scanNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes, rows.Err()
+}
+
+// LoadBinding reads a binding inside the reconciliation transaction (R35).
+func (t *reconcileTx) LoadBinding(ctx context.Context, bindingID string) (device.Binding, error) {
+	return scanBinding(t.tx.QueryRowContext(ctx, bindingColumns+"id = ?", bindingID))
+}
+
 // UpdateSessionServerSnapshot records the frozen snapshot inside the
-// snapshot transaction.
+// snapshot transaction. Conditional on the session remaining open and
+// uncommitted (R35).
 func (t *reconcileTx) UpdateSessionServerSnapshot(ctx context.Context, id, phase, serverArtifactID string, targetEpoch, targetRevision int64, at time.Time) error {
-	_, err := t.tx.ExecContext(ctx, `
+	res, err := t.tx.ExecContext(ctx, `
 		UPDATE reconciliations SET phase = ?, server_snapshot_artifact_id = ?,
 		       target_epoch = ?, target_revision = ?, updated_at = ?
-		WHERE id = ?`, phase, serverArtifactID, targetEpoch, targetRevision, formatTime(at), id)
-	return err
+		WHERE id = ? AND server_committed = 0 AND state IN ('running', 'waiting_user')`,
+		phase, serverArtifactID, targetEpoch, targetRevision, formatTime(at), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return reconcile.ErrInvalidSessionState
+	}
+	return nil
 }

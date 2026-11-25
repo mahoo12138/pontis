@@ -89,20 +89,34 @@ func (t *Tree) index() (*treeIndex, error) {
 		}
 		idx.children[n.ParentRef] = append(idx.children[n.ParentRef], n.Ref)
 	}
-	// Acyclicity: every node's parent chain must terminate at a root.
+	// Acyclicity: O(N) 3-color parent-chain check so every node terminates at a root.
+	state := make(map[string]uint8, len(t.Nodes)) // 0=unvisited, 1=visiting, 2=done
 	for _, n := range t.Nodes {
-		seen := map[string]bool{n.Ref: true}
+		if state[n.Ref] == 2 {
+			continue
+		}
+		path := make([]string, 0, 8)
 		cur := n
-		for cur.ParentRef != "" {
+		for {
+			if state[cur.Ref] == 2 {
+				break
+			}
+			if state[cur.Ref] == 1 {
+				return nil, fmt.Errorf("reconcile: cycle at %q", n.Ref)
+			}
+			state[cur.Ref] = 1
+			path = append(path, cur.Ref)
+			if cur.ParentRef == "" {
+				break
+			}
 			p, ok := idx.byRef[cur.ParentRef]
 			if !ok {
 				break // already reported above
 			}
-			if seen[p.Ref] {
-				return nil, fmt.Errorf("reconcile: cycle at %q", n.Ref)
-			}
-			seen[p.Ref] = true
 			cur = p
+		}
+		for _, ref := range path {
+			state[ref] = 2
 		}
 	}
 	return idx, nil

@@ -175,15 +175,14 @@ export function useSyncState() {
     });
 
   /**
-   * Answer the server plan's open questions (doc 08 §11). An issue left out of
-   * the map keeps the server's safe default, so the user may answer only the
-   * ones they care about.
+   * Answer the server plan's open questions (doc 08 §11). Every listed issue
+   * receives an explicit entry (empty string = server safe default / keep
+   * separate) so submitting the default choice converges the session (R31).
    */
   const answerIssues = (bindingId: string, issues: { id: string }[]) => {
     const decisions: Record<string, string> = {};
     for (const issue of issues) {
-      const chosen = issueChoices[issue.id];
-      if (chosen) decisions[issue.id] = chosen;
+      decisions[issue.id] = issueChoices[issue.id] ?? '';
     }
     return run(`answer:${bindingId}`, async () => {
       const resp = (await chrome.runtime.sendMessage({

@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"time"
 
 	"pontis/internal/backup"
 	"pontis/internal/canonical"
+	"pontis/internal/reconcile"
 )
 
 // BackupStore implements the backup catalog and the baseline replacement.
@@ -178,6 +180,10 @@ func (s *BackupStore) ReplaceBaseline(ctx context.Context, spaceID string, slots
 		}
 	}
 
+	// Normalize sibling positions to dense 0..N-1 per parent so manually edited
+	// or sparse backups cannot break the executor's dense-position invariant.
+	normalizedPos := normalizeBackupPositions(nodes)
+
 	// nodes arrive parent-first (backup.Service orders them): parent_id is an
 	// immediate FK, so a child inserted before its folder would abort the
 	// whole restore.
@@ -197,7 +203,7 @@ func (s *BackupStore) ReplaceBaseline(ctx context.Context, spaceID string, slots
 			INSERT INTO nodes (space_id, id, type, title, url, parent_id, root_key, position,
 				created_revision, title_revision, url_revision, structure_revision, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?)`,
-			spaceID, n.ID, n.Type, n.Title, url, parentID, rootKey, n.Position, n.CreatedAt, n.UpdatedAt); err != nil {
+			spaceID, n.ID, n.Type, n.Title, url, parentID, rootKey, normalizedPos[n.ID], n.CreatedAt, n.UpdatedAt); err != nil {
 			return 0, fmt.Errorf("backup: insert node: %w", err)
 		}
 	}
@@ -215,18 +221,74 @@ func (s *BackupStore) ReplaceBaseline(ctx context.Context, spaceID string, slots
 	// A reconciliation opened against the old epoch is now describing a tree
 	// that no longer exists. Left open, its client could still commit or
 	// complete it and stamp the new binding with the old baseline, so the
-	// session goes with the epoch it was frozen at.
+	// session and its artifacts go with the epoch it was frozen at (R36).
+	openRows, err := tx.QueryContext(ctx, sessionColumns+`
+		WHERE space_id = ? AND state IN ('running', 'waiting_user')`, spaceID)
+	if err != nil {
+		return 0, fmt.Errorf("backup: list superseded reconciliations: %w", err)
+	}
+	var openSessions []reconcile.Session
+	for openRows.Next() {
+		sess, scanErr := scanSession(openRows)
+		if scanErr != nil {
+			openRows.Close()
+			return 0, fmt.Errorf("backup: scan superseded reconciliation: %w", scanErr)
+		}
+		openSessions = append(openSessions, sess)
+	}
+	openRows.Close()
+	if err := openRows.Err(); err != nil {
+		return 0, fmt.Errorf("backup: read superseded reconciliations: %w", err)
+	}
+	nowStr := formatTime(time.Now().UTC())
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE reconciliations SET state = 'failed', phase = '', completed_at = ?, updated_at = ?
+		UPDATE reconciliations
+		SET state = 'failed', phase = '',
+		    client_snapshot_artifact_id = NULL,
+		    server_snapshot_artifact_id = NULL,
+		    plan_artifact_id = NULL,
+		    steps_artifact_id = NULL,
+		    completed_at = ?, updated_at = ?
 		WHERE space_id = ? AND state IN ('running', 'waiting_user')`,
-		formatTime(time.Now().UTC()), formatTime(time.Now().UTC()), spaceID); err != nil {
+		nowStr, nowStr, spaceID); err != nil {
 		return 0, fmt.Errorf("backup: fail superseded reconciliations: %w", err)
+	}
+	for _, sess := range openSessions {
+		if err := purgeSessionArtifactsTx(ctx, tx, sess); err != nil {
+			return 0, fmt.Errorf("backup: purge superseded reconciliation artifacts: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return newEpoch, nil
+}
+
+func normalizeBackupPositions(nodes []backup.NodeDTO) map[string]int64 {
+	groups := make(map[string][]backup.NodeDTO)
+	for _, n := range nodes {
+		key := "root:"
+		if n.ParentID != nil {
+			key = "node:" + *n.ParentID
+		} else if n.RootKey != nil {
+			key = "root:" + *n.RootKey
+		}
+		groups[key] = append(groups[key], n)
+	}
+	out := make(map[string]int64, len(nodes))
+	for _, list := range groups {
+		sort.SliceStable(list, func(i, j int) bool {
+			if list[i].Position != list[j].Position {
+				return list[i].Position < list[j].Position
+			}
+			return list[i].ID < list[j].ID
+		})
+		for idx, n := range list {
+			out[n.ID] = int64(idx)
+		}
+	}
+	return out
 }
 
 func boolInt(b bool) int {

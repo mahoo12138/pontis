@@ -67,20 +67,17 @@ func (m *MatchResult) link(sourceRef, targetRef string) {
 // classify fills SourceOnly/TargetOnly once pairing is done: every node
 // without a resolved counterpart, deterministically ordered.
 func (m *MatchResult) classify(srcIdx, tgtIdx *treeIndex) {
+	m.SourceOnly = m.SourceOnly[:0]
+	m.TargetOnly = m.TargetOnly[:0]
+	ambigSet := make(map[string]bool, len(m.Ambiguous))
+	for _, a := range m.Ambiguous {
+		ambigSet[a.SourceRef] = true
+	}
 	for ref := range srcIdx.byRef {
-		if _, ok := m.BySource[ref]; ok {
+		if _, ok := m.BySource[ref]; ok || ambigSet[ref] {
 			continue
 		}
-		ambig := false
-		for _, a := range m.Ambiguous {
-			if a.SourceRef == ref {
-				ambig = true
-				break
-			}
-		}
-		if !ambig {
-			m.SourceOnly = append(m.SourceOnly, ref)
-		}
+		m.SourceOnly = append(m.SourceOnly, ref)
 	}
 	sort.Strings(m.SourceOnly)
 	for ref := range tgtIdx.byRef {
@@ -89,6 +86,59 @@ func (m *MatchResult) classify(srcIdx, tgtIdx *treeIndex) {
 		}
 	}
 	sort.Strings(m.TargetOnly)
+}
+
+// matchChildren recursively matches direct children of two already-linked
+// parent containers by exact folder title or exact raw bookmark URL. Used by
+// both MatchExact and decision folding (when a user disambiguates a folder,
+// its children must also be matched rather than duplicated).
+func (m *MatchResult) matchChildren(srcIdx, tgtIdx *treeIndex, srcParent, tgtParent string) {
+	srcChildren := srcIdx.children[srcParent]
+	tgtChildren := tgtIdx.children[tgtParent]
+	used := map[string]bool{}
+	for _, tc := range tgtChildren {
+		if _, claimed := m.ByTarget[tc]; claimed {
+			used[tc] = true
+		}
+	}
+	for _, sc := range srcChildren {
+		if _, alreadyMatched := m.BySource[sc]; alreadyMatched {
+			continue
+		}
+		srcNode := srcIdx.byRef[sc]
+		var candidates []string
+		for _, tc := range tgtChildren {
+			if used[tc] {
+				continue
+			}
+			tgtNode := tgtIdx.byRef[tc]
+			if srcNode.Type != tgtNode.Type {
+				continue
+			}
+			switch srcNode.Type {
+			case NodeFolder:
+				if srcNode.Title == tgtNode.Title {
+					candidates = append(candidates, tc)
+				}
+			case NodeBookmark:
+				if srcNode.URL == tgtNode.URL {
+					candidates = append(candidates, tc)
+				}
+			}
+		}
+		switch len(candidates) {
+		case 0:
+			// No inference: the node arrives as a fresh create.
+		case 1:
+			used[candidates[0]] = true
+			m.link(sc, candidates[0])
+			if srcNode.Type == NodeFolder {
+				m.matchChildren(srcIdx, tgtIdx, sc, candidates[0])
+			}
+		default:
+			m.Ambiguous = append(m.Ambiguous, Ambiguity{SourceRef: sc, Candidates: candidates})
+		}
+	}
 }
 
 // linkRoots matches the root nodes of both trees on the canonical root
@@ -126,48 +176,9 @@ func MatchExact(source, target *Tree) (*MatchResult, error) {
 	}
 	m.linkRoots(srcIdx, tgtIdx)
 
-	var matchChildren func(srcParent, tgtParent string)
-	matchChildren = func(srcParent, tgtParent string) {
-		srcChildren := srcIdx.children[srcParent]
-		tgtChildren := tgtIdx.children[tgtParent]
-		used := map[string]bool{}
-		for _, sc := range srcChildren {
-			srcNode := srcIdx.byRef[sc]
-			var candidates []string
-			for _, tc := range tgtChildren {
-				if used[tc] {
-					continue
-				}
-				tgtNode := tgtIdx.byRef[tc]
-				if srcNode.Type != tgtNode.Type {
-					continue
-				}
-				switch srcNode.Type {
-				case NodeFolder:
-					if srcNode.Title == tgtNode.Title {
-						candidates = append(candidates, tc)
-					}
-				case NodeBookmark:
-					if srcNode.URL == tgtNode.URL {
-						candidates = append(candidates, tc)
-					}
-				}
-			}
-			switch len(candidates) {
-			case 0:
-				// No inference: the node arrives as a fresh create.
-			case 1:
-				used[candidates[0]] = true
-				m.link(sc, candidates[0])
-				matchChildren(sc, candidates[0])
-			default:
-				m.Ambiguous = append(m.Ambiguous, Ambiguity{SourceRef: sc, Candidates: candidates})
-			}
-		}
-	}
 	for _, pair := range m.Pairs {
 		if srcIdx.byRef[pair.SourceRef].Type == NodeRoot {
-			matchChildren(pair.SourceRef, pair.TargetRef)
+			m.matchChildren(srcIdx, tgtIdx, pair.SourceRef, pair.TargetRef)
 		}
 	}
 	m.classify(srcIdx, tgtIdx)

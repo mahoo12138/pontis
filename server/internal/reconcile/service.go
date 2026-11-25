@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"pontis/internal/canonical"
+	"pontis/internal/changeset"
 	"pontis/internal/device"
 )
 
@@ -169,13 +170,16 @@ type Issue struct {
 
 // Service implements the reconciliation session lifecycle.
 type Service struct {
-	store    Store
-	executor *canonical.Executor
+	store      Store
+	executor   *canonical.Executor
+	changesets *changeset.Service
 }
 
-// NewService returns a reconciliation service backed by store.
-func NewService(store Store) *Service {
-	return &Service{store: store, executor: canonical.NewExecutor()}
+// NewService returns a reconciliation service backed by store and changesets.
+// When changesets is non-nil, initial-sync commits are recorded in the unified
+// changesets table so they appear in Activity and are undoable (R43).
+func NewService(store Store, changesets *changeset.Service) *Service {
+	return &Service{store: store, executor: canonical.NewExecutor(), changesets: changesets}
 }
 
 func newID() (string, error) {
@@ -280,6 +284,7 @@ func (s *Service) SubmitClientSnapshot(ctx context.Context, bindingID string, sn
 	}
 	if err := s.store.UpdateSessionSnapshot(ctx, sess.ID, PhaseSnapshotReady,
 		art.ID, snapshot.Epoch, snapshot.Revision, time.Now().UTC()); err != nil {
+		_ = s.store.DeleteArtifact(ctx, art.ID)
 		return Session{}, err
 	}
 	return s.store.GetSession(ctx, sess.ID)
@@ -341,9 +346,51 @@ func (s *Service) freezeServerSnapshot(ctx context.Context, sess Session) (Serve
 		ExpiresAt: now.Add(SnapshotTTL),
 	}
 
+	// Load all nodes in a single query and group by parent in memory so large
+	// trees never issue N+1 per-node queries inside the write transaction.
+	allNodes, err := tx.ListAllNodes(ctx, sess.SpaceID)
+	if err != nil {
+		return ServerSnapshot{}, err
+	}
+	byParent := make(map[string][]canonical.Node, len(roots)+len(allNodes)/4)
+	for _, n := range allNodes {
+		var pRef string
+		if n.Parent.Type == canonical.ParentTypeRoot {
+			pRef = RootRef(n.Parent.RootKey)
+		} else {
+			pRef = string(n.Parent.NodeID)
+		}
+		byParent[pRef] = append(byParent[pRef], n)
+	}
+
 	// Collect everything first: the row carries the true node count.
 	hasher := sha256.New()
-	nodes := make([]SnapshotNode, 0, 16)
+	nodes := make([]SnapshotNode, 0, len(roots)+len(allNodes))
+	var walk func(parent string, depth int) error
+	walk = func(parent string, depth int) error {
+		if depth > 10_000 {
+			return errors.New("reconcile: canonical tree too deep")
+		}
+		for pos, node := range byParent[parent] {
+			frozen := SnapshotNode{
+				NodeRef:   string(node.ID),
+				ParentRef: parent,
+				Type:      string(node.Type),
+				Title:     node.Title,
+				URL:       node.URL,
+				Position:  int64(pos),
+			}
+			nodes = append(nodes, frozen)
+			fmt.Fprintf(hasher, "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1e",
+				frozen.NodeRef, frozen.ParentRef, frozen.Type, frozen.Title, frozen.URL)
+			if node.Type == canonical.NodeTypeFolder {
+				if err := walk(frozen.NodeRef, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	for _, root := range roots {
 		frozen := SnapshotNode{
 			NodeRef:  RootRef(root.Key),
@@ -354,7 +401,7 @@ func (s *Service) freezeServerSnapshot(ctx context.Context, sess Session) (Serve
 		}
 		fmt.Fprintf(hasher, "%s\x1f%s\x1f%s\x1f%s\x1e", frozen.NodeRef, frozen.ParentRef, frozen.Type, frozen.Title)
 		nodes = append(nodes, frozen)
-		if err := s.collectSubtree(ctx, tx, sess.SpaceID, frozen.NodeRef, &nodes, hasher, 0); err != nil {
+		if err := walk(frozen.NodeRef, 0); err != nil {
 			return ServerSnapshot{}, err
 		}
 	}
@@ -381,6 +428,12 @@ func (s *Service) freezeServerSnapshot(ctx context.Context, sess Session) (Serve
 	if err := tx.UpdateSessionServerSnapshot(ctx, sess.ID, PhaseServerReady, id, snap.Epoch, snap.Revision, now); err != nil {
 		return ServerSnapshot{}, err
 	}
+	// Drop any superseded frozen snapshot so re-plans after PLAN_STALE do not
+	// accumulate full tree copies (R36).
+	if sess.ServerSnapshotArtifact != "" && sess.ServerSnapshotArtifact != id {
+		_ = tx.DeleteServerSnapshot(ctx, sess.ServerSnapshotArtifact)
+		_ = tx.DeleteArtifact(ctx, sess.ServerSnapshotArtifact)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ServerSnapshot{}, err
 	}
@@ -388,48 +441,10 @@ func (s *Service) freezeServerSnapshot(ctx context.Context, sess Session) (Serve
 	return snap, nil
 }
 
-// collectSubtree appends the frozen nodes under parent to out, feeding
-// the checksum in stable walk order.
-func (s *Service) collectSubtree(ctx context.Context, tx Tx, space canonical.SpaceID, parent string, out *[]SnapshotNode, hasher hashIface, depth int) error {
-	if depth > 10_000 {
-		return errors.New("reconcile: canonical tree too deep")
-	}
-	parentRef := parentRefOf(parent)
-	children, err := tx.Children(ctx, space, parentRef)
-	if err != nil {
-		return err
-	}
-	for pos, node := range children {
-		frozen := SnapshotNode{
-			NodeRef:   string(node.ID),
-			ParentRef: parent,
-			Type:      string(node.Type),
-			Title:     node.Title,
-			URL:       node.URL,
-			Position:  int64(pos),
-		}
-		*out = append(*out, frozen)
-		fmt.Fprintf(hasher, "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1e",
-			frozen.NodeRef, frozen.ParentRef, frozen.Type, frozen.Title, frozen.URL)
-		if err := s.collectSubtree(ctx, tx, space, frozen.NodeRef, out, hasher, depth+1); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // hashIface is the subset of hash.Hash the checksum uses.
 type hashIface interface {
 	Write(p []byte) (n int, err error)
 	Sum(b []byte) []byte
-}
-
-// parentRefOf maps a frozen parent ref back to a canonical ParentRef.
-func parentRefOf(ref string) canonical.ParentRef {
-	if isRootRef(ref) {
-		return canonical.NewRootParent(ref[5:])
-	}
-	return canonical.NewNodeParent(canonical.NodeID(ref))
 }
 
 // Plan computes the reconciliation plan and the client apply steps from
@@ -440,6 +455,9 @@ func (s *Service) Plan(ctx context.Context, sessionID string) (Session, []Issue,
 	sess, err := s.loadActive(ctx, sessionID)
 	if err != nil {
 		return Session{}, nil, err
+	}
+	if sess.ServerCommitted {
+		return Session{}, nil, ErrInvalidSessionState
 	}
 	if sess.ClientSnapshotArtifact == "" || sess.ServerSnapshotArtifact == "" {
 		return Session{}, nil, ErrSnapshotMissing
@@ -462,7 +480,18 @@ func (s *Service) Plan(ctx context.Context, sessionID string) (Session, []Issue,
 			return Session{}, nil, err
 		}
 	}
-	sess, issues, _, err := s.computeAndStorePlan(ctx, sess, nil)
+	// Preserve any previously resolved user decisions across re-plans.
+	allIssues, err := s.store.ListAllIssues(ctx, sessionID)
+	if err != nil {
+		return Session{}, nil, err
+	}
+	prior := Decisions{}
+	for _, issue := range allIssues {
+		if issue.SelectedChoice != nil {
+			prior[issue.Payload.SourceRef] = *issue.SelectedChoice
+		}
+	}
+	sess, issues, _, err := s.computeAndStorePlan(ctx, sess, prior, nil, true)
 	if err != nil {
 		return Session{}, nil, err
 	}
@@ -470,62 +499,40 @@ func (s *Service) Plan(ctx context.Context, sessionID string) (Session, []Issue,
 }
 
 // Decide records user decisions on issues and recomputes the plan with
-// them folded in (doc 08 §11).
+// them folded in (doc 08 §11). Decisions are validated before anything is
+// written so an invalid choice never poisons the session (R31).
 func (s *Service) Decide(ctx context.Context, sessionID string, decisions map[string]string) (Session, []Issue, error) {
 	sess, err := s.loadActive(ctx, sessionID)
 	if err != nil {
 		return Session{}, nil, err
 	}
-	if sess.State != StateWaitingUser {
+	if sess.ServerCommitted || sess.State != StateWaitingUser || sess.Phase != PhasePlanned {
 		return Session{}, nil, ErrInvalidSessionState
 	}
-	issues, err := s.store.ListIssues(ctx, sessionID)
+	allIssues, err := s.store.ListAllIssues(ctx, sessionID)
 	if err != nil {
 		return Session{}, nil, err
 	}
-	known := map[string]string{} // source ref → current selection
-	for _, issue := range issues {
-		choice := issue.DefaultChoice
+	byID := make(map[string]Issue, len(allIssues))
+	known := Decisions{} // source ref → resolved selection
+	for _, issue := range allIssues {
+		byID[issue.ID] = issue
 		if issue.SelectedChoice != nil {
-			choice = *issue.SelectedChoice
+			known[issue.Payload.SourceRef] = *issue.SelectedChoice
+		}
+	}
+	for issueID, choice := range decisions {
+		issue, ok := byID[issueID]
+		if !ok {
+			return Session{}, nil, ErrInvalidSessionState
 		}
 		known[issue.Payload.SourceRef] = choice
 	}
-	for issueID, choice := range decisions {
-		found := false
-		for _, issue := range issues {
-			if issue.ID == issueID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return Session{}, nil, ErrInvalidSessionState
-		}
-		if err := s.store.ResolveIssue(ctx, issueID, choice, time.Now().UTC()); err != nil {
-			return Session{}, nil, err
-		}
-		known[issueIDToSourceRef(issues, issueID)] = choice
-	}
-	// Empty choice keeps the safe default (duplicate create).
-	d := Decisions{}
-	for ref, choice := range known {
-		d[ref] = choice
-	}
-	sess, issues, _, err = s.computeAndStorePlan(ctx, sess, d)
+	sess, issues, _, err := s.computeAndStorePlan(ctx, sess, known, decisions, false)
 	if err != nil {
 		return Session{}, nil, err
 	}
 	return sess, issues, nil
-}
-
-func issueIDToSourceRef(issues []Issue, issueID string) string {
-	for _, issue := range issues {
-		if issue.ID == issueID {
-			return issue.Payload.SourceRef
-		}
-	}
-	return ""
 }
 
 // planWarningsOrEmpty keeps the wire array empty rather than null: a client
@@ -537,9 +544,10 @@ func planWarningsOrEmpty(plan *Plan) []string {
 	return plan.Warnings
 }
 
-// computeAndStorePlan runs the engine for the session type, persists the
-// plan and steps artifacts and the issue rows, and updates the session.
-func (s *Service) computeAndStorePlan(ctx context.Context, sess Session, decisions Decisions) (Session, []Issue, Artifact, error) {
+// computeAndStorePlan runs the engine for the session type, validates all
+// decisions before persisting anything, stores plan/steps artifacts and open
+// issues, and updates the session.
+func (s *Service) computeAndStorePlan(ctx context.Context, sess Session, decisions Decisions, pendingResolves map[string]string, dropInvalidPrior bool) (Session, []Issue, Artifact, error) {
 	clientArt, err := s.store.GetArtifact(ctx, sess.ClientSnapshotArtifact)
 	if err != nil {
 		return Session{}, nil, Artifact{}, ErrSnapshotMissing
@@ -572,7 +580,7 @@ func (s *Service) computeAndStorePlan(ctx context.Context, sess Session, decisio
 	case TypeFullResync:
 		match, err = MatchByCanonicalID(serverTree, clientTree)
 		policy = Policy{Strategy: StrategyReplace, Placement: PlacementContents}
-		clientResolver = newCanonicalIdentity(clientTree)
+		clientResolver = newClientCanonicalIdentity(clientTree)
 	default:
 		return Session{}, nil, Artifact{}, fmt.Errorf("reconcile: unknown session type %q", sess.Type)
 	}
@@ -580,13 +588,19 @@ func (s *Service) computeAndStorePlan(ctx context.Context, sess Session, decisio
 		return Session{}, nil, Artifact{}, err
 	}
 
-	// Fold the decisions first: resolved ambiguities leave the issue set,
-	// and BuildDesired replans on the resolved view.
+	// Fold the decisions first: validation happens in memory BEFORE any DB write
+	// so invalid choices never poison reconciliation_issues (R31).
 	resolved, err := foldDecisions(match, decisions)
 	if err != nil {
-		return Session{}, nil, Artifact{}, err
+		if dropInvalidPrior && errors.Is(err, ErrDecisionInvalid) {
+			decisions = nil
+			resolved, err = foldDecisions(match, nil)
+		}
+		if err != nil {
+			return Session{}, nil, Artifact{}, err
+		}
 	}
-	desired, err := BuildDesired(resolved, policy, decisions, func() (string, error) { return newID() })
+	desired, err := BuildDesired(resolved, policy, nil, func() (string, error) { return newID() })
 	if err != nil {
 		return Session{}, nil, Artifact{}, err
 	}
@@ -726,13 +740,19 @@ func (s *Service) computeAndStorePlan(ctx context.Context, sess Session, decisio
 		SizeBytes:  len(stepsContent),
 		CreatedAt:  now,
 	}
+	// Persist newly validated user choices only after foldDecisions succeeded.
+	for issueID, choice := range pendingResolves {
+		if err := s.store.ResolveIssue(ctx, issueID, choice, now); err != nil {
+			return Session{}, nil, Artifact{}, err
+		}
+	}
 	if err := s.store.InsertArtifact(ctx, planArt); err != nil {
 		return Session{}, nil, Artifact{}, err
 	}
 	if err := s.store.InsertArtifact(ctx, stepsArt); err != nil {
 		return Session{}, nil, Artifact{}, err
 	}
-	if err := s.store.ReplaceIssues(ctx, sess.ID, issues); err != nil {
+	if err := s.store.SyncIssues(ctx, sess.ID, issues); err != nil {
 		return Session{}, nil, Artifact{}, err
 	}
 
@@ -743,13 +763,26 @@ func (s *Service) computeAndStorePlan(ctx context.Context, sess Session, decisio
 		phase = PhasePlanned
 	}
 	if err := s.store.UpdateSessionPlan(ctx, sess.ID, string(state), phase, planArt.ID, stepsArt.ID, plan.Hash, now); err != nil {
+		_ = s.store.DeleteArtifact(ctx, planArt.ID)
+		_ = s.store.DeleteArtifact(ctx, stepsArt.ID)
+		return Session{}, nil, Artifact{}, err
+	}
+	// Clean up superseded plan/steps artifacts from earlier plan rounds (R36).
+	if sess.PlanArtifact != "" && sess.PlanArtifact != planArt.ID {
+		_ = s.store.DeleteArtifact(ctx, sess.PlanArtifact)
+	}
+	if sess.StepsArtifact != "" && sess.StepsArtifact != stepsArt.ID {
+		_ = s.store.DeleteArtifact(ctx, sess.StepsArtifact)
+	}
+	openIssues, err := s.store.ListIssues(ctx, sess.ID)
+	if err != nil {
 		return Session{}, nil, Artifact{}, err
 	}
 	updated, err := s.store.GetSession(ctx, sess.ID)
 	if err != nil {
 		return Session{}, nil, Artifact{}, err
 	}
-	return updated, issues, planArt, nil
+	return updated, openIssues, planArt, nil
 }
 
 // loadSnapshotTree rebuilds the engine input tree from a frozen server
@@ -822,7 +855,7 @@ func (s *Service) Commit(ctx context.Context, sessionID string) (Session, error)
 	if err != nil {
 		return Session{}, err
 	}
-	if sess.Phase != PhasePlanned || sess.PlanArtifact == "" {
+	if sess.Phase != PhasePlanned {
 		return Session{}, ErrInvalidSessionState
 	}
 
@@ -832,6 +865,9 @@ func (s *Service) Commit(ctx context.Context, sessionID string) (Session, error)
 	var planJSON *PlanArtifactJSON
 	var deviceID string
 	if sess.Type == TypeInitial {
+		if sess.PlanArtifact == "" {
+			return Session{}, ErrInvalidSessionState
+		}
 		planArt, err := s.store.GetArtifact(ctx, sess.PlanArtifact)
 		if err != nil {
 			return Session{}, err
@@ -861,21 +897,51 @@ func (s *Service) Commit(ctx context.Context, sessionID string) (Session, error)
 		}
 	}()
 
-	space, err := tx.LoadSpace(ctx, sess.SpaceID)
+	// Re-read the session, space, and binding inside the write transaction so a
+	// concurrent unbind, restore, or replan cannot be bypassed (R35, doc 22 B.21).
+	current, err := tx.LoadSession(ctx, sess.ID)
 	if err != nil {
 		return Session{}, err
 	}
+	if current.State != StateRunning && current.State != StateWaitingUser {
+		return Session{}, ErrSessionSuperseded
+	}
+	space, err := tx.LoadSpace(ctx, current.SpaceID)
+	if err != nil {
+		return Session{}, err
+	}
+	if space.Epoch != current.TargetEpoch {
+		// The space baseline was replaced (e.g. backup restore) after this
+		// plan was computed: never commit against a superseded epoch (doc 06 §7).
+		return Session{}, ErrPlanStale
+	}
+	if current.ServerCommitted || current.Phase != PhasePlanned || current.PlanArtifact == "" || current.PlanArtifact != sess.PlanArtifact {
+		return Session{}, ErrInvalidSessionState
+	}
+	if current.PlanHash != sess.PlanHash {
+		return Session{}, ErrPlanStale
+	}
+	binding, err := tx.LoadBinding(ctx, current.BindingID)
+	if err != nil {
+		return Session{}, ErrSessionSuperseded
+	}
+	switch {
+	case current.Type == TypeInitial && binding.State != device.StatePendingInitial:
+		return Session{}, ErrSessionSuperseded
+	case current.Type != TypeInitial && binding.State != device.StateActive:
+		return Session{}, ErrSessionSuperseded
+	}
 
 	commitRevision := space.CurrentRevision
-	if sess.Type == TypeInitial {
-		if space.Epoch != sess.TargetEpoch || space.CurrentRevision != sess.TargetRevision {
+	if current.Type == TypeInitial {
+		if space.Epoch != current.TargetEpoch || space.CurrentRevision != current.TargetRevision {
 			return Session{}, ErrPlanStale
 		}
 		origin := canonical.Origin{
 			Type:      canonical.OriginReconciliation,
 			UserID:    space.OwnerUserID,
 			DeviceID:  canonical.DeviceID(deviceID),
-			BindingID: canonical.BindingID(sess.BindingID),
+			BindingID: canonical.BindingID(current.BindingID),
 		}
 		cmds := make([]canonical.Command, 0, len(planJSON.Operations))
 		for _, op := range planJSON.Operations {
@@ -888,23 +954,29 @@ func (s *Service) Commit(ctx context.Context, sessionID string) (Session, error)
 		// An empty plan (e.g. empty space meeting an empty browser)
 		// records no ChangeSet at all.
 		if len(cmds) > 0 {
-			planSummary := "初始导入浏览器书签"
-			if sess.Type == TypeRecovery {
-				planSummary = "恢复合并"
-			}
-			if _, err := s.executor.ApplyTxChangeSet(ctx, tx, origin, space.ID, canonical.ChangeSetInput{
-				Kind:    "reconciliation",
-				Summary: planSummary,
-			}, cmds...); err != nil {
-				return Session{}, err
+			planSummary := fmt.Sprintf("初始导入浏览器书签（%d 项变更）", len(cmds))
+			if s.changesets != nil {
+				batch := s.changesets.BeginBatch(space.ID, changeset.KindReconciliation, origin, true)
+				for _, cmd := range cmds {
+					if err := batch.Apply(ctx, tx, cmd); err != nil {
+						return Session{}, err
+					}
+				}
+				if _, err := batch.Finish(ctx, tx, planSummary); err != nil {
+					return Session{}, err
+				}
+			} else {
+				if err := s.executor.ApplyTx(ctx, tx, origin, cmds...); err != nil {
+					return Session{}, err
+				}
 			}
 		}
-		head, err := tx.LoadSpace(ctx, sess.SpaceID)
+		head, err := tx.LoadSpace(ctx, current.SpaceID)
 		if err != nil {
 			return Session{}, err
 		}
 		commitRevision = head.CurrentRevision
-	} else if space.Epoch != sess.TargetEpoch {
+	} else if space.Epoch != current.TargetEpoch {
 		// A resync or recovery commits no canonical change, but its steps were
 		// derived from a snapshot of a tree this space no longer holds: a
 		// restore under it means re-planning against the new head, not
@@ -913,7 +985,7 @@ func (s *Service) Commit(ctx context.Context, sessionID string) (Session, error)
 	}
 
 	now := time.Now().UTC()
-	if err := tx.MarkSessionCommitted(ctx, sess.ID, commitRevision, now); err != nil {
+	if err := tx.MarkSessionCommitted(ctx, current.ID, commitRevision, now); err != nil {
 		return Session{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1108,6 +1180,10 @@ func (s *Service) Complete(ctx context.Context, sessionID string) (Session, erro
 	}
 	if err := tx.FinalizeBinding(ctx, current.BindingID, current.TargetEpoch,
 		space.Epoch, baseline, baseline, time.Now().UTC()); err != nil {
+		return Session{}, err
+	}
+	// Release snapshot/plan/steps payloads once the session is closed (R36).
+	if err := tx.PurgeSessionArtifacts(ctx, current); err != nil {
 		return Session{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

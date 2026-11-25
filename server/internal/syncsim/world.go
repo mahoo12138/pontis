@@ -88,7 +88,7 @@ func (w *World) wireServices() {
 	w.Devices = device.NewService(sqlite.NewDeviceStore(w.db))
 	w.changesets = changeset.NewService(sqlite.NewChangeSetStore(w.db))
 	w.Sync = sync.NewService(sqlite.NewSyncStore(w.db), w.changesets)
-	w.Reconcile = reconcile.NewService(sqlite.NewReconcileStore(w.db))
+	w.Reconcile = reconcile.NewService(sqlite.NewReconcileStore(w.db), w.changesets)
 	backups, err := backup.NewService(sqlite.NewBackupStore(w.db), sqlite.NewLibraryStore(w.db),
 		filepath.Join(filepath.Dir(w.dbPath), "backups"))
 	if err != nil {

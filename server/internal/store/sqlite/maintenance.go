@@ -67,40 +67,40 @@ func (s *LibraryStore) JournalGCSpace(ctx context.Context, spaceID string, now t
 	if byCount < floor {
 		floor = byCount
 	}
-	if floor <= 0 {
-		return 0, 0, tx.Commit()
-	}
-
-	// Each statement carries its own arguments: the receipt delete has two
-	// placeholders while the other two also take two, and one shared argument
-	// list for all three made every run of this collector fail.
-	prunes := []struct {
-		query string
-		args  []any
-	}{
-		{`DELETE FROM journal WHERE space_id = ? AND revision <= ?`, []any{spaceID, floor}},
-		{`DELETE FROM tombstones WHERE space_id = ? AND deleted_revision <= ?`, []any{spaceID, floor}},
-		{`DELETE FROM client_operation_receipts WHERE binding_id IN
-			(SELECT id FROM device_space_bindings WHERE space_id = ?)
-		 AND COALESCE(processed_at_revision, 0) <= ?`, []any{spaceID, floor}},
-	}
-	for _, p := range prunes {
-		res, err := tx.ExecContext(ctx, p.query, p.args...)
-		if err != nil {
+	if floor > 0 {
+		// Each statement carries its own arguments: the receipt delete has two
+		// placeholders while the other two also take two, and one shared argument
+		// list for all three made every run of this collector fail.
+		prunes := []struct {
+			query string
+			args  []any
+		}{
+			{`DELETE FROM journal WHERE space_id = ? AND revision <= ?`, []any{spaceID, floor}},
+			{`DELETE FROM tombstones WHERE space_id = ? AND deleted_revision <= ?`, []any{spaceID, floor}},
+			{`DELETE FROM client_operation_receipts WHERE binding_id IN
+				(SELECT id FROM device_space_bindings WHERE space_id = ?)
+			 AND COALESCE(processed_at_revision, 0) <= ?`, []any{spaceID, floor}},
+		}
+		for _, p := range prunes {
+			res, err := tx.ExecContext(ctx, p.query, p.args...)
+			if err != nil {
+				return 0, 0, err
+			}
+			n, _ := res.RowsAffected()
+			removed += n
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE sync_spaces SET journal_floor_revision = MAX(journal_floor_revision, ?), updated_at = ?
+			WHERE id = ?`, floor, now.Format(time.RFC3339Nano), spaceID); err != nil {
 			return 0, 0, err
 		}
-		n, _ := res.RowsAffected()
-		removed += n
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE sync_spaces SET journal_floor_revision = MAX(journal_floor_revision, ?), updated_at = ?
-		WHERE id = ?`, floor, now.Format(time.RFC3339Nano), spaceID); err != nil {
-		return 0, 0, err
+	} else {
+		floor = 0
 	}
 
 	// ChangeSet retention is independent of the journal floor (doc 15 §12):
 	// undo data expires with the undo window, activity rows with the longer
-	// activity retention.
+	// activity retention — even for quiet spaces whose journal floor never moves.
 	undoCutoff := now.Add(-changeset.UndoWindow).Format(time.RFC3339Nano)
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE changesets SET undo_data = NULL

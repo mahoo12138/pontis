@@ -20,15 +20,18 @@ import {
   isUnsettledOp,
   logDiagnostic,
   releaseRunLock,
+  renewRunLock,
   writeEmergencySnapshot,
   type BindingRecord,
   type BindingState,
   type PontisDB,
   type ReconSessionRecord,
   type ReconType,
+  type SnapshotNodeSummary,
 } from '../store/db';
 import type {
   ClientSnapshotWire,
+  ParentRefWire,
   ReconciliationEnvelopeWire,
   ReconciliationType,
 } from '../protocol/types';
@@ -81,16 +84,24 @@ export async function buildClientSnapshot(
   epoch: number,
   revision: number,
   canonicalIdOf?: (browserId: string) => Promise<string | undefined>,
-): Promise<{ snapshot: ClientSnapshotWire; refs: Record<string, string> }> {
+): Promise<{
+  snapshot: ClientSnapshotWire;
+  refs: Record<string, string>;
+  snapshotNodes: Record<string, SnapshotNodeSummary>;
+}> {
   const roots: ClientSnapshotWire['roots'] = [];
   const nodes: ClientSnapshotWire['nodes'] = [];
   const refs: Record<string, string> = {};
+  const snapshotNodes: Record<string, SnapshotNodeSummary> = {};
+  // Reverse index keeps ref lookup O(1) instead of O(N^2) on large bookmark trees.
+  const browserToRef = new Map<string, string>();
   let next = 1;
   const ref = (browserId: string): string => {
-    const known = Object.keys(refs).find((r) => refs[r] === browserId);
+    const known = browserToRef.get(browserId);
     if (known) return known;
     const created = `l_${next++}`;
     refs[created] = browserId;
+    browserToRef.set(browserId, created);
     return created;
   };
 
@@ -106,6 +117,12 @@ export async function buildClientSnapshot(
     while (level.length > 0) {
       const { node, parentRef } = level.shift()!;
       const localRef = ref(node.id);
+      snapshotNodes[node.id] = {
+        type: node.type,
+        title: node.title,
+        url: node.url ?? null,
+        parentBrowserId: node.parentId,
+      };
       const canonicalId = canonicalIdOf ? await canonicalIdOf(node.id) : undefined;
       nodes.push({
         local_ref: localRef,
@@ -122,7 +139,7 @@ export async function buildClientSnapshot(
       }
     }
   }
-  return { snapshot: { epoch, revision, roots, nodes }, refs };
+  return { snapshot: { epoch, revision, roots, nodes }, refs, snapshotNodes };
 }
 
 export class InitialReconciler {
@@ -137,13 +154,19 @@ export class InitialReconciler {
    * `waiting_user` when the plan carries issues the user must answer, and
    * returns `completed` once the steps have been applied and closed out.
    */
-  async run(binding: BindingRecord, session: ReconSessionRecord): Promise<LifecycleOutcome> {
+  async run(
+    binding: BindingRecord,
+    session: ReconSessionRecord,
+    lockToken?: string,
+  ): Promise<LifecycleOutcome> {
     for (let round = 0; round < MAX_LIFECYCLE_ROUNDS; round++) {
+      if (lockToken) await renewRunLock(this.db, binding.id, lockToken);
       const env = await this.ensureSession(binding, session);
       const sess = env.session;
       session.serverSessionId = sess.id;
       session.serverPhase = sess.phase;
       if (sess.plan_hash) session.planHash = sess.plan_hash;
+      if (typeof sess.target_revision === 'number') session.targetRevision = sess.target_revision;
       if (sess.commit_revision) session.commitRevision = sess.commit_revision;
       await this.touch(session);
 
@@ -213,7 +236,7 @@ export class InitialReconciler {
     const token = uuidv7();
     if (!(await acquireRunLock(this.db, bindingId, token))) return 'idle';
     try {
-      return await this.driveBinding(bindingId);
+      return await this.driveBinding(bindingId, token);
     } finally {
       await releaseRunLock(this.db, bindingId, token);
     }
@@ -380,7 +403,7 @@ export class InitialReconciler {
     return this.run({ ...binding, state: session.type === 'FULL_RESYNC' ? 'resyncing' : 'initializing' }, session);
   }
 
-  private async driveBinding(bindingId: string): Promise<LifecycleOutcome | 'idle'> {
+  private async driveBinding(bindingId: string, lockToken?: string): Promise<LifecycleOutcome | 'idle'> {
     const binding = await this.mustGetBinding(bindingId);
     // A waiting_user session is driven by `answer`, not by a sync trigger: the
     // server will not move until the user picks a candidate.
@@ -397,7 +420,7 @@ export class InitialReconciler {
     if (found && found.driver !== 'server' && !found.serverSessionId) return 'idle';
     const session = found ?? (await this.openSession(binding));
     await this.db.bindings.update(binding.id, { state: 'initializing' });
-    return this.run(binding, session);
+    return this.run(binding, session, lockToken);
   }
 
   private async openSession(binding: BindingRecord, type: ReconType = 'INITIAL'): Promise<ReconSessionRecord> {
@@ -443,7 +466,7 @@ export class InitialReconciler {
       throw new Error('initialReconcile: another round is holding this binding');
     }
     try {
-      return await this.decideAndRun(binding, session, decisions);
+      return await this.decideAndRun(binding, session, decisions, token);
     } finally {
       await releaseRunLock(this.db, bindingId, token);
     }
@@ -453,6 +476,7 @@ export class InitialReconciler {
     binding: BindingRecord,
     session: ReconSessionRecord,
     decisions: Record<string, string>,
+    lockToken?: string,
   ): Promise<LifecycleOutcome> {
     await this.transport.decideReconciliation(session.serverSessionId!, decisions);
     session.state = 'RUNNING';
@@ -462,7 +486,7 @@ export class InitialReconciler {
     // parks at 'resyncing', an initialization at 'initializing'.
     const state: BindingState = session.type === 'FULL_RESYNC' ? 'resyncing' : 'initializing';
     await this.db.bindings.update(binding.id, { state });
-    return this.run({ ...binding, state }, session);
+    return this.run({ ...binding, state }, session, lockToken);
   }
 
   // --- phases ---
@@ -519,7 +543,7 @@ export class InitialReconciler {
     // it is the one that declares it: the server matches the tree by canonical
     // id and the client keeps its browser nodes instead of duplicating them.
     const declareIds = session.type === 'FULL_RESYNC';
-    const { snapshot, refs } = await buildClientSnapshot(
+    const { snapshot, refs, snapshotNodes } = await buildClientSnapshot(
       this.adapter,
       binding,
       binding.epoch,
@@ -527,6 +551,7 @@ export class InitialReconciler {
       declareIds ? (browserId) => this.mappedCanonicalId(binding.id, browserId) : undefined,
     );
     session.localRefs = refs;
+    session.snapshotNodes = snapshotNodes;
     session.progress.localOnly = snapshot.nodes.length;
     await this.touch(session);
     await this.transport.submitClientSnapshot(binding.id, snapshot);
@@ -568,12 +593,15 @@ export class InitialReconciler {
       bindingId: binding.id,
       localRefs: session.localRefs ?? {},
       roots: mountRoots(binding),
+      snapshotNodes: session.snapshotNodes,
     };
-    await applyReconcileSteps(this.db, this.adapter, scope, steps);
+    const { locallyDeleted } = await applyReconcileSteps(this.db, this.adapter, scope, steps);
     // Do not ask the server to close out a plan the browser does not hold:
     // completing adopts the commit revision as the new baseline, which would
-    // hide every node that never landed.
-    const problems = await verifyAppliedSteps(this.db, this.adapter, binding.id, steps);
+    // hide every node that never landed. Nodes the user intentionally deleted
+    // between snapshot and apply are tracked in locallyDeleted and synced out
+    // as delete ops once active (R32).
+    const problems = await verifyAppliedSteps(this.db, this.adapter, binding.id, steps, new Set(locallyDeleted));
     if (problems.length > 0) {
       await logDiagnostic(this.db, 'error', 'initial-reconcile', '已应用的方案未达成，下一轮重试', {
         bindingId: binding.id,
@@ -585,6 +613,7 @@ export class InitialReconciler {
       await this.touch(session);
       throw new Error(`initialReconcile: plan not satisfied after apply (${problems[0]})`);
     }
+    session.locallyDeleted = locallyDeleted.length > 0 ? locallyDeleted : undefined;
     session.progress.applied = session.commitRevision ?? session.progress.applied;
     session.progress.serverOnly = 0;
     session.serverPhase = 'committed';
@@ -596,7 +625,8 @@ export class InitialReconciler {
 
   /**
    * Write the server's answer back into the replica baseline (doc 06 §8):
-   * both watermarks sit at the commit revision, so the next /sync round
+   * both watermarks sit at the baseline revision (commit_revision for initial,
+   * target_revision for resync/recovery — R34), so the next /sync round
    * carries only what changed after the reconciliation.
    */
   private async finish(
@@ -604,7 +634,11 @@ export class InitialReconciler {
     session: ReconSessionRecord,
     env: ReconciliationEnvelopeWire,
   ): Promise<LifecycleOutcome> {
-    const revision = env.binding?.applied_revision ?? session.commitRevision;
+    const fallbackRevision =
+      session.type === 'INITIAL'
+        ? (session.commitRevision ?? env.session.commit_revision)
+        : (typeof env.session.target_revision === 'number' ? env.session.target_revision : session.targetRevision);
+    const revision = env.binding?.applied_revision ?? fallbackRevision;
     if (revision == null) {
       throw new Error('initialReconcile: completed without a baseline revision to adopt');
     }
@@ -624,9 +658,13 @@ export class InitialReconciler {
         return this.settleAdoptedCreates(binding.id);
       },
     );
+    const queuedPostOps = await this.reconcilePostSnapshotChanges(binding, session, revision);
     session.state = 'COMPLETED';
     session.phase = 'done';
     session.issues = undefined;
+    session.dirtyBrowserIds = undefined;
+    session.locallyDeleted = undefined;
+    session.snapshotNodes = undefined;
     session.serverPhase = env.session.phase;
     await this.touch(session);
     await logDiagnostic(this.db, 'info', 'initial-reconcile', '初始对账已完成', {
@@ -634,8 +672,236 @@ export class InitialReconciler {
       sessionId: env.session.id,
       baselineRevision: revision,
       settledCreates: settled,
+      queuedPostOps,
     });
     return 'completed';
+  }
+
+  /**
+   * Capture local changes that happened between snapshot submission and
+   * reconciliation completion (R32) plus browser-only nodes preserved during a
+   * mapping-lost recovery (R30), queuing ordinary incremental operations so
+   * they sync out on the very next /sync round.
+   */
+  private async reconcilePostSnapshotChanges(
+    binding: BindingRecord,
+    session: ReconSessionRecord,
+    baselineRevision: number,
+  ): Promise<number> {
+    const roots = mountRoots(binding);
+    const rootKeyByBrowserId = new Map<string, string>();
+    for (const [key, browserId] of Object.entries(roots)) {
+      rootKeyByBrowserId.set(browserId, key);
+    }
+
+    const unsettled = await this.db.pendingOps
+      .where('bindingId')
+      .equals(binding.id)
+      .filter((o) => isUnsettledOp(o))
+      .toArray();
+    const pendingCreateByBrowser = new Map<string, string>(); // browserId -> nodeId
+    const pendingDeleteByCanonical = new Set<string>();
+    for (const op of unsettled) {
+      if (op.type === 'create' && op.browserId) {
+        pendingCreateByBrowser.set(op.browserId, op.nodeId);
+      } else if (op.type === 'delete' && op.nodeId) {
+        pendingDeleteByCanonical.add(op.nodeId);
+      }
+    }
+
+    let queued = 0;
+
+    // 1. Queue deletes for snapshot nodes the user removed locally during waiting_user (R32).
+    const locallyDeleted = session.locallyDeleted ?? [];
+    if (locallyDeleted.length > 0) {
+      await this.db.transaction('rw', [this.db.bindings, this.db.pendingOps], async () => {
+        const b = await this.db.bindings.get(binding.id);
+        if (!b) return;
+        for (const canonicalId of locallyDeleted) {
+          if (pendingDeleteByCanonical.has(canonicalId)) continue;
+          b.clientSeq += 1;
+          await this.db.pendingOps.add({
+            opId: uuidv7(),
+            bindingId: b.id,
+            clientSeq: b.clientSeq,
+            baseRevision: baselineRevision,
+            status: 'QUEUED',
+            type: 'delete',
+            nodeId: canonicalId,
+            createdAt: Date.now(),
+          });
+          pendingDeleteByCanonical.add(canonicalId);
+          queued += 1;
+        }
+        await this.db.bindings.put(b);
+      });
+    }
+
+    // 2. Walk the live mounted browser tree top-down to queue:
+    //    - updates/moves on mapped nodes edited while waiting_user (R32)
+    //    - creates for browser-only nodes preserved during MAPPING_LOST (R30)
+    //    - creates for nodes added after snapshot submission (R32)
+    const dirtySet = new Set(session.dirtyBrowserIds ?? []);
+    const snapshotNodes = session.snapshotNodes;
+    const allocatedCanonicalByBrowser = new Map<string, string>();
+    for (const [bId, cId] of pendingCreateByBrowser) {
+      allocatedCanonicalByBrowser.set(bId, cId);
+    }
+
+    const resolveParentRef = async (parentBrowserId: string | null): Promise<ParentRefWire | null> => {
+      if (!parentBrowserId) return null;
+      const rootKey = rootKeyByBrowserId.get(parentBrowserId);
+      if (rootKey) return { type: 'root', key: rootKey };
+      const parentMirror = await this.db.localNodes.get([binding.id, parentBrowserId]);
+      if (parentMirror?.canonicalId) return { type: 'node', id: parentMirror.canonicalId };
+      const allocated = allocatedCanonicalByBrowser.get(parentBrowserId);
+      if (allocated) return { type: 'node', id: allocated };
+      return null;
+    };
+
+    const nextSiblingCanonicalId = async (parentBrowserId: string, index: number): Promise<string | null> => {
+      const children = await this.adapter.getChildren(parentBrowserId);
+      for (const child of children) {
+        if (child.index <= index) continue;
+        const m = await this.db.localNodes.get([binding.id, child.id]);
+        if (m?.canonicalId) return m.canonicalId;
+      }
+      return null;
+    };
+
+    for (const rootBrowserId of Object.values(roots)) {
+      const rootNode = await this.adapter.getNode(rootBrowserId);
+      if (!rootNode) continue;
+      const queue = await this.adapter.getChildren(rootBrowserId);
+      while (queue.length > 0) {
+        const node = queue.shift()!;
+        const mirror = await this.db.localNodes.get([binding.id, node.id]);
+
+        if (mirror?.canonicalId) {
+          // Compare live browser node against mirror (initialized from snapshot
+          // by applyAssignIdentity) to capture mid-reconcile edits/moves (R32).
+          const titleChanged = node.title !== mirror.title;
+          const urlChanged = node.type === 'bookmark' && (node.url ?? null) !== mirror.url;
+          const parentChanged = node.parentId != null && node.parentId !== mirror.parentBrowserId;
+          if (titleChanged || urlChanged || parentChanged) {
+            const parentRef = parentChanged ? await resolveParentRef(node.parentId) : null;
+            const beforeId =
+              parentChanged && node.parentId ? await nextSiblingCanonicalId(node.parentId, node.index) : null;
+            await this.db.transaction('rw', [this.db.bindings, this.db.localNodes, this.db.pendingOps], async () => {
+              const b = await this.db.bindings.get(binding.id);
+              if (!b) return;
+              if (titleChanged) {
+                b.clientSeq += 1;
+                await this.db.pendingOps.add({
+                  opId: uuidv7(),
+                  bindingId: b.id,
+                  clientSeq: b.clientSeq,
+                  baseRevision: baselineRevision,
+                  status: 'QUEUED',
+                  type: 'update_title',
+                  nodeId: mirror.canonicalId!,
+                  title: node.title,
+                  createdAt: Date.now(),
+                });
+                queued += 1;
+              }
+              if (urlChanged) {
+                b.clientSeq += 1;
+                await this.db.pendingOps.add({
+                  opId: uuidv7(),
+                  bindingId: b.id,
+                  clientSeq: b.clientSeq,
+                  baseRevision: baselineRevision,
+                  status: 'QUEUED',
+                  type: 'update_url',
+                  nodeId: mirror.canonicalId!,
+                  url: node.url ?? '',
+                  createdAt: Date.now(),
+                });
+                queued += 1;
+              }
+              if (parentChanged && parentRef) {
+                b.clientSeq += 1;
+                await this.db.pendingOps.add({
+                  opId: uuidv7(),
+                  bindingId: b.id,
+                  clientSeq: b.clientSeq,
+                  baseRevision: baselineRevision,
+                  status: 'QUEUED',
+                  type: 'move',
+                  nodeId: mirror.canonicalId!,
+                  parent: parentRef,
+                  beforeId,
+                  browserId: node.id,
+                  createdAt: Date.now(),
+                });
+                queued += 1;
+              }
+              await this.db.localNodes.put({
+                ...mirror,
+                title: node.title,
+                url: node.type === 'folder' ? null : (node.url ?? null),
+                parentBrowserId: parentChanged && parentRef ? node.parentId : mirror.parentBrowserId,
+              });
+              await this.db.bindings.put(b);
+            });
+          }
+        } else if (!mirror && !pendingCreateByBrowser.has(node.id)) {
+          const shouldEnqueueCreate =
+            session.type === 'MAPPING_LOST' ||
+            dirtySet.has(node.id) ||
+            (snapshotNodes != null && !(node.id in snapshotNodes));
+          if (shouldEnqueueCreate) {
+            const parentRef = await resolveParentRef(node.parentId);
+            if (parentRef) {
+              const beforeId = node.parentId ? await nextSiblingCanonicalId(node.parentId, node.index) : null;
+              const newCanonicalId = uuidv7();
+              allocatedCanonicalByBrowser.set(node.id, newCanonicalId);
+              await this.db.transaction('rw', [this.db.bindings, this.db.localNodes, this.db.pendingOps], async () => {
+                const b = await this.db.bindings.get(binding.id);
+                if (!b) return;
+                b.clientSeq += 1;
+                await this.db.localNodes.put({
+                  bindingId: b.id,
+                  browserId: node.id,
+                  canonicalId: null,
+                  type: node.type,
+                  title: node.title,
+                  url: node.url ?? null,
+                  parentBrowserId: node.parentId,
+                  position: null,
+                });
+                await this.db.pendingOps.add({
+                  opId: uuidv7(),
+                  bindingId: b.id,
+                  clientSeq: b.clientSeq,
+                  baseRevision: baselineRevision,
+                  status: 'QUEUED',
+                  type: 'create',
+                  nodeId: newCanonicalId,
+                  nodeType: node.type,
+                  title: node.title,
+                  url: node.url ?? undefined,
+                  parent: parentRef,
+                  beforeId,
+                  browserId: node.id,
+                  createdAt: Date.now(),
+                });
+                await this.db.bindings.put(b);
+              });
+              pendingCreateByBrowser.set(node.id, newCanonicalId);
+              queued += 1;
+            }
+          }
+        }
+
+        if (node.type === 'folder') {
+          queue.push(...(await this.adapter.getChildren(node.id)));
+        }
+      }
+    }
+
+    return queued;
   }
 
   /**

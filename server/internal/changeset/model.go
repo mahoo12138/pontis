@@ -23,8 +23,9 @@ const (
 	KindNodeMove   Kind = "node_move"
 	KindNodeDelete Kind = "node_delete"
 	// High-level operations aggregating many primitives (doc 15 §8).
-	KindImport      Kind = "import"
-	KindPublication Kind = "publication_apply"
+	KindImport         Kind = "import"
+	KindPublication    Kind = "publication_apply"
+	KindReconciliation Kind = "reconciliation"
 	// Cross-space transfer sides (not undoable in V1: undo would be a
 	// reverse transfer, a separate high-level operation).
 	KindTransferIn  Kind = "transfer_in"

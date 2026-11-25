@@ -21,9 +21,13 @@ import {
   type ExpectedMutationRecord,
   type LocalNodeRecord,
   type PontisDB,
+  type SnapshotNodeSummary,
 } from '../store/db';
-import type { ApplyStepWire, NodeType, ParentRefWire } from '../protocol/types';
+import type { ApplyStepWire, ParentRefWire } from '../protocol/types';
 import { syncMirrorPositions } from './remoteChangeApplier';
+
+/** Maximum lifetime for unconsumed reconciliation step expectations (R37). */
+export const STEP_EXPECTATION_TTL_MS = 60_000;
 
 /** The mount + snapshot a step list is resolved against. */
 export interface StepScope {
@@ -32,6 +36,37 @@ export interface StepScope {
   localRefs: Record<string, string>;
   /** Canonical root slot key → browser root id. */
   roots: Record<string, string>;
+  /** Browser node state captured when the client snapshot was built (R32). */
+  snapshotNodes?: Record<string, SnapshotNodeSummary>;
+}
+
+/** Side-effects reported back to InitialReconciler after applying steps. */
+export interface ApplyStepsResult {
+  /**
+   * Canonical ids whose browser node vanished between snapshot submission and
+   * step application (e.g. user deleted the bookmark during waiting_user).
+   * Verification ignores them and finish() queues matching delete ops (R32).
+   */
+  locallyDeleted: string[];
+}
+
+/**
+ * Remove expired reconciliation step expectations (revision === 0) so an
+ * unconsumed echo cannot swallow future user edits forever (R37).
+ */
+export async function pruneExpiredStepExpectations(
+  db: PontisDB,
+  bindingId: string,
+  now = Date.now(),
+): Promise<number> {
+  const stale = await db.expectedMutations
+    .where('bindingId')
+    .equals(bindingId)
+    .filter((e) => e.revision === STEP_REVISION && now - e.createdAt > STEP_EXPECTATION_TTL_MS)
+    .toArray();
+  if (stale.length === 0) return 0;
+  await db.expectedMutations.bulkDelete(stale.map((e) => e.id!));
+  return stale.length;
 }
 
 /**
@@ -59,15 +94,17 @@ export async function applyReconcileSteps(
   adapter: BrowserAdapter,
   scope: StepScope,
   steps: ApplyStepWire[],
-): Promise<void> {
+): Promise<ApplyStepsResult> {
+  const locallyDeleted = new Set<string>();
   for (const step of steps) {
-    await applyStep(db, adapter, scope, step);
+    await applyStep(db, adapter, scope, step, locallyDeleted);
   }
   // The steps placed nodes among their siblings; adopt the browser's order
   // as the mirrored canonical order for the whole mounted tree.
   for (const rootId of Object.values(scope.roots)) {
     await adoptBrowserOrder(db, adapter, scope.bindingId, rootId);
   }
+  return { locallyDeleted: [...locallyDeleted] };
 }
 
 async function applyStep(
@@ -75,16 +112,17 @@ async function applyStep(
   adapter: BrowserAdapter,
   scope: StepScope,
   step: ApplyStepWire,
+  locallyDeleted: Set<string>,
 ): Promise<void> {
   switch (step.kind) {
     case 'assign_identity':
-      return applyAssignIdentity(db, adapter, scope, step);
+      return applyAssignIdentity(db, adapter, scope, step, locallyDeleted);
     case 'create':
       return applyCreate(db, adapter, scope, step);
     case 'update':
-      return applyUpdate(db, adapter, scope, step);
+      return applyUpdate(db, adapter, scope, step, locallyDeleted);
     case 'move':
-      return applyMove(db, adapter, scope, step);
+      return applyMove(db, adapter, scope, step, locallyDeleted);
     case 'delete':
       return applyDelete(db, adapter, scope, step);
   }
@@ -99,6 +137,7 @@ async function applyAssignIdentity(
   adapter: BrowserAdapter,
   scope: StepScope,
   step: ApplyStepWire,
+  locallyDeleted: Set<string>,
 ): Promise<void> {
   const canonicalId = step.canonical_id ?? '';
   const browserId = scope.localRefs[step.local_ref ?? ''];
@@ -120,20 +159,28 @@ async function applyAssignIdentity(
   }
   const node = await adapter.getNode(browserId);
   if (!node) {
-    await logDiagnostic(db, 'warn', 'reconcile-steps', '身份步骤指向的浏览器节点已不存在', {
+    // The user deleted this bookmark between snapshot submission and step
+    // execution (e.g. while the session sat in waiting_user). Record it so
+    // verification passes and finish() queues the matching delete op (R32).
+    locallyDeleted.add(canonicalId);
+    await logDiagnostic(db, 'warn', 'reconcile-steps', '身份步骤指向的浏览器节点已被本地删除，完成后将同步删除', {
       browserId,
       canonicalId,
     });
     return;
   }
+  // Initialize the mirror to the snapshot-time values when known so any edit
+  // made while waiting_user shows up as a browser-vs-mirror diff in finish()
+  // instead of being silently swallowed (R32).
+  const snap = scope.snapshotNodes?.[browserId];
   await db.localNodes.put({
     bindingId: scope.bindingId,
     browserId: node.id,
     canonicalId,
-    type: node.type,
-    title: node.title,
-    url: node.url,
-    parentBrowserId: node.parentId,
+    type: snap?.type ?? node.type,
+    title: snap ? snap.title : node.title,
+    url: snap ? snap.url : node.url,
+    parentBrowserId: snap ? snap.parentBrowserId : node.parentId,
     position: null,
   });
 }
@@ -157,6 +204,54 @@ async function applyCreate(
     await db.localNodes.bulkDelete(stale.map((r) => [scope.bindingId, r.browserId] as [string, string]));
   }
   const parentBrowserId = await resolveParent(db, scope, step.parent);
+
+  // Crash-resume check (R37): if a previous worker crashed between
+  // adapter.create() and writing localNodes, a provisional create expectation
+  // still exists for this canonicalId. Adopt the matching unmapped orphan
+  // instead of creating a second copy.
+  const pendingProvisionals = await db.expectedMutations
+    .where('[bindingId+kind]')
+    .equals([scope.bindingId, 'create'])
+    .filter((e) => e.revision === STEP_REVISION && e.canonicalId === canonicalId && e.browserId == null)
+    .toArray();
+  if (pendingProvisionals.length > 0) {
+    const expectedTitle = step.title ?? '';
+    const expectedUrl = step.type === 'folder' ? null : (step.url || null);
+    const siblings = await adapter.getChildren(parentBrowserId);
+    const orphans = [];
+    for (const child of siblings) {
+      if (child.type !== (step.type ?? 'bookmark')) continue;
+      if (child.title !== expectedTitle || (child.url ?? null) !== expectedUrl) continue;
+      const mapped = await db.localNodes.get([scope.bindingId, child.id]);
+      if (!mapped) orphans.push(child);
+    }
+    if (orphans.length === 1) {
+      const orphan = orphans[0]!;
+      await db.transaction('rw', [db.localNodes, db.expectedMutations], async () => {
+        await db.expectedMutations.bulkDelete(pendingProvisionals.map((e) => e.id!));
+        await db.localNodes.put({
+          bindingId: scope.bindingId,
+          browserId: orphan.id,
+          canonicalId,
+          type: orphan.type,
+          title: orphan.title,
+          url: orphan.url,
+          parentBrowserId: orphan.parentId,
+          position: null,
+        });
+      });
+      await logDiagnostic(db, 'info', 'reconcile-steps', '崩溃恢复：认领未写镜像的孤立新建节点', {
+        bindingId: scope.bindingId,
+        browserId: orphan.id,
+        canonicalId,
+      });
+      return;
+    }
+    // Crash occurred before adapter.create (or ambiguous): drop stale
+    // provisional rows before issuing a fresh expectation.
+    await db.expectedMutations.bulkDelete(pendingProvisionals.map((e) => e.id!));
+  }
+
   const index = await indexForBefore(db, adapter, scope, parentBrowserId, step.before_id ?? '', null);
 
   const exp: ExpectedMutationRecord = {
@@ -168,7 +263,7 @@ async function applyCreate(
     parentBrowserId,
     position: null,
     title: step.title ?? '',
-    url: step.url ?? '',
+    url: step.type === 'folder' ? undefined : (step.url ?? ''),
     createdAt: Date.now(),
   };
   await db.expectedMutations.add(exp);
@@ -200,10 +295,13 @@ async function applyUpdate(
   adapter: BrowserAdapter,
   scope: StepScope,
   step: ApplyStepWire,
+  locallyDeleted: Set<string>,
 ): Promise<void> {
+  if (step.canonical_id && locallyDeleted.has(step.canonical_id)) return;
   const browserId = await resolveTargetBrowserId(db, scope, step);
   const mirror = await db.localNodes.get([scope.bindingId, browserId]);
   if (!mirror) return;
+  if (!(await adapter.getNode(browserId))) return;
   // One field per expected mutation: the event processor matches a change
   // event on the single field the expectation carries (doc 05 §8).
   if (step.title !== undefined && step.title !== mirror.title) {
@@ -248,13 +346,15 @@ async function applyMove(
   adapter: BrowserAdapter,
   scope: StepScope,
   step: ApplyStepWire,
+  locallyDeleted: Set<string>,
 ): Promise<void> {
+  if (step.canonical_id && locallyDeleted.has(step.canonical_id)) return;
   const browserId = await resolveTargetBrowserId(db, scope, step);
   const node = await adapter.getNode(browserId);
   if (!node) return;
   const parentBrowserId = await resolveParent(db, scope, step.parent);
   // Ensure-state: same parent and the sibling the step places it before is
-  // still directly above it (an append means it is last).
+  // directly after it (an append means it is last).
   if (await isPlaced(db, adapter, scope, parentBrowserId, browserId, step.before_id ?? '')) return;
 
   const mirror = await db.localNodes.get([scope.bindingId, browserId]);
@@ -378,9 +478,10 @@ async function isPlaced(
   const at = children.findIndex((c) => c.id === browserId);
   if (at < 0) return false;
   if (!beforeId) return at === children.length - 1;
-  const above = children[at - 1];
-  if (!above) return false;
-  const m = await db.localNodes.get([scope.bindingId, above.id]);
+  // before_id names the sibling that must come directly AFTER browserId.
+  const next = children[at + 1];
+  if (!next) return false;
+  const m = await db.localNodes.get([scope.bindingId, next.id]);
   return m?.canonicalId === beforeId;
 }
 
@@ -418,12 +519,13 @@ export async function verifyAppliedSteps(
   adapter: BrowserAdapter,
   bindingId: string,
   steps: ApplyStepWire[],
+  locallyDeleted: ReadonlySet<string> = new Set(),
 ): Promise<string[]> {
   const problems: string[] = [];
   const checked = new Set<string>();
   for (const step of steps) {
     const canonicalId = step.canonical_id;
-    if (!canonicalId || step.kind === 'delete' || checked.has(canonicalId)) continue;
+    if (!canonicalId || step.kind === 'delete' || checked.has(canonicalId) || locallyDeleted.has(canonicalId)) continue;
     checked.add(canonicalId);
     const mirror = await findMirrorByCanonical(db, bindingId, canonicalId);
     if (!mirror) {
@@ -436,7 +538,7 @@ export async function verifyAppliedSteps(
   }
   const rows = await db.localNodes.where('bindingId').equals(bindingId).toArray();
   for (const row of rows) {
-    if (checked.has(row.canonicalId ?? '')) continue;
+    if (checked.has(row.canonicalId ?? '') || (row.canonicalId && locallyDeleted.has(row.canonicalId))) continue;
     if (!(await adapter.getNode(row.browserId))) {
       problems.push(`mirror row ${row.browserId} points at a node the browser no longer has`);
     }

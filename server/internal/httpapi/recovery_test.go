@@ -118,9 +118,10 @@ func TestMappingLostRecoveryReMatchesWithoutTouchingTheCanonicalTree(t *testing.
 	counts := stepKinds(t, steps)
 	// doc 06 §12's failure mode is a flood of CREATEs for nodes the space
 	// already holds: the three re-declared nodes come back as identity
-	// assignments, and nothing in the browser is asked to be removed.
-	if counts["assign_identity"] < 3 {
-		t.Errorf("recovery re-mapped %d nodes, want the 3 the browser still holds (steps %v)",
+	// assignments, browser-only l_5 does NOT receive a phantom canonical UUID
+	// (R30), and nothing in the browser is asked to be removed.
+	if counts["assign_identity"] != 3 {
+		t.Errorf("recovery re-mapped %d nodes, want exactly the 3 canonical nodes (steps %v)",
 			counts["assign_identity"], counts)
 	}
 	if counts["create"] != 0 || counts["delete"] != 0 {
@@ -231,5 +232,17 @@ func TestRecoveryResumesAtTheSnapshotPoint(t *testing.T) {
 	}
 	if got := nodeTitles(t, ts, sessionAuth, spaceID); len(got) != 2 {
 		t.Fatalf("canonical nodes = %d %v, want 2", len(got), got)
+	}
+
+	// R34: GET /reconciliations/{sessionID} on a completed session must also
+	// carry the finalized binding so a client recovering from a lost /complete
+	// response adopts target_revision instead of commit_revision.
+	fetched := mustCall(t, http.MethodGet, base+"/reconciliations/"+sessionID, lostAuth, nil)
+	fetchedBinding, _ := fetched["binding"].(map[string]any)
+	if fetchedBinding == nil {
+		t.Fatalf("GET completed reconciliation omitted binding (R34): %v", fetched)
+	}
+	if gotRev := fieldInt(t, fetchedBinding, "applied_revision"); gotRev != target {
+		t.Fatalf("GET completed reconciliation binding.applied_revision = %d, want snapshot revision %d", gotRev, target)
 	}
 }

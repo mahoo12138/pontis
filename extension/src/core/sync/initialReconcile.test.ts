@@ -705,4 +705,101 @@ describe('mapping-lost recovery over the server engine (doc 06 §12)', () => {
     expect(lifecycle.calls).not.toContain('create');
     expect((await db.localNodes.get([bindingId, 'c1']))?.canonicalId).toBe('n9');
   });
+
+  it('R30: enqueues browser-only bookmarks left unmapped after mapping-lost recovery', async () => {
+    await seedBinding({ state: 'active', appliedRevision: 121, receivedRevision: 121 });
+    // b1 matches server node n1; b2 is browser-only (no assign_identity step from server).
+    lifecycle.steps = [{ kind: 'assign_identity', local_ref: 'l_2', canonical_id: 'n1' }];
+
+    expect(await reconciler.recoverMapping(bindingId)).toBe('completed');
+
+    expect((await db.localNodes.get([bindingId, 'b1']))?.canonicalId).toBe('n1');
+    const ops = await db.pendingOps.where('bindingId').equals(bindingId).toArray();
+    expect(ops).toHaveLength(1);
+    expect(ops[0]).toMatchObject({
+      type: 'create',
+      status: 'QUEUED',
+      browserId: 'b2',
+      title: 'Docs',
+      url: 'https://docs.example.com',
+      parent: { type: 'root', key: 'main' },
+    });
+  });
+
+  it('R32: syncs delete, rename, and create performed while waiting_user without stalling verification', async () => {
+    const binding = await seedBinding();
+    lifecycle.issues = [
+      {
+        id: 'i1',
+        type: 'ambiguous_identity',
+        payload: { source_ref: 'l_2', title: 'Home', url: 'https://home.example.com', candidates: ['n1', 'nX'] },
+        default_choice: '',
+      },
+    ];
+    lifecycle.steps = [
+      { kind: 'assign_identity', local_ref: 'l_2', canonical_id: 'n1' },
+      { kind: 'assign_identity', local_ref: 'l_3', canonical_id: 'n2' },
+    ];
+
+    expect(await reconciler.runBinding(binding.id)).toBe('waiting_user');
+
+    // While waiting for the user's answer: delete b1, rename b2, and add b3.
+    await adapter.removeBookmark('b1');
+    await adapter.update('b2', { title: 'Docs (edited)' });
+    adapter.seed({ id: 'b3', parentId: 'f1', title: 'New While Waiting', url: 'https://new.example.com' });
+
+    expect(await reconciler.answer(bindingId, { i1: 'n1' })).toBe('completed');
+    expect((await db.bindings.get(bindingId))?.state).toBe('active');
+
+    const ops = await db.pendingOps.where('bindingId').equals(bindingId).toArray();
+    expect(ops.find((o) => o.type === 'delete' && o.nodeId === 'n1')).toBeTruthy();
+    expect(ops.find((o) => o.type === 'update_title' && o.nodeId === 'n2' && o.title === 'Docs (edited)')).toBeTruthy();
+    expect(ops.find((o) => o.type === 'create' && o.browserId === 'b3' && o.title === 'New While Waiting')).toBeTruthy();
+  });
+
+  it('R34: adopts target_revision instead of commit_revision when recovering a completed full_resync without binding', async () => {
+    await seedBinding({ state: 'resyncing', appliedRevision: 10, receivedRevision: 10 });
+    await db.reconSessions.put({
+      id: 'sess-resync-lost',
+      bindingId,
+      type: 'FULL_RESYNC',
+      state: 'RUNNING',
+      phase: 'prepare',
+      driver: 'server',
+      serverSessionId: 'srv-1',
+      targetRevision: 50,
+      commitRevision: 55,
+      journalFloor: 0,
+      serverRevision: 0,
+      progress: emptyReconProgress(),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    lifecycle.getReconciliation = async () => ({
+      session: {
+        id: 'srv-1',
+        binding_id: bindingId,
+        space_id: 'space-1',
+        type: 'full_resync',
+        reason: 'history expired',
+        state: 'completed',
+        source_epoch: 1,
+        source_revision: 10,
+        target_epoch: 1,
+        target_revision: 50,
+        server_committed: true,
+        commit_revision: 55,
+        created_at: '',
+        updated_at: '',
+      },
+      issues: [],
+    });
+    const rec = new InitialReconciler(db, adapter, lifecycle);
+
+    expect(await rec.runBinding(bindingId)).toBe('completed');
+    const fresh = await db.bindings.get(bindingId);
+    expect(fresh?.state).toBe('active');
+    expect(fresh?.appliedRevision).toBe(50);
+    expect(fresh?.receivedRevision).toBe(50);
+  });
 });

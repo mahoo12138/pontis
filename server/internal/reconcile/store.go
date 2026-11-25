@@ -26,12 +26,15 @@ type Store interface {
 
 	InsertArtifact(ctx context.Context, a Artifact) error
 	GetArtifact(ctx context.Context, id string) (Artifact, error)
+	DeleteArtifact(ctx context.Context, id string) error
 
 	GetServerSnapshotByArtifact(ctx context.Context, artifactID string) (ServerSnapshot, error)
 	ListSnapshotNodes(ctx context.Context, snapshotID string, offset, limit int) ([]SnapshotNode, error)
 
 	ReplaceIssues(ctx context.Context, sessionID string, issues []Issue) error
+	SyncIssues(ctx context.Context, sessionID string, openIssues []Issue) error
 	ListIssues(ctx context.Context, sessionID string) ([]Issue, error)
+	ListAllIssues(ctx context.Context, sessionID string) ([]Issue, error)
 	ResolveIssue(ctx context.Context, issueID, choice string, at time.Time) error
 
 	LoadBinding(ctx context.Context, bindingID string) (device.Binding, error)
@@ -46,9 +49,17 @@ type Tx interface {
 
 	// ListRootSlots returns the space's root slots ordered by position.
 	ListRootSlots(ctx context.Context, space canonical.SpaceID) ([]canonical.RootSlot, error)
+	// ListAllNodes returns every node in the space ordered by position so
+	// snapshot freezing takes one query instead of N+1 per-node queries.
+	ListAllNodes(ctx context.Context, space canonical.SpaceID) ([]canonical.Node, error)
+	// LoadBinding reads a binding inside the write transaction.
+	LoadBinding(ctx context.Context, bindingID string) (device.Binding, error)
 
 	InsertServerSnapshot(ctx context.Context, snap ServerSnapshot, nodes []SnapshotNode) error
+	DeleteServerSnapshot(ctx context.Context, id string) error
 	InsertArtifact(ctx context.Context, a Artifact) error
+	DeleteArtifact(ctx context.Context, id string) error
+	PurgeSessionArtifacts(ctx context.Context, sess Session) error
 	UpdateSessionServerSnapshot(ctx context.Context, id, phase, serverArtifactID string, targetEpoch, targetRevision int64, at time.Time) error
 	MarkSessionCommitted(ctx context.Context, id string, commitRevision int64, at time.Time) error
 	CompleteSession(ctx context.Context, id string, at time.Time) error

@@ -8,6 +8,7 @@ import (
 
 	"pontis/internal/backup"
 	"pontis/internal/canonical"
+	"pontis/internal/changeset"
 	"pontis/internal/device"
 	"pontis/internal/reconcile"
 )
@@ -25,7 +26,7 @@ func setupReconcileTest(t *testing.T) (*reconcile.Service, *reconcileDeps) {
 			t.Fatal(err)
 		}
 	}
-	return reconcile.NewService(NewReconcileStore(db)), &reconcileDeps{t: t, db: db}
+	return reconcile.NewService(NewReconcileStore(db), changeset.NewService(NewChangeSetStore(db))), &reconcileDeps{t: t, db: db}
 }
 
 type reconcileDeps struct {
@@ -554,5 +555,287 @@ func TestRestoreSupersedesAnOpenReconciliation(t *testing.T) {
 	if state != "pending_initial" || epoch != 2 || applied != 0 || received != 0 {
 		t.Fatalf("binding = %s epoch %d at %d/%d, want pending_initial at the new baseline",
 			state, epoch, applied, received)
+	}
+}
+
+// R29: Full Resync matches by canonical ID and must NEVER emit an
+// assign_identity step whose local_ref is a canonical UUID instead of a client
+// snapshot local_ref.
+func TestReconcileFullResyncDoesNotEmitBogusAssignIdentity(t *testing.T) {
+	svc, deps := setupReconcileTest(t)
+	ctx := context.Background()
+	_, bindingID := deps.registerPendingBinding("Chrome")
+	deps.activateBinding(bindingID)
+
+	seedSystem(t, deps.db,
+		canonical.CreateNode{SpaceID: "s1", NodeID: "n1", Type: canonical.NodeTypeFolder,
+			Title: "Work", Parent: canonical.NewRootParent("main")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "n2", Type: canonical.NodeTypeBookmark,
+			Title: "RenamedOnServer", URL: "https://srv.example", Parent: canonical.NewNodeParent("n1")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "n3", Type: canonical.NodeTypeBookmark,
+			Title: "ServerOnly", URL: "https://new.example", Parent: canonical.NewNodeParent("n1")},
+	)
+
+	snapshot := clientSnapshot(
+		[]reconcile.ClientRootJSON{{LocalRef: "l_1", RootKey: "main", Title: "Bar"}},
+		[]reconcile.ClientNodeJSON{
+			{LocalRef: "l_2", ParentLocalRef: "l_1", Type: "folder", Title: "Work", CanonicalID: "n1"},
+			{LocalRef: "l_3", ParentLocalRef: "l_2", Type: "bookmark", Title: "OldLocal", URL: "https://srv.example", CanonicalID: "n2"},
+			{LocalRef: "l_4", ParentLocalRef: "l_1", Type: "bookmark", Title: "StaleLocal", URL: "https://stale.example"},
+		},
+	)
+	knownLocalRefs := map[string]bool{"l_1": true, "l_2": true, "l_3": true, "l_4": true}
+
+	sess, err := svc.CreateSession(ctx, bindingID, reconcile.TypeFullResync, "history expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitClientSnapshot(ctx, bindingID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateServerSnapshot(ctx, bindingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.Plan(ctx, sess.ID); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if _, err := svc.Commit(ctx, sess.ID); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	steps, err := svc.Steps(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("Steps: %v", err)
+	}
+	var creates, updates, deletes int
+	for _, st := range steps.Steps {
+		if st.Kind == reconcile.StepAssignIdentity {
+			t.Fatalf("full_resync must not emit assign_identity for already-mapped nodes: %+v", st)
+		}
+		if st.LocalRef != "" && !knownLocalRefs[st.LocalRef] {
+			t.Fatalf("step references unknown local_ref %q (not in client snapshot): %+v", st.LocalRef, st)
+		}
+		switch st.Kind {
+		case reconcile.StepCreate:
+			creates++
+		case reconcile.StepUpdate:
+			updates++
+		case reconcile.StepDelete:
+			deletes++
+		}
+	}
+	if creates != 1 || updates != 1 || deletes != 1 {
+		t.Fatalf("steps counts create=%d update=%d delete=%d, want 1/1/1: %+v", creates, updates, deletes, steps.Steps)
+	}
+}
+
+// R31 & R33: Empty choice "" converges (duplicate-create), invalid decisions do
+// not poison DB state, partial multi-round decisions keep earlier choices, and
+// disambiguating folders recursively matches their children.
+func TestReconcileDecisionsAndFolderDisambiguation(t *testing.T) {
+	svc, deps := setupReconcileTest(t)
+	ctx := context.Background()
+	_, bindingID := deps.registerPendingBinding("Firefox")
+
+	// Two folders with the same name "Dev" on the server, plus two bookmarks with
+	// the same URL under root.
+	seedSystem(t, deps.db,
+		canonical.CreateNode{SpaceID: "s1", NodeID: "fA", Type: canonical.NodeTypeFolder,
+			Title: "Dev", Parent: canonical.NewRootParent("main")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "fB", Type: canonical.NodeTypeFolder,
+			Title: "Dev", Parent: canonical.NewRootParent("main")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "bInB", Type: canonical.NodeTypeBookmark,
+			Title: "Go Docs", URL: "https://go.dev/doc", Parent: canonical.NewNodeParent("fB")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "x1", Type: canonical.NodeTypeBookmark,
+			Title: "Dup1", URL: "https://dup.example", Parent: canonical.NewRootParent("main")},
+		canonical.CreateNode{SpaceID: "s1", NodeID: "x2", Type: canonical.NodeTypeBookmark,
+			Title: "Dup2", URL: "https://dup.example", Parent: canonical.NewRootParent("main")},
+	)
+
+	snapshot := clientSnapshot(
+		[]reconcile.ClientRootJSON{{LocalRef: "l_bar", RootKey: "main", Title: "Bar"}},
+		[]reconcile.ClientNodeJSON{
+			{LocalRef: "l_dev", ParentLocalRef: "l_bar", Type: "folder", Title: "Dev"},
+			{LocalRef: "l_go", ParentLocalRef: "l_dev", Type: "bookmark", Title: "Go Docs (local)", URL: "https://go.dev/doc"},
+			{LocalRef: "l_dup", ParentLocalRef: "l_bar", Type: "bookmark", Title: "Keep Separate", URL: "https://dup.example"},
+		},
+	)
+
+	sess, err := svc.CreateSession(ctx, bindingID, reconcile.TypeInitial, "pairing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitClientSnapshot(ctx, bindingID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateServerSnapshot(ctx, bindingID); err != nil {
+		t.Fatal(err)
+	}
+	sess, issues, err := svc.Plan(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if sess.State != reconcile.StateWaitingUser || len(issues) != 2 {
+		t.Fatalf("want waiting_user with 2 issues, got %s (%d issues)", sess.State, len(issues))
+	}
+
+	issueByRef := map[string]reconcile.Issue{}
+	for _, iss := range issues {
+		issueByRef[iss.Payload.SourceRef] = iss
+	}
+
+	// Invalid choice must be rejected without poisoning the issue row.
+	if _, _, err := svc.Decide(ctx, sess.ID, map[string]string{issueByRef["l_dev"].ID: "nonexistent"}); !errors.Is(err, reconcile.ErrDecisionInvalid) {
+		t.Fatalf("invalid decision err = %v, want ErrDecisionInvalid", err)
+	}
+
+	// Round 1: answer only the folder ambiguity (pick fB).
+	sess, remaining, err := svc.Decide(ctx, sess.ID, map[string]string{issueByRef["l_dev"].ID: "fB"})
+	if err != nil {
+		t.Fatalf("Decide round 1: %v", err)
+	}
+	if sess.State != reconcile.StateWaitingUser || len(remaining) != 1 || remaining[0].Payload.SourceRef != "l_dup" {
+		t.Fatalf("after round 1 want 1 remaining issue for l_dup, got state=%s remaining=%+v", sess.State, remaining)
+	}
+
+	// Round 2: pick "" (duplicate-create) for l_dup; must converge to running with 0 open issues!
+	sess, remaining, err = svc.Decide(ctx, sess.ID, map[string]string{remaining[0].ID: ""})
+	if err != nil {
+		t.Fatalf("Decide round 2: %v", err)
+	}
+	if sess.State != reconcile.StateRunning || len(remaining) != 0 {
+		t.Fatalf("after round 2 want running with 0 issues, got state=%s remaining=%+v", sess.State, remaining)
+	}
+
+	if _, err := svc.Commit(ctx, sess.ID); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// R33: child bookmark inside disambiguated folder fB must match bInB (update title),
+	// NOT create a duplicate bookmark!
+	bInB := deps.mustNode("bInB")
+	if bInB.Title != "Go Docs (local)" {
+		t.Fatalf("bInB title = %q, want matched local title", bInB.Title)
+	}
+	var goCount int
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE space_id = 's1' AND url = 'https://go.dev/doc'`).Scan(&goCount); err != nil {
+		t.Fatal(err)
+	}
+	if goCount != 1 {
+		t.Fatalf("go.dev/doc count = %d, want 1 (must not duplicate matched child)", goCount)
+	}
+	// Duplicate-create choice on l_dup created a 3rd bookmark without overwriting x1/x2.
+	var dupCount int
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM nodes WHERE space_id = 's1' AND url = 'https://dup.example'`).Scan(&dupCount); err != nil {
+		t.Fatal(err)
+	}
+	if dupCount != 3 {
+		t.Fatalf("dup.example count = %d, want 3", dupCount)
+	}
+}
+
+// R35 & R36: Commit guards against subsequent Decide/Plan, artifact cleanup
+// runs on re-plan/complete/revoke, and R43/R14 initial commit creates an
+// undoable ChangeSet even with empty-title bookmarks.
+func TestReconcileLifecycleCleanupChangeSetAndEmptyTitle(t *testing.T) {
+	svc, deps := setupReconcileTest(t)
+	ctx := context.Background()
+	_, bindingID := deps.registerPendingBinding("Safari")
+
+	snapshot := clientSnapshot(
+		[]reconcile.ClientRootJSON{{LocalRef: "l_bar", RootKey: "main", Title: "Bar"}},
+		[]reconcile.ClientNodeJSON{
+			{LocalRef: "l_empty", ParentLocalRef: "l_bar", Type: "bookmark", Title: "", URL: "https://icon-only.example"},
+		},
+	)
+
+	sess, err := svc.CreateSession(ctx, bindingID, reconcile.TypeInitial, "pairing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitClientSnapshot(ctx, bindingID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateServerSnapshot(ctx, bindingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.Plan(ctx, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Re-plan cleans superseded plan/steps artifacts (R36).
+	if _, _, err := svc.Plan(ctx, sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	var artCount int
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM sync_artifacts WHERE binding_id = ?`, bindingID).Scan(&artCount); err != nil {
+		t.Fatal(err)
+	}
+	if artCount != 4 {
+		t.Fatalf("artifacts after re-plan = %d, want 4 (client + server + latest plan + latest steps)", artCount)
+	}
+
+	if _, err := svc.Commit(ctx, sess.ID); err != nil {
+		t.Fatalf("Commit with empty-title bookmark: %v", err)
+	}
+	// R35: Cannot re-plan or commit again once committed.
+	if _, _, err := svc.Plan(ctx, sess.ID); !errors.Is(err, reconcile.ErrInvalidSessionState) {
+		t.Fatalf("Plan after commit = %v, want ErrInvalidSessionState", err)
+	}
+	if _, err := svc.Commit(ctx, sess.ID); !errors.Is(err, reconcile.ErrInvalidSessionState) {
+		t.Fatalf("second Commit = %v, want ErrInvalidSessionState", err)
+	}
+
+	// R43: Initial commit recorded an undoable reconciliation ChangeSet.
+	csStore := NewChangeSetStore(deps.db)
+	csList, err := csStore.ListChangeSets(ctx, "s1", 10)
+	if err != nil {
+		t.Fatalf("ListChangeSets: %v", err)
+	}
+	if len(csList) != 1 || csList[0].Kind != changeset.KindReconciliation || csList[0].UndoDataJSON == "" {
+		t.Fatalf("changesets = %+v, want 1 undoable reconciliation changeset", csList)
+	}
+
+	// R36: Complete purges all session artifacts and server snapshots.
+	if _, err := svc.Complete(ctx, sess.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM sync_artifacts WHERE binding_id = ?`, bindingID).Scan(&artCount); err != nil {
+		t.Fatal(err)
+	}
+	var snapCount int
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM server_snapshots WHERE binding_id = ?`, bindingID).Scan(&snapCount); err != nil {
+		t.Fatal(err)
+	}
+	if artCount != 0 || snapCount != 0 {
+		t.Fatalf("after Complete: artifacts=%d snapshots=%d, want 0/0", artCount, snapCount)
+	}
+
+	// R35 & R36: Revoking a binding atomically fails open reconciliations and purges artifacts.
+	sess2, err := svc.CreateSession(ctx, bindingID, reconcile.TypeFullResync, "resync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitClientSnapshot(ctx, bindingID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateServerSnapshot(ctx, bindingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.Plan(ctx, sess2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewDeviceStore(deps.db).RevokeBinding(ctx, bindingID, sess2.CreatedAt); err != nil {
+		t.Fatalf("RevokeBinding: %v", err)
+	}
+	if _, err := svc.Commit(ctx, sess2.ID); !errors.Is(err, reconcile.ErrInvalidSessionState) {
+		t.Fatalf("Commit after RevokeBinding = %v, want ErrInvalidSessionState", err)
+	}
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM sync_artifacts WHERE binding_id = ?`, bindingID).Scan(&artCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := deps.db.QueryRow(`SELECT COUNT(*) FROM server_snapshots WHERE binding_id = ?`, bindingID).Scan(&snapCount); err != nil {
+		t.Fatal(err)
+	}
+	if artCount != 0 || snapCount != 0 {
+		t.Fatalf("after RevokeBinding: artifacts=%d snapshots=%d, want 0/0", artCount, snapCount)
 	}
 }

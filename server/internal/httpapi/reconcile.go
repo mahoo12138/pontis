@@ -413,7 +413,9 @@ func (s *Server) handleActiveReconciliation(w http.ResponseWriter, r *http.Reque
 }
 
 // handleGetReconciliation returns the session, its issues and the plan
-// preview when one exists.
+// preview when one exists. For a completed session it also includes the
+// binding's finalized watermarks so a client recovering from a lost /complete
+// response can still adopt the authoritative baseline (R34).
 func (s *Server) handleGetReconciliation(w http.ResponseWriter, r *http.Request) {
 	sess, ok := s.deviceSession(w, r, chi.URLParam(r, "sessionID"))
 	if !ok {
@@ -424,7 +426,16 @@ func (s *Server) handleGetReconciliation(w http.ResponseWriter, r *http.Request)
 		s.writeReconcileError(w, r, err)
 		return
 	}
-	s.writeSessionWithIssues(w, r, sess, issues)
+	envelope := sessionEnvelope(sess, issues)
+	if plan, hasPlan := s.planOf(r.Context(), sess); hasPlan {
+		envelope.Plan = &plan
+	}
+	if sess.State == reconcile.StateCompleted {
+		if binding, err := s.Devices.GetBindingByID(r.Context(), sess.BindingID); err == nil {
+			envelope.Binding = ptr(fromBinding(binding))
+		}
+	}
+	writeJSON(w, http.StatusOK, envelope)
 }
 
 // handlePlanReconciliation computes the plan and the apply steps, and
