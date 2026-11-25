@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"pontis/internal/auth"
 )
 
 // AdminUserRow is one account row for the admin listing.
@@ -47,18 +49,64 @@ func (s *AccountStore) ListUsersWithStats(ctx context.Context) ([]AdminUserRow, 
 	return out, rows.Err()
 }
 
+// UpdateAdminUser atomically updates a user's status and/or role while
+// ensuring at least one active admin remains on the instance. Disabling a user
+// also drops their web sessions in the same transaction.
+func (s *AccountStore) UpdateAdminUser(ctx context.Context, userID string, status, role *string, at time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var curRole, curStatus string
+	if err := tx.QueryRowContext(ctx, `SELECT role, status FROM users WHERE id = ?`, userID).
+		Scan(&curRole, &curStatus); err != nil {
+		return err
+	}
+
+	nextRole, nextStatus := curRole, curStatus
+	if role != nil {
+		nextRole = *role
+	}
+	if status != nil {
+		nextStatus = *status
+	}
+
+	if curRole == string(auth.RoleAdmin) && curStatus == string(auth.StatusActive) &&
+		!(nextRole == string(auth.RoleAdmin) && nextStatus == string(auth.StatusActive)) {
+		var otherAdmins int64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM users
+			WHERE role = 'admin' AND status = 'active' AND id <> ?`, userID).Scan(&otherAdmins); err != nil {
+			return err
+		}
+		if otherAdmins == 0 {
+			return auth.ErrLastAdmin
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE users SET role = ?, status = ?, updated_at = ? WHERE id = ?`,
+		nextRole, nextStatus, formatTime(at), userID); err != nil {
+		return err
+	}
+	if status != nil && nextStatus == string(auth.StatusDisabled) {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // SetUserStatus enables or disables an account.
 func (s *AccountStore) SetUserStatus(ctx context.Context, userID, status string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE users SET status = ?, updated_at = ? WHERE id = ?`, status, formatTime(at), userID)
-	return err
+	return s.UpdateAdminUser(ctx, userID, &status, nil, at)
 }
 
 // SetUserRole promotes or demotes an account.
 func (s *AccountStore) SetUserRole(ctx context.Context, userID, role string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, role, formatTime(at), userID)
-	return err
+	return s.UpdateAdminUser(ctx, userID, nil, &role, at)
 }
 
 // InsertResetToken stores a hashed single-use reset token.

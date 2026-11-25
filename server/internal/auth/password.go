@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -20,8 +21,36 @@ const (
 	argonSaltLen = 16
 )
 
+// argonSem bounds concurrent Argon2id derivations so a flood of anonymous
+// login/register requests cannot exhaust memory on a small host (64 MiB × 4 = 256 MiB).
+var argonSem = make(chan struct{}, 4)
+
+// dummyPasswordHash is verified on unknown or passwordless accounts to keep
+// login latency comparable across account states.
+const dummyPasswordHash = "$argon2id$v=19$m=65536,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+func acquireArgon(ctx context.Context) error {
+	select {
+	case argonSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // HashPassword derives an Argon2id hash encoded in PHC string format.
 func HashPassword(password string) (string, error) {
+	return HashPasswordContext(context.Background(), password)
+}
+
+// HashPasswordContext derives an Argon2id hash while respecting concurrency
+// limits and context cancellation.
+func HashPasswordContext(ctx context.Context, password string) (string, error) {
+	if err := acquireArgon(ctx); err != nil {
+		return "", err
+	}
+	defer func() { <-argonSem }()
+
 	salt := make([]byte, argonSaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("auth: read salt: %w", err)
@@ -36,6 +65,12 @@ func HashPassword(password string) (string, error) {
 // VerifyPassword checks a password against a PHC-format Argon2id hash in
 // constant time.
 func VerifyPassword(password, encoded string) (bool, error) {
+	return VerifyPasswordContext(context.Background(), password, encoded)
+}
+
+// VerifyPasswordContext checks a password against a PHC-format Argon2id hash
+// while bounding concurrent memory usage and honouring context cancellation.
+func VerifyPasswordContext(ctx context.Context, password, encoded string) (bool, error) {
 	parts := strings.Split(encoded, "$")
 	// "", "argon2id", "v=19", "m=..,t=..,p=..", salt, hash
 	if len(parts) != 6 || parts[1] != "argon2id" {
@@ -61,6 +96,11 @@ func VerifyPassword(password, encoded string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("auth: malformed hash: %w", err)
 	}
+
+	if err := acquireArgon(ctx); err != nil {
+		return false, err
+	}
+	defer func() { <-argonSem }()
 
 	got := argon2.IDKey([]byte(password), salt, t, m, p, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1, nil

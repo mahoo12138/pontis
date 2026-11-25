@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"time"
 
 	"pontis/internal/canonical"
@@ -17,6 +18,7 @@ type User struct {
 	DisplayName       string
 	Email             string
 	EmailNorm         string
+	EmailVerifiedAt   *time.Time
 	PasswordHash      string
 	Role              Role
 	Status            Status
@@ -102,5 +104,30 @@ func ValidatePassword(password string) bool {
 
 // NormalizeEmail folds an email address for uniqueness checks.
 func NormalizeEmail(email string) string {
-	return foldASCII(email)
+	return foldASCII(strings.TrimSpace(email))
+}
+
+// ValidateEmail accepts an empty email (optional) or a syntactically plausible
+// address without whitespace/control characters.
+func ValidateEmail(email string) bool {
+	if email == "" {
+		return true
+	}
+	if len(email) > 254 {
+		return false
+	}
+	for _, r := range email {
+		if r <= 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	at := strings.IndexByte(email, '@')
+	if at <= 0 || at > 64 || at != strings.LastIndexByte(email, '@') {
+		return false
+	}
+	domain := email[at+1:]
+	if len(domain) < 3 || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") || strings.Contains(domain, "..") {
+		return false
+	}
+	return strings.ContainsRune(domain, '.')
 }

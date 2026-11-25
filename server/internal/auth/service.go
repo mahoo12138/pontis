@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,39 +66,43 @@ func (s *Service) NeedsSetup(ctx context.Context) (bool, error) {
 	return n == 0, nil
 }
 
-// CreateUserParams carries the input for user creation.
-type CreateUserParams struct {
-	Username    string
-	Password    string
-	DisplayName string
-	Email       string
+// AtomicUserStore is the optional transactional user-creation contract that
+// eliminates check-then-insert races in /auth/setup, /auth/register, and OIDC.
+type AtomicUserStore interface {
+	CreateFirstAdmin(ctx context.Context, u User, passwordHash string) error
+	CreateMemberUser(ctx context.Context, u User, passwordHash string) error
+	CreateUserAutoRole(ctx context.Context, u User, passwordHash string) (Role, error)
 }
 
-// CreateUser registers a user. The first user of an instance becomes the
-// admin; later users are regular users.
-func (s *Service) CreateUser(ctx context.Context, p CreateUserParams) (User, error) {
+// CreateUserParams carries the input for user creation.
+type CreateUserParams struct {
+	Username      string
+	Password      string
+	DisplayName   string
+	Email         string
+	EmailVerified bool
+}
+
+func prepareNewUser(ctx context.Context, p CreateUserParams) (User, string, error) {
 	if !ValidateUsername(p.Username) {
-		return User{}, ErrInvalidUsername
+		return User{}, "", ErrInvalidUsername
 	}
 	if !ValidatePassword(p.Password) {
-		return User{}, ErrInvalidPassword
+		return User{}, "", ErrInvalidPassword
+	}
+	email := strings.TrimSpace(p.Email)
+	if !ValidateEmail(email) {
+		return User{}, "", ErrInvalidEmail
 	}
 
-	role := RoleUser
-	if n, err := s.store.CountUsers(ctx); err != nil {
-		return User{}, err
-	} else if n == 0 {
-		role = RoleAdmin
-	}
-
-	hash, err := HashPassword(p.Password)
+	hash, err := HashPasswordContext(ctx, p.Password)
 	if err != nil {
-		return User{}, err
+		return User{}, "", err
 	}
 
 	userID, err := uuid.NewV7()
 	if err != nil {
-		return User{}, err
+		return User{}, "", err
 	}
 
 	displayName := p.DisplayName
@@ -106,20 +111,103 @@ func (s *Service) CreateUser(ctx context.Context, p CreateUserParams) (User, err
 	}
 
 	now := time.Now().UTC()
+	var emailVerifiedAt *time.Time
+	if p.EmailVerified && email != "" {
+		t := now
+		emailVerifiedAt = &t
+	}
 	u := User{
 		ID:                userID.String(),
 		Username:          p.Username,
 		UsernameNorm:      NormalizeUsername(p.Username),
 		DisplayName:       displayName,
-		EmailNorm:         foldASCII(p.Email),
-		Email:             p.Email,
-		Role:              role,
+		EmailNorm:         NormalizeEmail(email),
+		Email:             email,
+		EmailVerifiedAt:   emailVerifiedAt,
+		PasswordHash:      hash,
+		Role:              RoleUser,
 		Status:            StatusActive,
 		Locale:            "zh-CN",
 		PasswordChangedAt: now,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
+	return u, hash, nil
+}
+
+// SetupAdmin atomically creates the instance's sole initial admin account.
+// Concurrent setup calls race inside a single write transaction so at most one
+// succeeds and the rest receive ErrAlreadyInitialized.
+func (s *Service) SetupAdmin(ctx context.Context, p CreateUserParams) (User, error) {
+	p.EmailVerified = true
+	u, hash, err := prepareNewUser(ctx, p)
+	if err != nil {
+		return User{}, err
+	}
+	u.Role = RoleAdmin
+	if atomic, ok := s.store.(AtomicUserStore); ok {
+		if err := atomic.CreateFirstAdmin(ctx, u, hash); err != nil {
+			return User{}, err
+		}
+		return u, nil
+	}
+	if n, err := s.store.CountUsers(ctx); err != nil {
+		return User{}, err
+	} else if n > 0 {
+		return User{}, ErrAlreadyInitialized
+	}
+	if err := s.store.CreateUser(ctx, u, hash); err != nil {
+		return User{}, err
+	}
+	return u, nil
+}
+
+// CreateMemberUser creates a non-admin user on an already-initialized instance.
+func (s *Service) CreateMemberUser(ctx context.Context, p CreateUserParams) (User, error) {
+	u, hash, err := prepareNewUser(ctx, p)
+	if err != nil {
+		return User{}, err
+	}
+	u.Role = RoleUser
+	if atomic, ok := s.store.(AtomicUserStore); ok {
+		if err := atomic.CreateMemberUser(ctx, u, hash); err != nil {
+			return User{}, err
+		}
+		return u, nil
+	}
+	if n, err := s.store.CountUsers(ctx); err != nil {
+		return User{}, err
+	} else if n == 0 {
+		return User{}, ErrNotInitialized
+	}
+	if err := s.store.CreateUser(ctx, u, hash); err != nil {
+		return User{}, err
+	}
+	return u, nil
+}
+
+// CreateUser registers a user. The first user of an instance becomes the
+// admin; later users are regular users.
+func (s *Service) CreateUser(ctx context.Context, p CreateUserParams) (User, error) {
+	u, hash, err := prepareNewUser(ctx, p)
+	if err != nil {
+		return User{}, err
+	}
+	if atomic, ok := s.store.(AtomicUserStore); ok {
+		role, err := atomic.CreateUserAutoRole(ctx, u, hash)
+		if err != nil {
+			return User{}, err
+		}
+		u.Role = role
+		return u, nil
+	}
+	role := RoleUser
+	if n, err := s.store.CountUsers(ctx); err != nil {
+		return User{}, err
+	} else if n == 0 {
+		role = RoleAdmin
+	}
+	u.Role = role
 	if err := s.store.CreateUser(ctx, u, hash); err != nil {
 		return User{}, err
 	}
@@ -132,11 +220,17 @@ func (s *Service) Login(ctx context.Context, username, password, userAgent strin
 	u, err := s.store.GetUserByUsernameNormalized(ctx, NormalizeUsername(username))
 	if err != nil {
 		// Burn comparable time to avoid trivially timing user existence.
-		_, _ = VerifyPassword(password, "$argon2id$v=19$m=65536,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+		_, _ = VerifyPasswordContext(ctx, password, dummyPasswordHash)
+		return "", Session{}, User{}, ErrInvalidCredentials
+	}
+	if u.PasswordHash == "" {
+		// Passwordless (SSO) account: still burn Argon2 time so timing cannot
+		// distinguish SSO accounts from password accounts.
+		_, _ = VerifyPasswordContext(ctx, password, dummyPasswordHash)
 		return "", Session{}, User{}, ErrInvalidCredentials
 	}
 
-	ok, err := VerifyPassword(password, u.PasswordHash)
+	ok, err := VerifyPasswordContext(ctx, password, u.PasswordHash)
 	if err != nil || !ok {
 		return "", Session{}, User{}, ErrInvalidCredentials
 	}
@@ -260,7 +354,7 @@ func (s *Service) ResetPassword(ctx context.Context, rawToken, newPassword strin
 	if !ok {
 		return errors.New("auth: reset flow unavailable")
 	}
-	hash, err := HashPassword(newPassword)
+	hash, err := HashPasswordContext(ctx, newPassword)
 	if err != nil {
 		return err
 	}

@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"strings"
 	"time"
 
 	"pontis/internal/activity"
@@ -56,7 +55,7 @@ func (s *ActivityStore) ReplaceDay(ctx context.Context, userID canonical.UserID,
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO activity_daily (user_id, device_id, day, host, seconds, visits)
 			VALUES (?, ?, ?, ?, ?, ?)`,
-			string(userID), deviceID, entry.Day, strings.ToLower(h.Host), h.Seconds, h.Visits); err != nil {
+			string(userID), deviceID, entry.Day, activity.NormalizeHost(h.Host), h.Seconds, h.Visits); err != nil {
 			return false, err
 		}
 	}

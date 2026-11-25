@@ -58,7 +58,7 @@ invite
 
 V1 UI 可先提供 closed/open，底层预留 invite。
 
-新用户注册后自动创建一个普通默认 Space，降低首次使用门槛。
+新用户注册后（`/auth/register`、管理员建号与 SSO 自动开通）自动创建一个普通默认 Space，降低首次使用门槛。`/auth/setup` 创建的首个管理员不自动创建默认 Space，便于管理员按需规划首批空间。
 
 落地形态（V1）：
 

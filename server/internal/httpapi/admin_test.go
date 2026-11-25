@@ -407,3 +407,98 @@ func TestResetTokenRaceHasOneWinner(t *testing.T) {
 		t.Fatalf("login after the winning reset = %d %v", code, body)
 	}
 }
+
+func TestConcurrentSetupProducesExactlyOneAdmin(t *testing.T) {
+	_, ts, db := newTestServerWithDB(t)
+
+	const racers = 6
+	var wg sync.WaitGroup
+	codes := make([]int, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			payload, _ := json.Marshal(map[string]string{
+				"username": "admin" + string(rune('a'+slot)),
+				"password": "password123",
+			})
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/setup", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				codes[slot] = -1
+				return
+			}
+			res.Body.Close()
+			codes[slot] = res.StatusCode
+		}(i)
+	}
+	wg.Wait()
+
+	created, conflicts := 0, 0
+	for _, c := range codes {
+		switch c {
+		case http.StatusCreated:
+			created++
+		case http.StatusConflict:
+			conflicts++
+		}
+	}
+	if created != 1 || conflicts != racers-1 {
+		t.Fatalf("concurrent setup: created=%d conflicts=%d codes=%v, want 1 and %d",
+			created, conflicts, codes, racers-1)
+	}
+	var adminCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&adminCount); err != nil {
+		t.Fatal(err)
+	}
+	if adminCount != 1 {
+		t.Fatalf("admin count in DB = %d, want 1", adminCount)
+	}
+}
+
+func TestConcurrentAdminsCannotLeaveZeroAdmins(t *testing.T) {
+	f := bootstrapLibraryFlow(t)
+	aliceHeader := map[string]string{"Authorization": "Bearer " + f.sessionToken}
+	bobHeader := map[string]string{"Authorization": "Bearer " + f.bobToken}
+
+	_, aliceMe := doJSON(t, "GET", f.ts.URL+"/api/v1/auth/me", aliceHeader, nil)
+	_, bobMe := doJSON(t, "GET", f.ts.URL+"/api/v1/auth/me", bobHeader, nil)
+	aliceID := aliceMe["id"].(string)
+	bobID := bobMe["id"].(string)
+
+	// Promote Bob to second admin.
+	if code, body := doJSON(t, "PATCH", f.ts.URL+"/api/v1/admin/users/"+bobID, aliceHeader,
+		map[string]any{"role": "admin"}); code != http.StatusOK {
+		t.Fatalf("promote bob = %d %v", code, body)
+	}
+
+	// Alice and Bob concurrently try to demote each other.
+	patchRole := func(token, targetID string) int {
+		payload, _ := json.Marshal(map[string]string{"role": "user"})
+		req, _ := http.NewRequest(http.MethodPatch, f.ts.URL+"/api/v1/admin/users/"+targetID, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return -1
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+
+	var wg sync.WaitGroup
+	var c1, c2 int
+	wg.Add(2)
+	go func() { defer wg.Done(); c1 = patchRole(f.sessionToken, bobID) }()
+	go func() { defer wg.Done(); c2 = patchRole(f.bobToken, aliceID) }()
+	wg.Wait()
+
+	var activeAdmins int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'`).Scan(&activeAdmins); err != nil {
+		t.Fatal(err)
+	}
+	if activeAdmins < 1 {
+		t.Fatalf("concurrent mutual demotion left %d active admins (codes %d, %d)", activeAdmins, c1, c2)
+	}
+}

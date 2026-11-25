@@ -184,6 +184,13 @@ func (s *Service) Ingest(ctx context.Context, userID canonical.UserID, deviceID 
 	return applied, nil
 }
 
+// NormalizeHost returns the canonical lowercase hostname stored in SQLite.
+// Validation and persistence both pass through this function so a trailing dot
+// cannot pass validation under one key and collide on insert under another.
+func NormalizeHost(raw string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+}
+
 func validateDay(entry DayEntry) error {
 	if !dayPattern.MatchString(entry.Day) {
 		return fmt.Errorf("%w: %q", ErrBadDay, entry.Day)
@@ -194,11 +201,18 @@ func validateDay(entry DayEntry) error {
 	if len(entry.Hours) > 24 {
 		return fmt.Errorf("%w: %d > 24", ErrBadHour, len(entry.Hours))
 	}
+	seenHosts := make(map[string]bool, len(entry.Hosts))
 	for _, h := range entry.Hosts {
-		host := strings.ToLower(strings.TrimSuffix(h.Host, "."))
-		if host == "" || len(host) > MaxHostLength || strings.ContainsAny(host, "/ \t\r\n") {
+		host := NormalizeHost(h.Host)
+		if host == "" || len(host) > MaxHostLength ||
+			strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") ||
+			strings.ContainsAny(host, "/ \t\r\n") {
 			return fmt.Errorf("%w: %q", ErrBadHost, h.Host)
 		}
+		if seenHosts[host] {
+			return fmt.Errorf("%w: duplicate host %q", ErrBadHost, host)
+		}
+		seenHosts[host] = true
 		if h.Seconds < 0 || h.Seconds > MaxSecondsPerDay {
 			return fmt.Errorf("%w: %d for host %q", ErrBadSeconds, h.Seconds, h.Host)
 		}

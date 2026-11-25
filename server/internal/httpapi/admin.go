@@ -93,15 +93,6 @@ func (s *Server) handleUpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusBadRequest, "INVALID_VALUE", "status must be active or disabled")
 			return
 		}
-		if err := s.Accounts.SetUserStatus(r.Context(), userID, *req.Status, now); err != nil {
-			s.writeAdminError(w, r, err)
-			return
-		}
-		if *req.Status == "disabled" {
-			// Disabled accounts are rejected at every credential check;
-			// dropping their sessions makes it immediate.
-			_ = s.Accounts.DeleteUserSessions(r.Context(), userID)
-		}
 	}
 	if req.Role != nil {
 		switch *req.Role {
@@ -110,7 +101,9 @@ func (s *Server) handleUpdateAdminUser(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusBadRequest, "INVALID_VALUE", "role must be admin or user")
 			return
 		}
-		if err := s.Accounts.SetUserRole(r.Context(), userID, *req.Role, now); err != nil {
+	}
+	if req.Status != nil || req.Role != nil {
+		if err := s.Accounts.UpdateAdminUser(r.Context(), userID, req.Status, req.Role, now); err != nil {
 			s.writeAdminError(w, r, err)
 			return
 		}
@@ -139,11 +132,12 @@ func (s *Server) handleCreateAdminUser(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	user, err := s.Auth.CreateUser(r.Context(), auth.CreateUserParams{
-		Username:    req.Username,
-		Password:    req.Password,
-		DisplayName: req.DisplayName,
-		Email:       req.Email,
+	user, err := s.Auth.CreateMemberUser(r.Context(), auth.CreateUserParams{
+		Username:      req.Username,
+		Password:      req.Password,
+		DisplayName:   req.DisplayName,
+		Email:         req.Email,
+		EmailVerified: true,
 	})
 	if err != nil {
 		s.mapAuthError(w, r, err)
@@ -219,6 +213,8 @@ func (s *Server) writeAdminError(w http.ResponseWriter, r *http.Request, err err
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		s.writeError(w, r, http.StatusNotFound, "USER_NOT_FOUND", "unknown user")
+	case errors.Is(err, auth.ErrLastAdmin):
+		s.writeError(w, r, http.StatusConflict, "LAST_ADMIN", "cannot remove or disable the last active admin")
 	case errors.Is(err, auth.ErrResetTokenInvalid):
 		s.writeError(w, r, http.StatusForbidden, "RESET_TOKEN_INVALID", "reset link is invalid, used or expired")
 	default:

@@ -19,16 +19,53 @@ type AccountStore struct {
 // NewAccountStore returns an account store.
 func NewAccountStore(db *sql.DB) *AccountStore { return &AccountStore{db: db} }
 
-// UpdateProfile rewrites display name and email.
+// UpdateProfile rewrites display name and email. Changing the email clears
+// email_verified_at so a self-edited address can never hijack another user's
+// SSO bootstrap link. Empty email is stored as SQL NULL (matching CreateUser).
 func (s *AccountStore) UpdateProfile(ctx context.Context, userID, displayName, email string, at time.Time) error {
-	var emailNorm any
-	if email != "" {
-		emailNorm = auth.NormalizeEmail(email)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE users SET display_name = ?, email = ?, email_normalized = ?, updated_at = ?
-		WHERE id = ?`, displayName, email, emailNorm, formatTime(at), userID)
-	return err
+	defer tx.Rollback()
+
+	var currentEmailNorm string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(email_normalized, '') FROM users WHERE id = ?`, userID).Scan(&currentEmailNorm); err != nil {
+		return err
+	}
+
+	var emailCol, emailNormCol any
+	newEmailNorm := ""
+	if email != "" {
+		newEmailNorm = auth.NormalizeEmail(email)
+		emailCol, emailNormCol = email, newEmailNorm
+		var taken bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM users WHERE email_normalized = ? AND id <> ?)`,
+			newEmailNorm, userID).Scan(&taken); err != nil {
+			return err
+		}
+		if taken {
+			return auth.ErrEmailTaken
+		}
+	}
+
+	if newEmailNorm != currentEmailNorm {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE users
+			SET display_name = ?, email = ?, email_normalized = ?, email_verified_at = NULL, updated_at = ?
+			WHERE id = ?`, displayName, emailCol, emailNormCol, formatTime(at), userID)
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE users
+			SET display_name = ?, email = ?, email_normalized = ?, updated_at = ?
+			WHERE id = ?`, displayName, emailCol, emailNormCol, formatTime(at), userID)
+	}
+	if err != nil {
+		return mapUserUniqueErr(err)
+	}
+	return tx.Commit()
 }
 
 // UpdatePassword rewrites the password hash and bumps password_changed_at.
@@ -184,17 +221,28 @@ func (s *AccountStore) DeleteOwnerDevice(ctx context.Context, owner canonical.Us
 	return err
 }
 
-// DeleteDeviceChildren removes a device's bindings and credentials.
+// DeleteDeviceChildren removes a device's bindings, credentials, receipts,
+// reconciliation sessions, snapshots, and artifacts atomically.
 func (s *AccountStore) DeleteDeviceChildren(ctx context.Context, deviceID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	for _, stmt := range []string{
+		`DELETE FROM client_operation_receipts WHERE binding_id IN (SELECT id FROM device_space_bindings WHERE device_id = ?)`,
+		`DELETE FROM sync_artifacts WHERE binding_id IN (SELECT id FROM device_space_bindings WHERE device_id = ?)`,
+		`DELETE FROM server_snapshots WHERE binding_id IN (SELECT id FROM device_space_bindings WHERE device_id = ?)`,
+		`DELETE FROM reconciliations WHERE binding_id IN (SELECT id FROM device_space_bindings WHERE device_id = ?)`,
 		`DELETE FROM device_space_bindings WHERE device_id = ?`,
 		`DELETE FROM device_credentials WHERE device_id = ?`,
 	} {
-		if _, err := s.db.ExecContext(ctx, stmt, deviceID); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, deviceID); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DeviceRevokedAt reports when the device was revoked, or nil while it is still

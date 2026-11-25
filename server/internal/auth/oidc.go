@@ -71,6 +71,9 @@ type OIDCStore interface {
 	UpsertOIDCIdentity(ctx context.Context, issuer, subject, userID string, at time.Time) error
 	// GetUserByEmailNormalized loads an account by its email key.
 	GetUserByEmailNormalized(ctx context.Context, emailNorm string) (User, error)
+	// HasOIDCIdentityForUser reports whether userID is already linked to a
+	// subject for issuer.
+	HasOIDCIdentityForUser(ctx context.Context, issuer, userID string) (bool, error)
 	// InsertOIDCState stores a flow. Implementations may prune expired rows.
 	InsertOIDCState(ctx context.Context, st OIDCState) error
 	// ConsumeOIDCState atomically reads and deletes a flow: two callbacks
@@ -262,17 +265,31 @@ func (s *OIDCService) resolveUser(ctx context.Context, store OIDCStore, subject,
 		return User{}, err
 	}
 
-	// 2. Email linking, bootstrap only. An unverified email claim is
-	// attacker-chosen text at a permissive provider; trusting it would let
-	// anyone who controls their IdP profile take over a local account.
+	// 2. Email linking, bootstrap only. Both halves must be verified: an
+	// unverified IdP claim is attacker-controlled text at a permissive
+	// provider, and a local account whose email was self-entered (via open
+	// registration or PATCH /auth/me without verification) is not a trusted
+	// ownership anchor either. Only accounts with email_verified_at set (e.g.
+	// admin-created or SSO-provisioned) and not already bound to a different
+	// subject under this issuer may auto-link.
 	if email != "" && emailVerified {
 		user, err := store.GetUserByEmailNormalized(ctx, NormalizeEmail(email))
 		switch {
 		case err == nil:
-			if err := store.UpsertOIDCIdentity(ctx, issuer, subject, user.ID, time.Now().UTC()); err != nil {
-				return User{}, err
+			if user.EmailVerifiedAt != nil {
+				alreadyLinked, linkErr := store.HasOIDCIdentityForUser(ctx, issuer, user.ID)
+				if linkErr != nil {
+					return User{}, linkErr
+				}
+				if !alreadyLinked {
+					if err := store.UpsertOIDCIdentity(ctx, issuer, subject, user.ID, time.Now().UTC()); err != nil {
+						return User{}, err
+					}
+					return user, nil
+				}
 			}
-			return user, nil
+			// Local email is unverified or already bound to another subject:
+			// do not auto-link; fall through to provisioning / refusal.
 		case errors.Is(err, ErrUserNotFound):
 			// fall through to provisioning
 		default:
@@ -305,8 +322,9 @@ func (s *OIDCService) provisionUser(ctx context.Context, store OIDCStore, issuer
 	// would poison the email slot: an attacker could pre-provision a local
 	// account under someone else's address, and a later verified login with
 	// that address would link to the attacker's account. No email, no link.
-	if !emailVerified {
+	if !emailVerified || !ValidateEmail(strings.TrimSpace(email)) {
 		email = ""
+		emailVerified = false
 	}
 	var user User
 	var err error
@@ -317,24 +335,34 @@ func (s *OIDCService) provisionUser(ctx context.Context, store OIDCStore, issuer
 			// the base short enough for the suffix to fit the charset cap.
 			candidate = truncateRunes(fmt.Sprintf("%s-%d", orig, attempt+1), 32)
 		}
-		user, err = s.auth.CreateOIDCUser(ctx, candidate, displayName, email)
+		user, err = s.auth.CreateOIDCUser(ctx, candidate, displayName, email, emailVerified)
 		if err == nil {
 			break
 		}
-		if attempt >= 7 || !errors.Is(err, ErrUserExists) {
-			// The email is somebody's account already. For a verified claim
-			// that means two logins raced to provision the same person —
-			// link to the account that won. An unverified claim has no such
-			// excuse: it is somebody else's address, and touching their
-			// account is exactly what this package must never do.
-			if errors.Is(err, ErrEmailTaken) && emailVerified {
-				if linked, lookupErr := store.GetUserByEmailNormalized(ctx, NormalizeEmail(email)); lookupErr == nil {
-					if err := store.UpsertOIDCIdentity(ctx, issuer, subject, linked.ID, time.Now().UTC()); err != nil {
-						return User{}, err
+		if errors.Is(err, ErrEmailTaken) && email != "" {
+			// The email slot is already occupied. Only link if that account's
+			// email is verified and it is not already bound to another subject
+			// (e.g. a concurrent login race). If an unverified local account
+			// is squatting on this email, provision the SSO user without
+			// claiming the contested email so the victim is neither hijacked
+			// nor locked out.
+			if emailVerified {
+				if linked, lookupErr := store.GetUserByEmailNormalized(ctx, NormalizeEmail(email)); lookupErr == nil && linked.EmailVerifiedAt != nil {
+					alreadyLinked, linkErr := store.HasOIDCIdentityForUser(ctx, issuer, linked.ID)
+					if linkErr == nil && !alreadyLinked {
+						if err := store.UpsertOIDCIdentity(ctx, issuer, subject, linked.ID, time.Now().UTC()); err != nil {
+							return User{}, err
+						}
+						return linked, nil
 					}
-					return linked, nil
 				}
 			}
+			email = ""
+			emailVerified = false
+			attempt--
+			continue
+		}
+		if attempt >= 7 || !errors.Is(err, ErrUserExists) {
 			return User{}, ErrOIDCProvisionFailed
 		}
 	}
@@ -346,14 +374,14 @@ func (s *OIDCService) provisionUser(ctx context.Context, store OIDCStore, issuer
 
 // CreateOIDCUser creates a passwordless account for an SSO-provisioned
 // identity: always role=user on an instance that already has an admin.
-func (s *Service) CreateOIDCUser(ctx context.Context, username, displayName, email string) (User, error) {
+func (s *Service) CreateOIDCUser(ctx context.Context, username, displayName, email string, emailVerified bool) (User, error) {
 	if !ValidateUsername(username) {
 		return User{}, ErrInvalidUsername
 	}
-	if n, err := s.store.CountUsers(ctx); err != nil {
-		return User{}, err
-	} else if n == 0 {
-		return User{}, ErrOIDCNotInitialized
+	email = strings.TrimSpace(email)
+	if !ValidateEmail(email) {
+		email = ""
+		emailVerified = false
 	}
 
 	userID, err := uuid.NewV7()
@@ -364,6 +392,11 @@ func (s *Service) CreateOIDCUser(ctx context.Context, username, displayName, ema
 		displayName = username
 	}
 	now := time.Now().UTC()
+	var emailVerifiedAt *time.Time
+	if emailVerified && email != "" {
+		t := now
+		emailVerifiedAt = &t
+	}
 	u := User{
 		ID:                userID.String(),
 		Username:          username,
@@ -371,12 +404,27 @@ func (s *Service) CreateOIDCUser(ctx context.Context, username, displayName, ema
 		DisplayName:       displayName,
 		EmailNorm:         NormalizeEmail(email),
 		Email:             email,
+		EmailVerifiedAt:   emailVerifiedAt,
 		Role:              RoleUser,
 		Status:            StatusActive,
 		Locale:            "zh-CN",
 		PasswordChangedAt: now,
 		CreatedAt:         now,
 		UpdatedAt:         now,
+	}
+	if atomic, ok := s.store.(AtomicUserStore); ok {
+		if err := atomic.CreateMemberUser(ctx, u, ""); err != nil {
+			if errors.Is(err, ErrNotInitialized) {
+				return User{}, ErrOIDCNotInitialized
+			}
+			return User{}, err
+		}
+		return u, nil
+	}
+	if n, err := s.store.CountUsers(ctx); err != nil {
+		return User{}, err
+	} else if n == 0 {
+		return User{}, ErrOIDCNotInitialized
 	}
 	if err := s.store.CreateUser(ctx, u, ""); err != nil {
 		return User{}, err

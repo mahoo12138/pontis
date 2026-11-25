@@ -66,7 +66,7 @@ disable_password_login = false
 对验证过的 (issuer, subject):
 
 1. **identity 行决定**:`oidc_identities(issuer, subject)` → user。这是唯一持久的绑定;IdP 改邮箱不会让身份换主。
-2. **email 关联(仅 bootstrap)**:identity 不存在且 `email` claim 存在**且 `email_verified: true`** 时,按 `email_normalized` 找本地账号并写入 identity 行。未验证的 email claim 视为攻击者可控文本,永不参与关联。
+2. **email 关联(仅 bootstrap)**:identity 不存在且 `email` claim 存在**且 `email_verified: true`** 时,仅当本地账号同时满足 `email_verified_at IS NOT NULL`（仅由管理员建号、首次初始化或已验证 SSO 开通写入；开放注册或自助修改邮箱时置空）且尚未绑定该 issuer 的其他 subject，才按 `email_normalized` 关联并写入 identity 行。未验证的 IdP claim 或本地自填邮箱永不参与关联。
 3. **自动开通**:`auto_provision = true` 时创建 role=user 账号(password_hash 为空 → 密码登录天然失败;默认 Personal space 由 HTTP 层与 /auth/register 同一钩子补齐);`false` 时拒绝(`OIDC_ACCOUNT_NOT_LINKED`)。
 
 两个附加红线:

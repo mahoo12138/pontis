@@ -16,7 +16,7 @@ import (
 // joined against another table that shares column names (created_at).
 const userColumnsQualified = `
 	SELECT u.id, u.username, u.username_normalized, u.display_name,
-	       COALESCE(u.email, ''), COALESCE(u.email_normalized, ''), u.password_hash,
+	       COALESCE(u.email, ''), COALESCE(u.email_normalized, ''), COALESCE(u.email_verified_at, ''), u.password_hash,
 	       u.role, u.status, u.locale, COALESCE(u.default_space_id, ''),
 	       u.password_changed_at, u.created_at, u.updated_at`
 
@@ -52,6 +52,16 @@ func (s *AuthStore) GetUserByEmailNormalized(ctx context.Context, emailNorm stri
 		return auth.User{}, auth.ErrUserNotFound
 	}
 	return u, err
+}
+
+// HasOIDCIdentityForUser reports whether userID is already bound to a subject
+// under issuer.
+func (s *AuthStore) HasOIDCIdentityForUser(ctx context.Context, issuer, userID string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM oidc_identities WHERE issuer = ? AND user_id = ?)`,
+		issuer, userID).Scan(&exists)
+	return exists, err
 }
 
 // InsertOIDCState stores one in-flight sign-in flow and prunes the expired

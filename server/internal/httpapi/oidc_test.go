@@ -650,3 +650,135 @@ func TestPairingCodeLifecycle(t *testing.T) {
 		t.Fatalf("expired code = %d, want 403", code)
 	}
 }
+
+func TestOIDCCallbackRequiresMatchingStateCookie(t *testing.T) {
+	_, ts, idp := newOIDCTestServer(t, nil)
+	setupAdmin(t, ts)
+
+	// Attacker starts a legitimate flow in their own browser.
+	attacker := browserClient()
+	authorizeURL := ssoStart(t, attacker, ts.URL, "")
+	u, _ := url.Parse(authorizeURL)
+	q := u.Query()
+	code := idp.issueCode(q.Get("code_challenge"), q.Get("nonce"), stubClaims{
+		sub: "sub-mallory", username: "mallory", email: "mallory@example.com", emailVerified: true,
+	})
+	callbackURL := ts.URL + "/api/v1/auth/oidc/callback?code=" + url.QueryEscape(code) +
+		"&state=" + url.QueryEscape(q.Get("state"))
+
+	// Victim visits the callback URL without the state cookie (login CSRF).
+	victim := browserClient()
+	resp, err := victim.Get(callbackURL)
+	if err != nil {
+		t.Fatalf("victim callback: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := redirectQuery(t, resp).Get("error"); got != "OIDC_STATE_INVALID" {
+		t.Fatalf("callback without cookie = %q, want OIDC_STATE_INVALID", got)
+	}
+	meCode, _ := doJSONWithClient(t, victim, "GET", ts.URL+"/api/v1/auth/me", nil, nil)
+	if meCode != http.StatusUnauthorized {
+		t.Fatalf("victim got session without state cookie: %d", meCode)
+	}
+
+	// Victim with a different state cookie must also be rejected without
+	// consuming the attacker's in-flight state row.
+	_ = ssoStart(t, victim, ts.URL, "")
+	resp2, err := victim.Get(callbackURL)
+	if err != nil {
+		t.Fatalf("victim wrong cookie callback: %v", err)
+	}
+	defer resp2.Body.Close()
+	if got := redirectQuery(t, resp2).Get("error"); got != "OIDC_STATE_INVALID" {
+		t.Fatalf("callback with wrong cookie = %q, want OIDC_STATE_INVALID", got)
+	}
+
+	// The original browser holding the matching cookie can still complete its
+	// own flow — proving the forged attempts did not burn its state.
+	resp3, err := attacker.Get(callbackURL)
+	if err != nil {
+		t.Fatalf("attacker legitimate callback: %v", err)
+	}
+	defer resp3.Body.Close()
+	if loc := resp3.Header.Get("Location"); loc != "/" {
+		t.Fatalf("legitimate flow after forged attempt = %q, want /", loc)
+	}
+}
+
+func TestOIDCDoesNotAutoLinkUnverifiedLocalEmail(t *testing.T) {
+	t.Run("self-edited email does not hijack SSO (auto_provision=true)", func(t *testing.T) {
+		_, ts, idp := newOIDCTestServer(t, nil)
+		adminToken := setupAdmin(t, ts)
+		// Admin creates Mallory with no email.
+		code, body := doJSON(t, "POST", ts.URL+"/api/v1/admin/users",
+			map[string]string{"Authorization": "Bearer " + adminToken},
+			map[string]string{"username": "mallory", "password": "password123"})
+		if code != http.StatusCreated {
+			t.Fatalf("create mallory = %d %v", code, body)
+		}
+		_, loginBody := doJSON(t, "POST", ts.URL+"/api/v1/auth/login", nil,
+			map[string]string{"username": "mallory", "password": "password123"})
+		malloryToken := loginBody["token"].(string)
+
+		// Mallory edits her own email to Alice's corporate email.
+		code, body = doJSON(t, "PATCH", ts.URL+"/api/v1/auth/me",
+			map[string]string{"Authorization": "Bearer " + malloryToken},
+			map[string]string{"email": "alice@corp.example"})
+		if code != http.StatusOK {
+			t.Fatalf("mallory update email = %d %v", code, body)
+		}
+
+		// Alice signs in via SSO for the first time with verified email.
+		aliceClient := browserClient()
+		authorizeURL := ssoStart(t, aliceClient, ts.URL, "")
+		resp := ssoComplete(t, aliceClient, ts.URL, idp, authorizeURL,
+			"sub-alice", "alice.sso", "alice@corp.example", true)
+		if loc := resp.Header.Get("Location"); loc != "/" {
+			t.Fatalf("alice sso login = %s, want /", loc)
+		}
+		code, me := doJSONWithClient(t, aliceClient, "GET", ts.URL+"/api/v1/auth/me", nil, nil)
+		if code != http.StatusOK {
+			t.Fatalf("alice me = %d %v", code, me)
+		}
+		if me["username"] == "mallory" {
+			t.Fatal("Alice's SSO login was hijacked into Mallory's account via unverified local email")
+		}
+		if me["has_password"] != false {
+			t.Fatalf("SSO-provisioned user has_password = %v, want false", me["has_password"])
+		}
+
+		// Passwordless SSO user gets 409 PASSWORD_NOT_SET on /auth/password.
+		code, pwBody := doJSONWithClient(t, aliceClient, "POST", ts.URL+"/api/v1/auth/password", nil,
+			map[string]string{"current_password": "x", "new_password": "newpassword123"})
+		if code != http.StatusConflict || errCode(t, pwBody) != "PASSWORD_NOT_SET" {
+			t.Fatalf("sso change password = %d %v, want 409 PASSWORD_NOT_SET", code, pwBody)
+		}
+	})
+
+	t.Run("open-registered email does not hijack SSO (auto_provision=false)", func(t *testing.T) {
+		_, ts, idp := newOIDCTestServer(t, func(s *auth.OIDCSettings) { s.AutoProvision = false })
+		adminToken := setupAdmin(t, ts)
+		// Open public registration.
+		code, _ := doJSON(t, "PATCH", ts.URL+"/api/v1/settings",
+			map[string]string{"Authorization": "Bearer " + adminToken},
+			map[string]string{"registration_mode": "open"})
+		if code != http.StatusOK {
+			t.Fatalf("open registration = %d", code)
+		}
+		// Mallory registers publicly claiming Alice's email.
+		code, body := doJSON(t, "POST", ts.URL+"/api/v1/auth/register", nil,
+			map[string]string{"username": "mallory", "password": "password123", "email": "alice@corp.example"})
+		if code != http.StatusCreated {
+			t.Fatalf("register mallory = %d %v", code, body)
+		}
+
+		// Alice signs in via SSO; must NOT link to Mallory's self-registered account.
+		aliceClient := browserClient()
+		authorizeURL := ssoStart(t, aliceClient, ts.URL, "")
+		resp := ssoComplete(t, aliceClient, ts.URL, idp, authorizeURL,
+			"sub-alice", "alice.sso", "alice@corp.example", true)
+		if got := redirectQuery(t, resp).Get("error"); got != "OIDC_ACCOUNT_NOT_LINKED" {
+			t.Fatalf("error = %q, want OIDC_ACCOUNT_NOT_LINKED", got)
+		}
+	})
+}

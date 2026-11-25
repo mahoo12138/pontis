@@ -53,18 +53,27 @@ export class PairingService {
     // refuse their syncs with NOT_BINDING_OWNER forever.
     const previous = await this.bootstrap.get();
     const meta = await this.client.meta(params.serverUrl);
-    // Session token doubles as a Bearer credential for device registration.
+    // Session token doubles as a Bearer credential for device registration,
+    // and is immediately revoked afterwards so pairing leaves no lingering web session.
     const login = await this.client.login(params.username, params.password, params.serverUrl);
-    const { device, token } = await this.client.registerDevice(
-      login.token,
-      {
-        name: params.deviceName,
-        client_type: 'extension',
-        browser: params.browser,
-        platform: params.platform,
-      },
-      params.serverUrl,
-    );
+    let device: { id: string };
+    let token: string;
+    try {
+      const reg = await this.client.registerDevice(
+        login.token,
+        {
+          name: params.deviceName,
+          client_type: 'extension',
+          browser: params.browser,
+          platform: params.platform,
+        },
+        params.serverUrl,
+      );
+      device = reg.device;
+      token = reg.token;
+    } finally {
+      await this.client.logout(login.token, params.serverUrl).catch(() => {});
+    }
     await this.bootstrap.set({
       serverUrl: params.serverUrl.replace(/\/+$/, ''),
       instanceId: meta.instance_id,

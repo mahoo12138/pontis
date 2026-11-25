@@ -30,6 +30,19 @@ var (
 	// ErrEmailTaken is returned when the email is already in use.
 	ErrEmailTaken = errors.New("auth: email already in use")
 
+	// ErrInvalidEmail is returned when a non-empty email fails format checks.
+	ErrInvalidEmail = errors.New("auth: invalid email")
+
+	// ErrAlreadyInitialized is returned when /auth/setup is called after the
+	// first admin already exists.
+	ErrAlreadyInitialized = errors.New("auth: instance already initialized")
+
+	// ErrNotInitialized is returned when user creation requires an existing admin.
+	ErrNotInitialized = errors.New("auth: instance has no admin yet")
+
+	// ErrLastAdmin is returned when mutating a user would leave zero active admins.
+	ErrLastAdmin = errors.New("auth: cannot remove or disable the last active admin")
+
 	// ErrUserNotFound is returned by account lookups that find no row. The
 	// credential paths keep answering ErrInvalidCredentials so they cannot
 	// disclose which half was wrong; administrative and SSO lookups have no

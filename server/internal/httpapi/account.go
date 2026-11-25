@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -232,9 +234,17 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 		displayName = *req.DisplayName
 	}
 	if req.Email != nil {
-		email = *req.Email
+		email = strings.TrimSpace(*req.Email)
+		if !auth.ValidateEmail(email) {
+			s.writeError(w, r, http.StatusBadRequest, "INVALID_EMAIL", "invalid email address")
+			return
+		}
 	}
 	if err := s.Accounts.UpdateProfile(r.Context(), u.ID, displayName, email, time.Now().UTC()); err != nil {
+		if errors.Is(err, auth.ErrEmailTaken) {
+			s.writeError(w, r, http.StatusConflict, "EMAIL_TAKEN", "email already in use")
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
 		return
 	}
@@ -267,7 +277,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
 		return
 	}
-	ok, err := auth.VerifyPassword(req.CurrentPassword, hash)
+	if hash == "" {
+		s.writeError(w, r, http.StatusConflict, "PASSWORD_NOT_SET", "this account has no local password")
+		return
+	}
+	ok, err := auth.VerifyPasswordContext(r.Context(), req.CurrentPassword, hash)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
 		return
@@ -276,7 +290,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusForbidden, "INVALID_CREDENTIALS", "current password is wrong")
 		return
 	}
-	newHash, err := auth.HashPassword(req.NewPassword)
+	newHash, err := auth.HashPasswordContext(r.Context(), req.NewPassword)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL", "internal error")
 		return

@@ -140,13 +140,15 @@ export function AccountPanel() {
         </Button>
       </section>
 
-      <section>
-        <Text className={sectionTitle} mb={4}>修改密码</Text>
-        <Text className={sectionHint} mb="sm">
-          修改密码会使所有网页会话失效,设备与 API Token 不受影响。
-        </Text>
-        <PasswordForm />
-      </section>
+      {me?.has_password !== false && (
+        <section>
+          <Text className={sectionTitle} mb={4}>修改密码</Text>
+          <Text className={sectionHint} mb="sm">
+            修改密码会使所有网页会话失效,设备与 API Token 不受影响。
+          </Text>
+          <PasswordForm />
+        </section>
+      )}
     </div>
   );
 }

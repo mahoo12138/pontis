@@ -239,3 +239,32 @@ func TestActivityHostsPaging(t *testing.T) {
 		t.Fatalf("page2 = %v", page2)
 	}
 }
+
+func TestActivityIngestNormalizesAndRejectsDuplicateHosts(t *testing.T) {
+	_, ts := newTestServer(t)
+	token := restBootstrap(t, ts)
+	deviceToken := activityDeviceToken(t, ts, token, "Chrome@Home")
+
+	// Trailing dot normalizes cleanly on insert.
+	ingestBatch(t, ts, deviceToken, batchBody(
+		dayEntry("2026-11-04", []map[string]any{host("GitHub.COM.", 120, 2)}, nil),
+	))
+	hosts := restGET(t, ts, token, "/api/v1/activity/hosts?from=2026-11-01&to=2026-11-30")
+	item := hosts["items"].([]any)[0].(map[string]any)
+	if item["host"] != "github.com" {
+		t.Fatalf("stored host = %v, want github.com", item["host"])
+	}
+
+	// Duplicate host after normalization (with/without trailing dot) is rejected
+	// as 400 ACTIVITY_ROW_INVALID rather than failing with 500 PK collision.
+	out := restExpect(t, ts, deviceToken, http.StatusBadRequest, http.MethodPost,
+		"/api/v1/device/activity/batches", batchBody(
+			dayEntry("2026-11-05", []map[string]any{
+				host("github.com", 60, 1),
+				host("github.com.", 60, 1),
+			}, nil),
+		))
+	if out["error"].(map[string]any)["code"] != "ACTIVITY_ROW_INVALID" {
+		t.Fatalf("duplicate host error = %v, want ACTIVITY_ROW_INVALID", out["error"])
+	}
+}

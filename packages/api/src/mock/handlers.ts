@@ -39,6 +39,7 @@ export function mockUser(username: string): User {
     username,
     display_name: username,
     email: `${username}@pontis.local`,
+    has_password: true,
     role: 'admin',
     status: 'active',
     locale: 'zh-CN',

@@ -70,6 +70,7 @@ const paired: Record<string, [unknown, number?]> = {
   'POST /api/v1/auth/login': [
     { token: 'session-1', expires_at: 'later', user: { id: 'u1', username: 'alpha', display_name: 'A' } },
   ],
+  'POST /api/v1/auth/logout': [{ status: 'ok' }],
   'POST /api/v1/devices': [{ device: { id: 'dev-1', name: 'Alpha Chrome' }, token: 'device-secret' }],
   'POST /api/v1/device/bindings': [bindingWire('pending_initial')],
   'DELETE /api/v1/device/bindings/binding-1': [bindingWire('pending_initial')],
@@ -112,6 +113,7 @@ describe('PairingService', () => {
       'GET /api/v1/meta',
       'POST /api/v1/auth/login',
       'POST /api/v1/devices',
+      'POST /api/v1/auth/logout',
     ]);
     const stored = (kv.data['bootstrap'] ?? {}) as BootstrapData;
     expect(stored.deviceToken).toBe('device-secret');

@@ -240,3 +240,68 @@ func mergeHeaders(base map[string]string, extra map[string]string) map[string]st
 	}
 	return out
 }
+
+func TestPublicAuthEndpointsBlockCrossOriginAndNonJSON(t *testing.T) {
+	_, ts := newTestServer(t)
+	_ = sessionCookieSession(t, ts)
+
+	// 1. Cross-site text/plain form login CSRF is blocked (both Origin and Content-Type).
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login",
+		strings.NewReader(`{"username":"alice","password":"password123"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Origin", "https://evil.example")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin text/plain login = %d, want 403", res.StatusCode)
+	}
+
+	// 2. Same-origin (or originless) text/plain is still blocked by Content-Type enforcement.
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/auth/login",
+		strings.NewReader(`{"username":"alice","password":"password123"}`))
+	req2.Header.Set("Content-Type", "text/plain")
+	res2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2.Body.Close()
+	if res2.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("text/plain login = %d, want 415", res2.StatusCode)
+	}
+
+	// 3. Cross-origin POST on /auth/register and /auth/reset is blocked.
+	for _, path := range []string{"/api/v1/auth/register", "/api/v1/auth/reset"} {
+		code, body := doJSON(t, http.MethodPost, ts.URL+path,
+			map[string]string{"Origin": "https://evil.example"}, map[string]string{})
+		if code != http.StatusForbidden || errCode(t, body) != "ORIGIN_MISMATCH" {
+			t.Fatalf("cross-origin POST %s = %d %v, want 403 ORIGIN_MISMATCH", path, code, body)
+		}
+	}
+
+	// 4. Browser extension origin is permitted on /auth/login with application/json.
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/v1/auth/login",
+		map[string]string{"Origin": "chrome-extension://abcdefghijklmnop"},
+		map[string]string{"username": "alice", "password": "password123"})
+	if code != http.StatusOK {
+		t.Fatalf("extension login = %d %v, want 200", code, body)
+	}
+
+	// 5. Security headers (CSP frame-ancestors + nosniff) are present.
+	metaRes, err := http.Get(ts.URL + "/api/v1/meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaRes.Body.Close()
+	if !strings.Contains(metaRes.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("missing frame-ancestors CSP: %q", metaRes.Header.Get("Content-Security-Policy"))
+	}
+	if metaRes.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("missing X-Content-Type-Options: %q", metaRes.Header.Get("X-Content-Type-Options"))
+	}
+}

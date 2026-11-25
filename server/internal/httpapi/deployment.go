@@ -192,6 +192,15 @@ func firstForwardedValue(v string) string {
 	return strings.ToLower(strings.TrimSpace(v))
 }
 
+// isExtensionOrigin reports whether the request carries a browser extension
+// Origin header (chrome-extension:// or moz-extension://), which cross-site
+// web pages cannot forge.
+func isExtensionOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	return strings.HasPrefix(origin, "chrome-extension://") ||
+		strings.HasPrefix(origin, "moz-extension://")
+}
+
 // isSafeMethod cannot change state, so it is outside the origin check.
 func isSafeMethod(method string) bool {
 	switch method {

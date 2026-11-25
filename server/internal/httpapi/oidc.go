@@ -7,6 +7,7 @@ package httpapi
 // message, never a JSON envelope.
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"net/url"
@@ -59,8 +60,19 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bind the callback to the browser that started the flow (doc 25 §3).
+	// Check the cookie before consuming the server-side state row so a forged
+	// callback cannot burn an in-flight login belonging to another browser.
+	state := r.URL.Query().Get("state")
+	cookie, err := r.Cookie(OIDCStateCookie)
+	if err != nil || cookie.Value == "" || state == "" ||
+		subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(state)) != 1 {
+		s.redirectOIDCError(w, r, "OIDC_STATE_INVALID")
+		return
+	}
+
 	token, user, returnTo, err := s.OIDC.CompleteCallback(r.Context(),
-		r.URL.Query().Get("state"), r.URL.Query().Get("code"), r.UserAgent(), s.Logger)
+		state, r.URL.Query().Get("code"), r.UserAgent(), s.Logger)
 	if err != nil {
 		if !isExpectedOIDCError(err) {
 			s.Logger.Error("oidc callback failed", "error", err.Error())

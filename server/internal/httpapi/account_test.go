@@ -228,6 +228,31 @@ func TestProfileAndPassword(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("current session invalidated: %d", code)
 	}
+
+	// Invalid email is rejected with 400 INVALID_EMAIL.
+	code, body = doJSON(t, "PATCH", f.ts.URL+"/api/v1/auth/me", h,
+		map[string]any{"email": "not-an-email"})
+	if code != http.StatusBadRequest || errCode(t, body) != "INVALID_EMAIL" {
+		t.Fatalf("invalid email = %d %v, want 400 INVALID_EMAIL", code, body)
+	}
+
+	// Duplicate email returns 409 EMAIL_TAKEN (not 500).
+	bobHeader := map[string]string{"Authorization": "Bearer " + f.bobToken}
+	code, body = doJSON(t, "PATCH", f.ts.URL+"/api/v1/auth/me", bobHeader,
+		map[string]any{"email": "ALICE@example.com"})
+	if code != http.StatusConflict || errCode(t, body) != "EMAIL_TAKEN" {
+		t.Fatalf("duplicate email = %d %v, want 409 EMAIL_TAKEN", code, body)
+	}
+
+	// Clearing email stores NULL so multiple users may hold empty email.
+	code, body = doJSON(t, "PATCH", f.ts.URL+"/api/v1/auth/me", h, map[string]any{"email": ""})
+	if code != http.StatusOK || body["email"] != "" {
+		t.Fatalf("clear alice email = %d %v", code, body)
+	}
+	code, body = doJSON(t, "PATCH", f.ts.URL+"/api/v1/auth/me", bobHeader, map[string]any{"email": ""})
+	if code != http.StatusOK || body["email"] != "" {
+		t.Fatalf("clear bob email = %d %v", code, body)
+	}
 }
 
 func TestSystemSettingsAdminOnly(t *testing.T) {
